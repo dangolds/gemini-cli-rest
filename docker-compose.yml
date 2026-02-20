@@ -1,0 +1,15 @@
+services:
+  gemini-rest:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - gemini-config:/root/.gemini
+    environment:
+      - RESPONSE_IDLE_TIMEOUT=5
+      - RESPONSE_MAX_TIMEOUT=120
+      - STARTUP_TIMEOUT=30
+      - LOG_LEVEL=INFO
+
+volumes:
+  gemini-config:
