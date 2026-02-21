@@ -8,7 +8,9 @@ services:
     environment:
       - RESPONSE_IDLE_TIMEOUT=5
       - RESPONSE_MAX_TIMEOUT=120
+      - RESPONSE_DONE_MARKER=YOLO ctrl+y
       - STARTUP_TIMEOUT=30
+      - CLEAR_SETTLE_DELAY=0.2
       - LOG_LEVEL=INFO
 
 volumes:

@@ -32,6 +32,21 @@ GEMINI_EXTRA_ARGS = os.getenv("GEMINI_EXTRA_ARGS", "")  # space-separated extras
 RESPONSE_IDLE_TIMEOUT = float(os.getenv("RESPONSE_IDLE_TIMEOUT", "5"))  # seconds of silence → response done
 RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "120"))  # hard cap per request
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
+RESPONSE_DONE_MARKER = os.getenv("RESPONSE_DONE_MARKER", "YOLO ctrl+y")  # YOLO status bar rendered when response is complete
+# After /clear, the TUI status bar may omit "YOLO ctrl+y" (e.g. no file
+# context), but "Type your message" always appears when ready for input.
+# We split primary markers by comma (high-confidence, only need MIN_WAIT)
+# and keep a separate fallback that checks the chunk contains
+# "Type your message" but NOT "responding" (which the TUI shows while the
+# model is still streaming).
+RESPONSE_DONE_MARKERS_PRIMARY: list[str] = [
+    m.strip() for m in RESPONSE_DONE_MARKER.split(",")
+]
+# How long after the last new Model: content before we consider the response
+# complete (fallback when primary marker never appears, e.g. after /clear).
+RESPONSE_MODEL_STABLE_TIMEOUT = float(os.getenv("RESPONSE_MODEL_STABLE_TIMEOUT", "3"))
+CLEAR_SETTLE_DELAY = float(os.getenv("CLEAR_SETTLE_DELAY", "0.2"))  # seconds to wait after /clear for TUI to re-attach stdin
+RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "2"))  # seconds to ignore done_marker after sending (avoids false-positive from TUI status bar redraw)
 
 # Marker that Gemini CLI prints when ready for input (screen-reader mode)
 READY_MARKER = os.getenv("READY_MARKER", "Type your message")
@@ -86,13 +101,16 @@ def clean_response(raw: str, prompt_sent: str) -> str:
     """
     text = strip_ansi(raw)
 
-    # Extract "Model: ..." lines — each is a progressively longer snapshot
+    # Extract "Model: ..." segments — each is a progressively longer snapshot
     # of the streaming response. The last/longest one is the complete answer.
+    # Use regex search (not startswith) because TUI cursor repositioning can
+    # place "Model:" mid-line after other content once ANSI codes are stripped.
+    model_re = re.compile(r'Model:\s+(.*)')
     model_contents = []
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Model:"):
-            content = stripped[len("Model:"):].strip()
+        match = model_re.search(line)
+        if match:
+            content = match.group(1).strip()
             if content:
                 model_contents.append(content)
 
@@ -192,6 +210,10 @@ class GeminiProcess:
 
         # Wait for the CLI to become ready (input prompt / initial output)
         await self._wait_for_ready()
+        # The TUI continues rendering the status bar after "Type your message".
+        # Give it time to finish, then discard so it doesn't pollute the first turn.
+        await asyncio.sleep(0.5)
+        await self._drain_buffer()
         self._ready = True
         logger.info("Gemini CLI ready (pid=%s)", self._child.pid)
 
@@ -272,6 +294,26 @@ class GeminiProcess:
             await self._spawn()
         return
 
+    async def _drain_buffer(self) -> None:
+        """Drain any pending output from the PTY buffer.
+
+        This prevents _wait_for_ready from matching stale markers
+        left over from previous interactions.
+        """
+        loop = asyncio.get_event_loop()
+        drained = 0
+        while True:
+            try:
+                chunk = await loop.run_in_executor(
+                    None, lambda: self._child.read_nonblocking(65536, timeout=0.3)
+                )
+                if chunk:
+                    drained += len(chunk)
+            except (pexpect.TIMEOUT, pexpect.EOF):
+                break
+        if drained:
+            logger.debug("Drained %d bytes of stale buffer", drained)
+
     async def clear(self) -> None:
         """Send /clear to the CLI to clear screen and conversation history."""
         async with self._lock:
@@ -279,13 +321,24 @@ class GeminiProcess:
                 raise RuntimeError("Gemini CLI process is not running")
 
             logger.info("Clearing conversation context via /clear")
+
+            # Drain stale PTY output so _wait_for_ready won't match
+            # an old "Type your message" marker from before the /clear.
+            await self._drain_buffer()
+
             self._child.send("/clear")
             await asyncio.sleep(0.1)
             self._child.send("\r")
             self._turn_count = 0
 
-            # Wait for the CLI to be ready again
+            # Wait for the CLI to be ready again (fresh marker)
             await self._wait_for_ready()
+
+            # The Ink TUI redraws "Type your message" almost instantly after
+            # /clear, but its stdin handler isn't fully re-attached yet.
+            # Without this delay, the next prompt sent gets swallowed.
+            await asyncio.sleep(CLEAR_SETTLE_DELAY)
+            await self._drain_buffer()
 
     # --- Chat ----------------------------------------------------------------
 
@@ -303,6 +356,10 @@ class GeminiProcess:
             self._turn_count += 1
             logger.info("Turn %d — sending prompt (%d chars)", self._turn_count, len(prompt))
 
+            # Drain stale output (startup status bar, previous turn leftovers)
+            # so _collect_response doesn't false-positive on an old done marker.
+            await self._drain_buffer()
+
             # Send the prompt text, then a separate \r after a brief pause.
             # Ink (React TUI) processes stdin byte-by-byte as key events.
             # Sending text+Enter as one burst causes Enter to be swallowed.
@@ -316,16 +373,50 @@ class GeminiProcess:
             return response
 
     async def _collect_response(self, prompt_sent: str) -> str:
-        """Read output until idle-timeout indicates the response is complete."""
+        """Read output until we're confident the response is complete.
+
+        Detection strategy (two tiers):
+
+        1. **Primary markers** (e.g. "YOLO ctrl+y"): high-confidence TUI
+           status-bar indicators that the CLI is idle. Only requires
+           RESPONSE_MIN_WAIT to have elapsed.
+
+        2. **Model-content stabilization** (fallback): after /clear the primary
+           marker may never appear.  Instead we watch for ``Model:`` prefixed
+           lines in the output.  The ``clean_response`` function takes the
+           *longest* ``Model:`` segment as the final answer, so once no chunk
+           has contained a *longer* ``Model:`` segment for
+           RESPONSE_MODEL_STABLE_TIMEOUT seconds, the answer has stabilized
+           and we can stop reading.
+        """
         loop = asyncio.get_event_loop()
         chunks: list[str] = []
         start = time.monotonic()
+        exit_reason = "unknown"
+
+        # Fallback tracking: length of longest Model: content seen so far,
+        # and the timestamp at which it last grew.
+        best_model_len = 0
+        last_model_growth = 0.0  # monotonic time of last growth
+        model_re = re.compile(r'Model:\s+(.*)')
 
         while True:
             elapsed = time.monotonic() - start
             if elapsed > RESPONSE_MAX_TIMEOUT:
+                exit_reason = "max_timeout"
                 logger.warning("Hit max timeout (%.0fs) — returning partial response", RESPONSE_MAX_TIMEOUT)
                 break
+
+            # --- Fallback: model content stabilized? ---
+            if best_model_len > 0 and elapsed >= RESPONSE_MIN_WAIT:
+                since_growth = time.monotonic() - last_model_growth
+                if since_growth >= RESPONSE_MODEL_STABLE_TIMEOUT:
+                    exit_reason = "model_stable"
+                    logger.info(
+                        "Model content stabilized (%d chars, %.1fs since last growth)",
+                        best_model_len, since_growth,
+                    )
+                    break
 
             try:
                 chunk = await loop.run_in_executor(
@@ -334,15 +425,43 @@ class GeminiProcess:
                 )
                 if chunk:
                     chunks.append(chunk)
-                    logger.debug("Chunk (%d bytes): %r", len(chunk), chunk[:120])
+                    stripped_chunk = strip_ansi(chunk)
+                    logger.debug("Chunk (%d bytes): %r", len(chunk), chunk[:200])
+
+                    # Track longest Model: content for stabilization fallback
+                    for line in stripped_chunk.splitlines():
+                        match = model_re.search(line)
+                        if match:
+                            content_len = len(match.group(1).strip())
+                            if content_len > best_model_len:
+                                best_model_len = content_len
+                                last_model_growth = time.monotonic()
+                                logger.debug("Model content grew to %d chars at %.1fs", best_model_len, elapsed)
+
+                    chunk_lower = stripped_chunk.lower()
+
+                    # --- Tier 1: primary markers (high confidence) ---
+                    primary_hit = any(
+                        m.lower() in chunk_lower
+                        for m in RESPONSE_DONE_MARKERS_PRIMARY
+                    )
+                    if primary_hit:
+                        if elapsed >= RESPONSE_MIN_WAIT:
+                            exit_reason = "done_marker"
+                            logger.debug("Primary done marker matched at %.1fs", elapsed)
+                            break
+                        else:
+                            logger.debug("Ignoring early primary marker at %.1fs (min_wait=%.1fs)", elapsed, RESPONSE_MIN_WAIT)
+
             except pexpect.TIMEOUT:
                 # Idle timeout — response is likely complete
                 if chunks:
-                    logger.debug("Idle timeout after output → response complete")
+                    exit_reason = "idle_timeout"
                     break
                 # No output yet — keep waiting (model might be thinking)
                 if elapsed < RESPONSE_MAX_TIMEOUT:
                     continue
+                exit_reason = "idle_timeout_no_output"
                 break
             except pexpect.EOF:
                 logger.error("Gemini CLI process terminated unexpectedly")
@@ -350,6 +469,12 @@ class GeminiProcess:
                 raise RuntimeError("Gemini CLI process died during response")
 
         raw = "".join(chunks)
+        # Log how the response ended and a tail of the stripped output for debugging
+        stripped_tail = strip_ansi(raw)[-300:] if raw else "(empty)"
+        logger.info(
+            "Response complete via %s (%.1fs, %d bytes raw). Tail: %r",
+            exit_reason, time.monotonic() - start, len(raw), stripped_tail,
+        )
         return clean_response(raw, prompt_sent)
 
     # --- Status --------------------------------------------------------------
@@ -379,17 +504,17 @@ class ChatManager:
         async with self._lock:
             if name in self._sessions:
                 session = self._sessions[name]
-                if not session.is_alive:
-                    logger.info("Session '%s' found dead, restarting", name)
-                    await session.start()
-                return session
+                if session.is_alive:
+                    return session
+                logger.info("Session '%s' found dead, restarting", name)
+            else:
+                logger.info("Creating new session: '%s'", name)
+                session = GeminiProcess()
+                self._sessions[name] = session
 
-            logger.info("Creating new session: '%s'", name)
-            session = GeminiProcess()
-            self._sessions[name] = session
-
-        # Start outside the manager lock so other sessions aren't blocked
-        # during the ~10s startup.
+        # Start/restart outside the manager lock so other sessions aren't
+        # blocked during the ~10s startup. The session's own _lock in
+        # start() serializes concurrent starts for the same session.
         await session.start()
         return session
 
