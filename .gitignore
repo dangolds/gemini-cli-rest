@@ -1,1 +1,6 @@
 .claude/
+.env
+.venv/
+__pycache__/
+*.pyc
+files.zip

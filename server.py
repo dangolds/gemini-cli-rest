@@ -2,7 +2,8 @@
 REST API server that wraps Gemini CLI interactive mode.
 
 Communicates with Gemini CLI via PTY (pseudo-terminal) using pexpect,
-exposing /chat and /reset endpoints for programmatic access.
+exposing named multi-session chat endpoints for programmatic access.
+Each session (/chat/{name}) gets its own CLI process with isolated context.
 """
 
 import asyncio
@@ -15,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import pexpect
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -272,25 +273,19 @@ class GeminiProcess:
         return
 
     async def clear(self) -> None:
-        """Send /clear to the CLI to reset conversation context without restarting."""
+        """Send /clear to the CLI to clear screen and conversation history."""
         async with self._lock:
             if not self._child or not self._child.isalive():
                 raise RuntimeError("Gemini CLI process is not running")
 
-            logger.info("Clearing conversation context")
+            logger.info("Clearing conversation context via /clear")
             self._child.send("/clear")
             await asyncio.sleep(0.1)
             self._child.send("\r")
             self._turn_count = 0
 
-            # Drain the confirmation output so it doesn't leak into the next chat
-            loop = asyncio.get_event_loop()
-            try:
-                await loop.run_in_executor(
-                    None, lambda: self._child.read_nonblocking(65536, timeout=3)
-                )
-            except (pexpect.TIMEOUT, pexpect.EOF):
-                pass
+            # Wait for the CLI to be ready again
+            await self._wait_for_ready()
 
     # --- Chat ----------------------------------------------------------------
 
@@ -369,78 +364,139 @@ class GeminiProcess:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# Session Manager
 # ---------------------------------------------------------------------------
 
-gemini = GeminiProcess()
+@dataclass
+class ChatManager:
+    """Manages named chat sessions, each backed by its own GeminiProcess."""
+
+    _sessions: dict[str, GeminiProcess] = field(default_factory=dict, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    async def get_or_create(self, name: str) -> GeminiProcess:
+        """Return an existing session or create and start a new one."""
+        async with self._lock:
+            if name in self._sessions:
+                session = self._sessions[name]
+                if not session.is_alive:
+                    logger.info("Session '%s' found dead, restarting", name)
+                    await session.start()
+                return session
+
+            logger.info("Creating new session: '%s'", name)
+            session = GeminiProcess()
+            self._sessions[name] = session
+
+        # Start outside the manager lock so other sessions aren't blocked
+        # during the ~10s startup.
+        await session.start()
+        return session
+
+    async def get(self, name: str) -> GeminiProcess | None:
+        """Return a session by name, or None."""
+        async with self._lock:
+            return self._sessions.get(name)
+
+    async def remove(self, name: str) -> bool:
+        """Stop and remove a single session. Returns True if it existed."""
+        async with self._lock:
+            session = self._sessions.pop(name, None)
+        if session:
+            await session.stop()
+            return True
+        return False
+
+    async def stop_all(self) -> int:
+        """Stop and remove ALL sessions. Returns count stopped."""
+        async with self._lock:
+            sessions = dict(self._sessions)
+            self._sessions.clear()
+        for session in sessions.values():
+            await session.stop()
+        return len(sessions)
+
+    async def list_sessions(self) -> dict[str, dict]:
+        """Return status info for all sessions."""
+        async with self._lock:
+            snapshot = dict(self._sessions)
+        return {
+            name: {"alive": s.is_alive, "turn_count": s.turn_count}
+            for name, s in snapshot.items()
+        }
+
+
+manager = ChatManager()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start Gemini CLI on startup, stop on shutdown."""
-    logger.info("Starting Gemini CLI process...")
-    try:
-        await gemini.start()
-    except Exception as e:
-        logger.error("Failed to start Gemini CLI: %s", e)
-        logger.error(
-            "Make sure 'gemini' is installed (npx @google/gemini-cli) "
-            "and you are authenticated."
-        )
-        # Don't crash the server — let health endpoint report the issue
+    """Sessions are created lazily. On shutdown, stop all."""
+    logger.info("Server starting (sessions will be created on demand)")
     yield
-    logger.info("Shutting down Gemini CLI...")
-    await gemini.stop()
+    logger.info("Shutting down — stopping all sessions...")
+    count = await manager.stop_all()
+    logger.info("Stopped %d session(s)", count)
 
 
 app = FastAPI(
     title="Gemini CLI REST Bridge",
     description=(
         "REST API that wraps Google's Gemini CLI interactive mode, "
-        "providing a simple HTTP interface for chat with conversation continuity."
+        "providing named multi-session chat with conversation continuity."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
 # --- Request/Response models ------------------------------------------------
 
+_NAME = Path(..., pattern=r"^[a-zA-Z0-9_-]+$", max_length=64,
+             description="Session name (alphanumeric, hyphens, underscores)")
+
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=50_000, description="The message to send")
 
 class ChatResponse(BaseModel):
     response: str
+    session: str
     turn: int
     elapsed_ms: int
 
-class StatusResponse(BaseModel):
-    status: str
+class SessionStatus(BaseModel):
+    name: str
     alive: bool
     turn_count: int
 
-class ResetResponse(BaseModel):
+class HealthResponse(BaseModel):
+    status: str
+    active_sessions: int
+    sessions: list[SessionStatus]
+
+class MessageResponse(BaseModel):
     status: str
     message: str
 
 
 # --- Endpoints ---------------------------------------------------------------
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    """
-    Send a message to the current Gemini CLI session.
-    Maintains conversation context across calls.
-    """
-    if not gemini.is_alive:
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini CLI is not running. Try POST /reset to restart.",
-        )
+@app.post("/chat/{name}", response_model=ChatResponse)
+async def chat(req: ChatRequest, name: str = _NAME):
+    """Send a message to a named session. Creates the session on first use."""
+    try:
+        session = await manager.get_or_create(name)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=f"Failed to start session '{name}': {e}")
 
     t0 = time.monotonic()
     try:
-        response = await gemini.send(req.prompt)
+        response = await session.send(req.prompt)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -449,48 +505,71 @@ async def chat(req: ChatRequest):
     if not response:
         raise HTTPException(
             status_code=504,
-            detail="No response received from Gemini CLI (timeout or empty output).",
+            detail="No response received (timeout or empty output).",
         )
 
     return ChatResponse(
         response=response,
-        turn=gemini.turn_count,
+        session=name,
+        turn=session.turn_count,
         elapsed_ms=elapsed,
     )
 
 
-@app.post("/clear", response_model=ResetResponse)
-async def clear():
-    """Clear conversation context without restarting the CLI process."""
-    if not gemini.is_alive:
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini CLI is not running. Try POST /reset to restart.",
-        )
+@app.post("/clear/{name}", response_model=MessageResponse)
+async def clear(name: str = _NAME):
+    """Clear conversation context for a session without restarting the process."""
+    session = await manager.get(name)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+    if not session.is_alive:
+        raise HTTPException(status_code=503, detail=f"Session '{name}' is not running. Use /reset/{name}.")
     try:
-        await gemini.clear()
+        await session.clear()
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    return MessageResponse(status="ok", message=f"Session '{name}' context cleared.")
 
-    return ResetResponse(status="ok", message="Conversation cleared.")
 
-
-@app.post("/reset", response_model=ResetResponse)
-async def reset():
-    """Kill the current session and start a fresh conversation."""
+@app.post("/reset/{name}", response_model=MessageResponse)
+async def reset(name: str = _NAME):
+    """Kill and restart a specific session (fresh conversation)."""
+    session = await manager.get(name)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
     try:
-        await gemini.reset()
+        await session.reset()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reset: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset session '{name}': {e}")
+    return MessageResponse(status="ok", message=f"Session '{name}' reset.")
 
-    return ResetResponse(status="ok", message="Session reset — new conversation started.")
+
+@app.delete("/chat/{name}", response_model=MessageResponse)
+async def delete_session(name: str = _NAME):
+    """Kill and permanently remove a specific session."""
+    removed = await manager.remove(name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+    return MessageResponse(status="ok", message=f"Session '{name}' deleted.")
 
 
-@app.get("/health", response_model=StatusResponse)
+@app.post("/stop", response_model=MessageResponse)
+async def stop_all():
+    """Kill ALL sessions. Clean slate."""
+    count = await manager.stop_all()
+    return MessageResponse(status="ok", message=f"Stopped {count} session(s).")
+
+
+@app.get("/health", response_model=HealthResponse)
 async def health():
-    """Check whether the Gemini CLI process is alive."""
-    return StatusResponse(
-        status="ok" if gemini.is_alive else "down",
-        alive=gemini.is_alive,
-        turn_count=gemini.turn_count,
+    """List all active sessions and their status."""
+    sessions_info = await manager.list_sessions()
+    session_list = [
+        SessionStatus(name=name, alive=info["alive"], turn_count=info["turn_count"])
+        for name, info in sessions_info.items()
+    ]
+    return HealthResponse(
+        status="ok" if all(s.alive for s in session_list) or not session_list else "degraded",
+        active_sessions=len(session_list),
+        sessions=session_list,
     )
