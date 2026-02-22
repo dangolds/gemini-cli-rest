@@ -323,3 +323,64 @@ class TestValidation:
         )
         assert r.status_code == 422
         print(f"  [{_ts()}] PASS: Got 422 as expected", flush=True)
+
+
+class TestSpecialCharacters:
+    """Verify that special characters in prompts don't trigger TUI shortcuts.
+
+    Uses a single session for all sub-tests to avoid ~30s startup overhead per case.
+    Each sub-test sends a prompt containing a dangerous character plus a unique token,
+    then asserts the token was echoed back in a normal model response (not swallowed
+    by a TUI shortcut like shell mode or file selector).
+    """
+
+    def test_special_chars_treated_as_text(self, cleanup):
+        print(f"\n[{_ts()}] TEST: Special characters — do dangerous chars get treated as text?", flush=True)
+        name = f"test-specchar-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+
+        # Each tuple: (label, prompt_template with {token} placeholder)
+        cases = [
+            ("exclamation mark (!)", "Repeat this token exactly: !{token}"),
+            ("triple backticks", "Here is a code block:\n```\nprint('hello')\n```\nNow repeat this token exactly: {token}"),
+            ("at sign (@)", "My email is user@example.com — repeat this token exactly: {token}"),
+            ("embedded newlines", "Line one\nLine two\nLine three\nRepeat this token exactly: {token}"),
+            ("backslash", "The path is C:\\Users\\test — repeat this token exactly: {token}"),
+            ("single quotes", "It's a test with 'quotes' — repeat this token exactly: {token}"),
+            ("double quotes", 'She said "hello" and "goodbye" — repeat this token exactly: {token}'),
+            ("forward slash", "Use /dev/null or /tmp/test — repeat this token exactly: {token}"),
+        ]
+
+        total = len(cases) + 1  # +1 for the combined stress test
+
+        for i, (label, template) in enumerate(cases, 1):
+            token = _unique()
+            prompt = template.format(token=token)
+            print(f"  [{_ts()}] Step {i}/{total}: Testing {label}...", flush=True)
+            resp = chat(name, prompt)
+
+            # Core assertion: model echoed back the token (prompt arrived as text)
+            assert token in resp["response"].lower(), (
+                f"[{label}] Expected token '{token}' in response: {resp['response']!r}"
+            )
+            # Safety assertion: no shell mode contamination
+            resp_lower = resp["response"].lower()
+            assert "shell mode" not in resp_lower, (
+                f"[{label}] Shell mode detected in response: {resp['response']!r}"
+            )
+
+        # Final combined stress test — all dangerous chars in one prompt
+        token = _unique()
+        combined = (
+            f'!bang @mention "double" \'single\' /slash \\back\n'
+            f"```code```\nRepeat this token exactly: {token}"
+        )
+        print(f"  [{_ts()}] Step {total}/{total}: Testing combined stress test...", flush=True)
+        resp = chat(name, combined)
+        assert token in resp["response"].lower(), (
+            f"[combined] Expected token '{token}' in response: {resp['response']!r}"
+        )
+        assert "shell mode" not in resp["response"].lower(), (
+            f"[combined] Shell mode detected in response: {resp['response']!r}"
+        )
+        print(f"  [{_ts()}] PASS: All special characters treated as text", flush=True)
