@@ -480,6 +480,20 @@ class GeminiProcess:
                         else:
                             logger.debug("Ignoring early primary marker at %.1fs (min_wait=%.1fs)", elapsed, RESPONSE_MIN_WAIT)
 
+                    # --- Tier 2: secondary marker ("Type your message" without "responding") ---
+                    # For plain-text responses (no tool use / file writes), the TUI
+                    # never shows the primary "YOLO ctrl+y" marker. Instead it shows
+                    # "Type your message" once the model finishes. While still
+                    # streaming, the TUI also shows "responding" alongside "Type your
+                    # message", so we require its absence as a completion signal.
+                    if elapsed >= RESPONSE_MIN_WAIT:
+                        has_ready = READY_MARKER.lower() in chunk_lower
+                        has_responding = "responding" in chunk_lower
+                        if has_ready and not has_responding:
+                            exit_reason = "done_marker_secondary"
+                            logger.debug("Secondary done marker (ready w/o responding) at %.1fs", elapsed)
+                            break
+
             except pexpect.TIMEOUT:
                 # Idle timeout — response is likely complete
                 if chunks:
