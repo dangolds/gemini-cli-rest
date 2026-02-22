@@ -349,6 +349,14 @@ class TestSpecialCharacters:
             ("single quotes", "It's a test with 'quotes' — repeat this token exactly: {token}"),
             ("double quotes", 'She said "hello" and "goodbye" — repeat this token exactly: {token}'),
             ("forward slash", "Use /dev/null or /tmp/test — repeat this token exactly: {token}"),
+            ("mixed/nested quotes", "She said \"it's 'complicated'\" — isn't it? Repeat this token exactly: {token}"),
+            ("special chars ($, %, &, <html>)", "$HOME, \\n, \\t, %, &, <html>, {{json: \"val\"}} — repeat this token exactly: {token}"),
+            ("multiline + unicode", "Hello \U0001f30d café naïve \u65e5\u672c\u8a9e \u03a9\u221e\u2248 — repeat this token exactly: {token}"),
+            ("SQL injection style", "'; DROP TABLE users; -- <script>alert(1)</script> — repeat this token exactly: {token}"),
+            ("control characters (tabs)", "Col1\tCol2\tCol3\nVal1\tVal2\tVal3 — repeat this token exactly: {token}"),
+            ("JSON payload", '{{"name": "test", "nested": {{"key": "val with quotes"}}}} — repeat this token exactly: {token}'),
+            ("rich markdown", "# Header\n| Col | Col |\n|-----|-----|\n| A | B |\n> blockquote\n[link](http://example.com)\nRepeat this token exactly: {token}"),
+            ("regex and glob patterns", "^[a-z]+@[\\w.]+$ and *.{{ts,tsx}} and $(echo hi) | grep x — repeat this token exactly: {token}"),
         ]
 
         total = len(cases) + 1  # +1 for the combined stress test
@@ -384,3 +392,105 @@ class TestSpecialCharacters:
             f"[combined] Shell mode detected in response: {resp['response']!r}"
         )
         print(f"  [{_ts()}] PASS: All special characters treated as text", flush=True)
+
+    def test_simple_prompt_baseline(self, cleanup):
+        """Baseline: a trivial prompt returns a coherent response."""
+        print(f"\n[{_ts()}] TEST: Simple prompt baseline", flush=True)
+        name = f"test-baseline-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+        resp = chat(name, f'Say "OK" and then repeat this token exactly: {token}')
+        assert token in resp["response"].lower(), (
+            f"Expected token '{token}' in response: {resp['response']!r}"
+        )
+        print(f"  [{_ts()}] PASS: Simple prompt baseline", flush=True)
+
+    def test_long_prompt(self, cleanup):
+        """~3000-char prompt (60x repeated pangram) is handled correctly."""
+        print(f"\n[{_ts()}] TEST: Long prompt (~3000 chars)", flush=True)
+        name = f"test-longprompt-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+        pangram = "The quick brown fox jumps over the lazy dog. " * 60
+        prompt = f"{pangram}\nNow repeat this token exactly: {token}"
+        print(f"  [{_ts()}] Sending {len(prompt)}-char prompt...", flush=True)
+        resp = chat(name, prompt)
+        assert token in resp["response"].lower(), (
+            f"Expected token '{token}' in response: {resp['response']!r}"
+        )
+        print(f"  [{_ts()}] PASS: Long prompt handled correctly", flush=True)
+
+    def test_very_long_single_line(self, cleanup):
+        """~5000-char single line is handled correctly."""
+        print(f"\n[{_ts()}] TEST: Very long single line (~5000 chars)", flush=True)
+        name = f"test-longline-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+        filler = "abcdefghijklmnopqrstuvwxyz0123456789" * 140
+        prompt = f"{filler} — repeat this token exactly: {token}"
+        print(f"  [{_ts()}] Sending {len(prompt)}-char single-line prompt...", flush=True)
+        resp = chat(name, prompt)
+        assert token in resp["response"].lower(), (
+            f"Expected token '{token}' in response: {resp['response']!r}"
+        )
+        print(f"  [{_ts()}] PASS: Very long single line handled correctly", flush=True)
+
+    def test_large_code_io(self, cleanup):
+        """~5000-line code input expecting large (~6000-line) code output.
+
+        Stress-tests the PTY I/O pipeline: bracketed paste for large input,
+        and response collection loop for sustained large output.
+        """
+        print(f"\n[{_ts()}] TEST: Large code I/O (~5k lines in, expecting ~6k out)", flush=True)
+        name = f"test-largecodeio-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+
+        # Generate ~5000 lines of Python code (1000 functions × 5 lines each)
+        code_lines = []
+        for i in range(1000):
+            code_lines.append(f"def process_item_{i}(data):")
+            code_lines.append(f"    value = data.get('field_{i}', {i})")
+            code_lines.append(f"    result = value * {i + 1} + {i % 7}")
+            code_lines.append(f"    return {{'id': {i}, 'result': result}}")
+            code_lines.append("")
+
+        code_block = "\n".join(code_lines)
+        prompt = (
+            f"Here is a Python file with {len(code_lines)} lines of code:\n"
+            f"```python\n{code_block}\n```\n\n"
+            f"Rewrite ALL of these functions adding: "
+            f"(1) Google-style docstrings with Args and Returns sections, "
+            f"(2) full type hints on parameters and return types, "
+            f"(3) input validation that raises ValueError for bad input. "
+            f"Output the COMPLETE rewritten file in a single code block — "
+            f"do NOT skip, abbreviate, or summarize any functions. "
+            f"At the very end of the code block, add this comment: # TOKEN: {token}"
+        )
+
+        print(
+            f"  [{_ts()}] Sending {len(code_lines)}-line, {len(prompt)}-char prompt...",
+            flush=True,
+        )
+        resp = chat(name, prompt)
+
+        # Assert token present — proves the full prompt was received and
+        # the model reached the end of its output without truncation
+        assert token in resp["response"].lower(), (
+            f"Expected token '{token}' in response (last 300 chars): "
+            f"{resp['response'][-300:]!r}"
+        )
+
+        # Assert response is substantial (model didn't summarize/skip)
+        resp_lines = resp["response"].strip().splitlines()
+        resp_chars = len(resp["response"])
+        print(
+            f"  [{_ts()}] Got {len(resp_lines)} lines, {resp_chars} chars back",
+            flush=True,
+        )
+        assert len(resp_lines) >= 2000, (
+            f"Expected at least 2000 lines in response, got {len(resp_lines)}. "
+            f"Model may have summarized instead of outputting all functions."
+        )
+
+        print(f"  [{_ts()}] PASS: Large code I/O handled correctly", flush=True)

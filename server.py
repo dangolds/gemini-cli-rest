@@ -639,7 +639,7 @@ _NAME = Path(..., pattern=r"^[a-zA-Z0-9_-]+$", max_length=64,
              description="Session name (alphanumeric, hyphens, underscores)")
 
 class ChatRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, max_length=50_000, description="The message to send")
+    prompt: str = Field(..., min_length=1, max_length=500_000, description="The message to send")
 
 class ChatResponse(BaseModel):
     response: str
