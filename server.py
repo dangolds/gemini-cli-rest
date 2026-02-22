@@ -91,59 +91,83 @@ def strip_ansi(text: str) -> str:
     return text
 
 
+_TUI_CHROME_PREFIXES = (
+    "User:", "/app ", "responding", "── Shortcuts",
+    "❯", ">", ">>>", "│", "╭", "╰", "─",
+    "? for shortcuts", "YOLO mode", "YOLO ctrl+y",
+)
+
+
+def _is_tui_chrome(line: str) -> bool:
+    """Return True if *line* is TUI chrome rather than model content.
+
+    Blank lines are NOT considered chrome — they can appear inside
+    multi-line model responses (e.g. between paragraphs or code blocks).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return any(stripped.startswith(p) for p in _TUI_CHROME_PREFIXES)
+
+
 def clean_response(raw: str, prompt_sent: str) -> str:
     """
     Extract the model's response from raw PTY output.
 
-    In screen-reader mode, the model's response lines are prefixed with "Model:".
-    The TUI redraws these lines as the response streams in, so each successive
-    "Model:" block is a longer version of the response. We take the last one.
+    In screen-reader mode, the model's response lines are prefixed with
+    "Model:".  The TUI redraws these lines as the response streams in, so
+    each successive "Model:" block is a progressively longer snapshot.
+
+    Multi-line responses (e.g. code blocks) are rendered as a ``Model:``
+    line followed by continuation lines that lack the prefix.  We collect
+    each block (``Model:`` line + continuations) and return the longest one.
     """
     text = strip_ansi(raw)
 
-    # Extract "Model: ..." segments — each is a progressively longer snapshot
-    # of the streaming response. The last/longest one is the complete answer.
-    # Use regex search (not startswith) because TUI cursor repositioning can
-    # place "Model:" mid-line after other content once ANSI codes are stripped.
+    # --- Primary: block-based extraction from Model: prefixed output ---
+    # A Model: line starts a new block.  Subsequent lines are appended
+    # to the block *unless* they are TUI chrome, which is silently
+    # skipped (NOT treated as a block terminator — the TUI interleaves
+    # chrome like "/app ..." and "responding ..." between content lines
+    # during redraws).  A block only ends when the next Model: line
+    # starts a new one, or we reach end-of-input.
     model_re = re.compile(r'Model:\s+(.*)')
-    model_contents = []
+    blocks: list[list[str]] = []       # each element is a list of lines
+    current_block: list[str] | None = None
+
     for line in text.splitlines():
         match = model_re.search(line)
         if match:
+            # Start a new block
             content = match.group(1).strip()
-            if content:
-                model_contents.append(content)
+            current_block = [content] if content else []
+            blocks.append(current_block)
+        elif current_block is not None:
+            if _is_tui_chrome(line):
+                continue              # skip chrome, keep block open
+            stripped = line.strip()
+            if stripped:
+                current_block.append(stripped)
+            # blank lines are silently skipped (common between redraws)
 
-    if model_contents:
-        # Take the longest entry (the final complete response)
-        return max(model_contents, key=len)
+    if blocks:
+        # Pick the block with the most total content
+        def _block_len(b: list[str]) -> int:
+            return sum(len(l) for l in b)
+        best = max(blocks, key=_block_len)
+        return "\n".join(best).strip()
 
-    # Fallback: remove known TUI artifacts and echoed prompt
+    # --- Fallback: remove known TUI artifacts and echoed prompt ---
     lines = text.splitlines()
     cleaned: list[str] = []
     prompt_stripped = prompt_sent.strip()
-    # Patterns that are TUI chrome, not content
-    skip_patterns = {
-        "❯", ">", ">>>", "│", "╭", "╰", "─",
-        "? for shortcuts", "YOLO mode", "YOLO ctrl+y",
-    }
     for line in lines:
         stripped = line.strip()
+        if not stripped:
+            continue
         if stripped == prompt_stripped:
             continue
-        if stripped.startswith("User:"):
-            continue
-        if stripped.startswith("/app "):
-            continue
-        if stripped.startswith("responding"):
-            continue
-        if any(stripped.startswith(p) for p in skip_patterns):
-            continue
-        if stripped.startswith("── Shortcuts"):
-            continue
-        if stripped in skip_patterns:
-            continue
-        if not stripped:
+        if _is_tui_chrome(line):
             continue
         cleaned.append(line)
 
