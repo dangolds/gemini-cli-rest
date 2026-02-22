@@ -360,10 +360,13 @@ class GeminiProcess:
             # so _collect_response doesn't false-positive on an old done marker.
             await self._drain_buffer()
 
-            # Send the prompt text, then a separate \r after a brief pause.
-            # Ink (React TUI) processes stdin byte-by-byte as key events.
-            # Sending text+Enter as one burst causes Enter to be swallowed.
+            # Wrap prompt in bracketed paste mode so the Ink TUI treats it as
+            # literal text, not as individual key events.  Without this,
+            # characters like '!' (shell mode), backticks, '@', and '\n'
+            # trigger TUI shortcuts instead of being sent as text.
+            self._child.send("\x1b[200~")   # begin bracketed paste
             self._child.send(prompt)
+            self._child.send("\x1b[201~")   # end bracketed paste
             await asyncio.sleep(0.1)
             self._child.send("\r")
 
@@ -475,6 +478,18 @@ class GeminiProcess:
             "Response complete via %s (%.1fs, %d bytes raw). Tail: %r",
             exit_reason, time.monotonic() - start, len(raw), stripped_tail,
         )
+
+        # Safety net: detect if the TUI accidentally entered shell mode.
+        # If so, send Escape to exit and log a warning.
+        stripped_raw = strip_ansi(raw).lower()
+        if "shell mode" in stripped_raw or "type your shell command" in stripped_raw:
+            logger.warning(
+                "Shell mode detected in response — sending Escape to exit"
+            )
+            self._child.send("\x1b")        # Escape exits shell mode
+            await asyncio.sleep(0.3)
+            await self._drain_buffer()       # discard shell-mode TUI output
+
         return clean_response(raw, prompt_sent)
 
     # --- Status --------------------------------------------------------------

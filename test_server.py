@@ -64,8 +64,7 @@ def server():
 
 def chat(session: str, prompt: str) -> dict:
     """Send a chat message and return the JSON response."""
-    preview = (prompt[:60] + "...") if len(prompt) > 60 else prompt
-    print(f"  [{_ts()}] >>> {session}: {preview}", flush=True)
+    print(f"  [{_ts()}] >>> {session}: {prompt}", flush=True)
     t0 = time.monotonic()
     r = httpx.post(
         f"{BASE}/chat/{session}",
@@ -75,8 +74,7 @@ def chat(session: str, prompt: str) -> dict:
     r.raise_for_status()
     data = r.json()
     elapsed = time.monotonic() - t0
-    resp_preview = (data["response"][:80] + "...") if len(data["response"]) > 80 else data["response"]
-    print(f"  [{_ts()}] <<< {session} (turn {data['turn']}, {elapsed:.1f}s): {resp_preview}", flush=True)
+    print(f"  [{_ts()}] <<< {session} (turn {data['turn']}, {elapsed:.1f}s): {data['response']}", flush=True)
     return data
 
 
