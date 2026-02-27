@@ -95,6 +95,7 @@ _TUI_CHROME_PREFIXES = (
     "User:", "/app ", "responding", "── Shortcuts",
     "❯", ">", ">>>", "│", "╭", "╰", "─",
     "? for shortcuts", "YOLO mode", "YOLO ctrl+y",
+    "Press Ctrl+O", "[Pasted Text",
 )
 
 
@@ -388,14 +389,40 @@ class GeminiProcess:
             # literal text, not as individual key events.  Without this,
             # characters like '!' (shell mode), backticks, '@', and '\n'
             # trigger TUI shortcuts instead of being sent as text.
-            self._child.send("\x1b[200~")   # begin bracketed paste
-            self._child.send(prompt)
-            self._child.send("\x1b[201~")   # end bracketed paste
-            await asyncio.sleep(0.1)
-            self._child.send("\r")
+            #
+            # The Ink TUI collapses ANY multi-line bracketed paste into an
+            # unsubmittable "[Pasted Text: N lines]" widget.  For large
+            # prompts we write to a temp file and use the @file syntax so
+            # the CLI reads the file and includes its content in the API
+            # request to the model.
+            PASTE_FILE_THRESHOLD = 50_000   # chars — above this, use @file
 
-            # Collect output
-            response = await self._collect_response(prompt)
+            temp_path: str | None = None
+            try:
+                if len(prompt) > PASTE_FILE_THRESHOLD:
+                    temp_path = f"/app/.gemini_prompt_{id(self)}_{self._turn_count}.md"
+                    with open(temp_path, "w") as f:
+                        f.write(prompt)
+                    logger.info("Large prompt — wrote %d chars to %s", len(prompt), temp_path)
+                    self._child.send(f"@{temp_path}")
+                    await asyncio.sleep(0.5)
+                else:
+                    self._child.send("\x1b[200~")
+                    self._child.send(prompt)
+                    self._child.send("\x1b[201~")
+                    await asyncio.sleep(0.1)
+
+                self._child.send("\r")
+
+                # Collect output
+                response = await self._collect_response(prompt)
+            finally:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+
             logger.info("Turn %d — response collected (%d chars)", self._turn_count, len(response))
             return response
 
@@ -425,7 +452,9 @@ class GeminiProcess:
         # and the timestamp at which it last grew.
         best_model_len = 0
         last_model_growth = 0.0  # monotonic time of last growth
+        last_responding = 0.0    # monotonic time "responding" last seen in output
         model_re = re.compile(r'Model:\s+(.*)')
+        paste_resubmitted = False  # only retry once
 
         while True:
             elapsed = time.monotonic() - start
@@ -435,9 +464,14 @@ class GeminiProcess:
                 break
 
             # --- Fallback: model content stabilized? ---
+            # Don't trigger if "responding" appeared recently — the model
+            # may be executing a tool (file read, shell command) in YOLO
+            # mode and Model: content pauses during tool execution.
             if best_model_len > 0 and elapsed >= RESPONSE_MIN_WAIT:
                 since_growth = time.monotonic() - last_model_growth
-                if since_growth >= RESPONSE_MODEL_STABLE_TIMEOUT:
+                since_responding = time.monotonic() - last_responding
+                if (since_growth >= RESPONSE_MODEL_STABLE_TIMEOUT
+                        and since_responding >= RESPONSE_MODEL_STABLE_TIMEOUT):
                     exit_reason = "model_stable"
                     logger.info(
                         "Model content stabilized (%d chars, %.1fs since last growth)",
@@ -467,10 +501,52 @@ class GeminiProcess:
 
                     chunk_lower = stripped_chunk.lower()
 
+                    # Track "responding" indicator — present while the model
+                    # is actively streaming.  The TUI status bar always
+                    # contains "YOLO ctrl+y" (it's a persistent element),
+                    # so "responding" in the same chunk means the model is
+                    # NOT done yet — we must not treat the marker as a
+                    # completion signal.
+                    has_responding = "responding" in chunk_lower
+                    if has_responding:
+                        last_responding = time.monotonic()
+
+                    # --- Paste-collapse recovery ---
+                    # For very large inputs the Gemini CLI may collapse the
+                    # bracketed paste into a "[Pasted Text: N lines]" widget
+                    # without actually submitting it to the model.  If we
+                    # detect this pattern early (before any model output has
+                    # appeared), re-send Enter to trigger submission.
+                    if (not paste_resubmitted
+                            and elapsed < 3.0
+                            and best_model_len == 0
+                            and ("pasted text" in chunk_lower
+                                 or "ctrl+o" in chunk_lower)
+                            and not has_responding):
+                        paste_resubmitted = True
+                        logger.info(
+                            "Paste-collapse detected at %.1fs — re-sending Enter to submit",
+                            elapsed,
+                        )
+                        self._child.send("\r")
+                        # Reset state so detection timers apply to the real response
+                        start = time.monotonic()
+                        chunks.clear()
+                        best_model_len = 0
+                        last_model_growth = 0.0
+                        continue
+
                     # --- Tier 1: primary markers (high confidence) ---
-                    primary_hit = any(
-                        m.lower() in chunk_lower
-                        for m in RESPONSE_DONE_MARKERS_PRIMARY
+                    # Guard: skip if "responding" is in the same chunk —
+                    # "YOLO ctrl+y" is always in the status bar, even
+                    # mid-stream.  It only signals completion when
+                    # "responding" is absent.
+                    primary_hit = (
+                        not has_responding
+                        and any(
+                            m.lower() in chunk_lower
+                            for m in RESPONSE_DONE_MARKERS_PRIMARY
+                        )
                     )
                     if primary_hit:
                         if elapsed >= RESPONSE_MIN_WAIT:
@@ -488,7 +564,6 @@ class GeminiProcess:
                     # message", so we require its absence as a completion signal.
                     if elapsed >= RESPONSE_MIN_WAIT:
                         has_ready = READY_MARKER.lower() in chunk_lower
-                        has_responding = "responding" in chunk_lower
                         if has_ready and not has_responding:
                             exit_reason = "done_marker_secondary"
                             logger.debug("Secondary done marker (ready w/o responding) at %.1fs", elapsed)
