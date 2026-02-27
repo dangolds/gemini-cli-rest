@@ -541,8 +541,14 @@ class GeminiProcess:
                     # "YOLO ctrl+y" is always in the status bar, even
                     # mid-stream.  It only signals completion when
                     # "responding" is absent.
+                    # Also require that we've actually seen Model: content —
+                    # the TUI redraws "YOLO ctrl+y" during the thinking
+                    # phase before any model output; without this guard
+                    # we false-positive on a status-bar redraw chunk that
+                    # happens to lack "responding".
                     primary_hit = (
                         not has_responding
+                        and best_model_len > 0
                         and any(
                             m.lower() in chunk_lower
                             for m in RESPONSE_DONE_MARKERS_PRIMARY
@@ -562,7 +568,8 @@ class GeminiProcess:
                     # "Type your message" once the model finishes. While still
                     # streaming, the TUI also shows "responding" alongside "Type your
                     # message", so we require its absence as a completion signal.
-                    if elapsed >= RESPONSE_MIN_WAIT:
+                    # Same guard as Tier 1: must have seen Model: content first.
+                    if elapsed >= RESPONSE_MIN_WAIT and best_model_len > 0:
                         has_ready = READY_MARKER.lower() in chunk_lower
                         if has_ready and not has_responding:
                             exit_reason = "done_marker_secondary"
