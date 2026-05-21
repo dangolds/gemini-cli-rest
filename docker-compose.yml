@@ -5,6 +5,7 @@ services:
       - "8000:8000"
     volumes:
       - gemini-config:/root/.gemini
+      - ~/.ssh:/root/.ssh:ro
     environment:
       - RESPONSE_IDLE_TIMEOUT=5
       - RESPONSE_MAX_TIMEOUT=120
@@ -12,6 +13,7 @@ services:
       - STARTUP_TIMEOUT=30
       - CLEAR_SETTLE_DELAY=0.2
       - LOG_LEVEL=INFO
+      - GIT_SSH_COMMAND=ssh -F /dev/null
 
 volumes:
   gemini-config:
