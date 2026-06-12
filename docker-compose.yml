@@ -6,11 +6,16 @@ services:
     volumes:
       - agy-config:/root/.gemini
       - ~/.ssh:/root/.ssh:ro
+      # Repos you want agy to read: mount them under one parent...
+      # - ~/dev/slit/slitled-platform:/repos/slitled-platform
+      # - ~/dev/other-repo:/repos/other-repo
     environment:
       - RESPONSE_MAX_TIMEOUT=120
       - STARTUP_TIMEOUT=60
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
+      # ...and add the parent to every session's workspace (--add-dir is repeatable):
+      # - AGY_EXTRA_ARGS=--add-dir /repos
 
 volumes:
   agy-config:

@@ -12,7 +12,7 @@ if [ ! -f "$SETTINGS" ]; then
   "toolPermission": "always-proceed",
   "enableTelemetry": false,
   "notifications": false,
-  "trustedWorkspaces": ["/app", "/tmp/agy-rest-sessions"]
+  "trustedWorkspaces": ["/app", "/repos", "/tmp/agy-rest-sessions"]
 }
 EOF
 fi
