@@ -1,6 +1,6 @@
-# Gemini CLI REST Bridge
+# Antigravity CLI REST Bridge
 
-REST API server that wraps Google's Gemini CLI interactive mode, giving you HTTP endpoints for **named multi-session chat** with full conversation continuity. Each session gets its own isolated CLI process — run as many parallel conversations as you need.
+REST API server that wraps Google's Antigravity CLI (`agy`) interactive mode, giving you HTTP endpoints for **named multi-session chat** with full conversation continuity. Each session gets its own live, warm CLI process — run as many parallel conversations as you need, with no per-request startup cost.
 
 ## Quick Start (Docker Compose)
 
@@ -9,7 +9,7 @@ REST API server that wraps Google's Gemini CLI interactive mode, giving you HTTP
 docker compose up -d --build
 
 # 2. First time only — authenticate inside the container
-docker exec -it geminidev-gemini-rest-1 gemini
+docker exec -it gemini-cli-rest-agy-rest-1 agy
 # Complete auth in browser, then Ctrl+C to exit
 
 # 3. Restart so the server picks up the auth
@@ -61,7 +61,7 @@ curl -s -X POST http://localhost:8000/chat/coding \
 
 ### `POST /clear/{name}` — Clear conversation context
 
-Clears the conversation history without restarting the process. Instant (~1s).
+Wipes the conversation by respawning agy in a fresh project directory (~5s). A respawn is required because agy keeps **cross-conversation memory per project**: its own `/clear` starts a new conversation that still receives summaries of the previous ones — and the agent can read their transcripts to recover "cleared" context.
 
 ```bash
 curl -s -X POST http://localhost:8000/clear/research
@@ -69,7 +69,7 @@ curl -s -X POST http://localhost:8000/clear/research
 
 ### `POST /reset/{name}` — Full process restart
 
-Kills the session's Gemini CLI process and spawns a new one. Use when the CLI is stuck or misbehaving (~10s).
+Kills the session's agy process and spawns a new one. Use when the CLI is stuck or misbehaving (~25s).
 
 ```bash
 curl -s -X POST http://localhost:8000/reset/research
@@ -128,14 +128,14 @@ docker compose logs -f          # View logs
 
 ## Running Without Docker
 
-Requires Node.js 20+ and Python 3.11+.
+Requires Python 3.11+, tmux, and the Antigravity CLI.
 
 ```bash
-# Install Gemini CLI
-npm install -g @google/gemini-cli
-gemini  # authenticate once
+# Install Antigravity CLI (to ~/.local/bin/agy)
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy  # authenticate once, then /quit or Ctrl+C
 
-# Install Python deps
+# Install Python deps (tmux from your package manager if missing)
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -150,49 +150,57 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 
 | Variable | Default | Description |
 |---|---|---|
-| `GEMINI_CMD` | `gemini` | Path to the gemini CLI binary |
-| `GEMINI_MODEL` | *(auto)* | Model override (e.g. `gemini-2.5-pro`) |
-| `GEMINI_YOLO` | `true` | Auto-approve all tool actions |
-| `GEMINI_SCREEN_READER` | `true` | Screen-reader mode for cleaner output |
-| `GEMINI_EXTRA_ARGS` | | Additional CLI args (space-separated) |
-| `RESPONSE_IDLE_TIMEOUT` | `5` | Seconds of silence before considering response complete |
+| `AGY_CMD` | `agy` | Path to the agy CLI binary |
+| `AGY_SKIP_PERMISSIONS` | `false` | Pass `--dangerously-skip-permissions` to agy. Prefer `"toolPermission": "always-proceed"` in agy's `settings.json` (the Docker image seeds this) |
+| `AGY_EXTRA_ARGS` | | Additional CLI args (space-separated) |
+| `AGY_STATE_DIR` | `~/.gemini/antigravity-cli` | agy's state directory (conversation transcripts live here) |
+| `SESSIONS_ROOT` | `/tmp/agy-rest-sessions` | Per-session working directories |
+| `TMUX_SOCKET` | `agy-rest` | Dedicated tmux server socket name |
+| `RESPONSE_POLL_INTERVAL` | `0.5` | Seconds between completion-detection polls |
 | `RESPONSE_MAX_TIMEOUT` | `120` | Hard cap on response wait time (seconds) |
 | `STARTUP_TIMEOUT` | `60` | Max seconds to wait for CLI startup |
-| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG` for raw output chunks) |
+| `LOG_LEVEL` | `INFO` | Logging level |
 
-### Tuning the idle timeout
-
-- **Too low** (< 3s): May cut off responses mid-generation
-- **Too high** (> 10s): Adds unnecessary latency to every response
-- **Recommended**: Start with `5`, increase to `8-10` if you see truncated responses
+The model is **not** selected per-request — set `"model"` in agy's `settings.json` (`~/.gemini/antigravity-cli/settings.json`).
 
 ## Architecture
 
 ```
-Client (curl/app)          Server (FastAPI)                  Gemini CLI
-─────────────────     ──────────────────────────     ─────────────────
+Client (curl/app)          Server (FastAPI)                 tmux              agy
+─────────────────     ──────────────────────────     ───────────────    ─────────────
                          ChatManager
                       ┌──────────────────────┐
-POST /chat/foo ──────→│  session "foo"       │
-                      │  GeminiProcess ──────────→ pexpect (PTY) → stdin
-                      │  ← read until idle ←────── stdout
-  ← JSON response ←──│                      │
+POST /chat/foo ──────→│  session "foo"       │       tmux session
+                      │  AgySession ─────────────→  "agy-foo"  ─────→  live agy TUI
+                      │                      │       paste-buffer -p → typed input
+                      │   response text ←──────── transcript.jsonl ←── model output
+  ← JSON response ←──│                      │       capture-pane → busy/idle check
                       ├──────────────────────┤
-POST /chat/bar ──────→│  session "bar"       │
-                      │  GeminiProcess ──────────→ pexpect (PTY) → stdin
-                      │  ← read until idle ←────── stdout
-  ← JSON response ←──│                      │
+POST /chat/bar ──────→│  session "bar"       │       tmux session
+                      │  AgySession ─────────────→  "agy-bar"   ─────→  live agy TUI
                       └──────────────────────┘
-POST  /clear/{name} → sends /clear to session's CLI
+POST  /clear/{name} → respawn in a fresh project dir (true context wipe)
 POST  /reset/{name} → kill + respawn session's process
 DELETE /chat/{name} → stop + remove session entirely
 POST  /stop ────────→ stop all sessions
 GET   /health ──────→ list all sessions + status
 ```
 
-The server manages sessions via `ChatManager`. Each named session owns a `GeminiProcess` — a `gemini --screen-reader --yolo` child process on a pseudo-terminal (PTY via `pexpect`). Sessions are created lazily on first `/chat/{name}` request and wait for the `"Type your message"` ready marker before accepting input. Responses are detected by idle-timeout (configurable silence threshold). All ANSI escape codes and TUI artifacts are stripped, and model output is extracted from `"Model:"` prefixed lines.
+Each named session owns a live `agy` process hosted in a detached **tmux** session (dedicated socket, so it never touches your own tmux). tmux acts as a terminal-emulator mediator with three clean channels:
+
+1. **Input** — prompts are injected with `tmux load-buffer` + `paste-buffer -p` (bracketed paste), so newlines and TUI shortcut characters (`!`, `@`, `/`, backticks) always arrive as literal text.
+2. **Response content** — read from agy's structured per-conversation transcript (`brain/<conversation>/.system_generated/logs/transcript.jsonl`), not scraped off the screen. The bridge takes the completed (`DONE`) model steps that appeared after the prompt was sent.
+3. **Busy/idle detection** — `tmux capture-pane` returns the *rendered* screen (no ANSI escapes); a turn is complete when a new model step exists in the transcript **and** the screen shows the idle status bar (`? for shortcuts`) with no `Generating...` indicator.
+
+You can watch any session live while the bridge drives it:
+
+```bash
+tmux -L agy-rest attach -t agy-research   # Ctrl+B then D to detach
+```
 
 ## Limitations
 
 1. **No streaming** — Responses return only after fully collected.
-2. **Idle-timeout heuristic** — Long model pauses (tool execution) may cause truncation. Increase `RESPONSE_IDLE_TIMEOUT` if needed.
+2. **Prompts starting with `/`** may be interpreted as agy slash commands.
+3. **Model selection** is global (agy `settings.json`), not per-session.
+4. **agy's brain is shared** — sessions are isolated per project directory, but the agent has filesystem access; a prompt that explicitly asks it to read another conversation's transcript under `~/.gemini/antigravity-cli/brain/` could cross session boundaries.

@@ -1,26 +1,26 @@
-FROM node:20-slim AS base
+FROM python:3.12-slim
 
-# Install Python + system deps
+# tmux hosts the live agy processes; curl installs agy
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip python3-venv openssh-client git && \
+    apt-get install -y --no-install-recommends tmux curl ca-certificates git openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Gemini CLI globally
-RUN npm install -g @google/gemini-cli
+# Install Antigravity CLI (installs to /root/.local/bin/agy)
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 
 WORKDIR /app
 
 # Python deps
 COPY requirements.txt .
-RUN python3 -m venv /app/.venv && \
+RUN python -m venv /app/.venv && \
     /app/.venv/bin/pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-ENV PATH="/app/.venv/bin:$PATH"
-ENV GEMINI_CMD="gemini"
+ENV PATH="/app/.venv/bin:/root/.local/bin:$PATH"
+ENV AGY_CMD="agy"
 
 EXPOSE 8000
 

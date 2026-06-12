@@ -1,21 +1,25 @@
 """
-REST API server that wraps Gemini CLI interactive mode.
+REST API server that wraps Antigravity CLI (agy) interactive mode.
 
-Communicates with Gemini CLI via PTY (pseudo-terminal) using pexpect,
-exposing named multi-session chat endpoints for programmatic access.
-Each session (/chat/{name}) gets its own CLI process with isolated context.
+Each named session (/chat/{name}) runs its own live `agy` process inside a
+detached tmux session. tmux acts as a terminal emulator mediator: instead of
+parsing the raw PTY escape-code stream, we read the *rendered* screen with
+`tmux capture-pane` (used only for busy/idle detection) and extract the
+model's response as structured data from agy's per-conversation transcript
+file (brain/<conversation>/.system_generated/logs/transcript.jsonl).
 """
 
 import asyncio
+import json
 import logging
 import os
-import re
-import signal
+import shlex
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path as FsPath
 
-import pexpect
 from fastapi import FastAPI, HTTPException, Path
 from pydantic import BaseModel, Field
 
@@ -24,599 +28,432 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-GEMINI_CMD = os.getenv("GEMINI_CMD", "gemini")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")  # e.g. "gemini-2.5-pro"
-GEMINI_YOLO = os.getenv("GEMINI_YOLO", "true").lower() == "true"
-GEMINI_SCREEN_READER = os.getenv("GEMINI_SCREEN_READER", "true").lower() == "true"
-GEMINI_EXTRA_ARGS = os.getenv("GEMINI_EXTRA_ARGS", "")  # space-separated extras
-RESPONSE_IDLE_TIMEOUT = float(os.getenv("RESPONSE_IDLE_TIMEOUT", "5"))  # seconds of silence → response done
-RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "120"))  # hard cap per request
-STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
-RESPONSE_DONE_MARKER = os.getenv("RESPONSE_DONE_MARKER", "YOLO ctrl+y")  # YOLO status bar rendered when response is complete
-# After /clear, the TUI status bar may omit "YOLO ctrl+y" (e.g. no file
-# context), but "Type your message" always appears when ready for input.
-# We split primary markers by comma (high-confidence, only need MIN_WAIT)
-# and keep a separate fallback that checks the chunk contains
-# "Type your message" but NOT "responding" (which the TUI shows while the
-# model is still streaming).
-RESPONSE_DONE_MARKERS_PRIMARY: list[str] = [
-    m.strip() for m in RESPONSE_DONE_MARKER.split(",")
-]
-# How long after the last new Model: content before we consider the response
-# complete (fallback when primary marker never appears, e.g. after /clear).
-RESPONSE_MODEL_STABLE_TIMEOUT = float(os.getenv("RESPONSE_MODEL_STABLE_TIMEOUT", "3"))
-CLEAR_SETTLE_DELAY = float(os.getenv("CLEAR_SETTLE_DELAY", "0.2"))  # seconds to wait after /clear for TUI to re-attach stdin
-RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "2"))  # seconds to ignore done_marker after sending (avoids false-positive from TUI status bar redraw)
+AGY_CMD = os.getenv("AGY_CMD", "agy")
+# Auto-approve tool permission prompts. Prefer setting
+# "toolPermission": "always-proceed" in agy's settings.json instead (the
+# Docker entrypoint seeds it); this flag is the per-process equivalent.
+AGY_SKIP_PERMISSIONS = os.getenv("AGY_SKIP_PERMISSIONS", "false").lower() == "true"
+AGY_EXTRA_ARGS = os.getenv("AGY_EXTRA_ARGS", "")  # space-separated extras
 
-# Marker that Gemini CLI prints when ready for input (screen-reader mode)
-READY_MARKER = os.getenv("READY_MARKER", "Type your message")
+TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
+# Dedicated tmux server socket so we never collide with a user's tmux.
+TMUX_SOCKET = os.getenv("TMUX_SOCKET", "agy-rest")
+TERM_WIDTH = int(os.getenv("TERM_WIDTH", "200"))
+TERM_HEIGHT = int(os.getenv("TERM_HEIGHT", "50"))
+
+# Where agy keeps its state (brain/<conversation-id>/... transcripts).
+AGY_STATE_DIR = FsPath(
+    os.getenv("AGY_STATE_DIR", os.path.expanduser("~/.gemini/antigravity-cli"))
+)
+# Each session gets its own working directory so agy's per-cwd project state
+# never crosses between sessions. The per-run id keeps paths unique across
+# server restarts: agy keys conversation memory by directory path, so reusing
+# a path would hand a "fresh" session the previous run's conversation history.
+RUN_ID = uuid.uuid4().hex[:8]
+SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/agy-rest-sessions")) / RUN_ID
+
+STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
+RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
+RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
+RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "120"))
+# How long after /clear / startup we wait for agy to register the new
+# conversation (brain dir appears).
+CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
+
+# Rendered-screen markers (read from tmux's emulated screen, never from the
+# raw escape stream, so these are stable plain-text strings).
+READY_MARKER = "? for shortcuts"          # idle status bar
+BUSY_MARKERS = ("Generating...", "esc to cancel")
+
+# tmux client commands are sub-second; anything longer means a stuck client.
+TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
 
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("gemini-rest")
+logger = logging.getLogger("agy-rest")
+
 
 # ---------------------------------------------------------------------------
-# ANSI / control-character stripping
+# Subprocess / tmux helpers
 # ---------------------------------------------------------------------------
 
-_ANSI_RE = re.compile(r"""
-    \x1b       # ESC
-    (?:
-        \[       # CSI
-        [0-?]*   # parameter bytes
-        [ -/]*   # intermediate bytes
-        [@-~]    # final byte
-    |
-        \]       # OSC
-        .*?      # payload
-        (?:\x07|\x1b\\)  # ST (BEL or ESC\)
-    |
-        [()][AB012]  # charset selection
-    |
-        [=><=]       # misc escapes
-    |
-        \[[0-9;]*[A-HJKSTfhlmnsu]  # catch-all CSI
+async def _exec(*argv: str, stdin_data: bytes | None = None) -> tuple[int, str]:
+    """Run a command, return (returncode, combined output)."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
-""", re.VERBOSE)
-
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes and stray control characters."""
-    text = _ANSI_RE.sub("", text)
-    text = _CONTROL_RE.sub("", text)
-    return text
-
-
-_TUI_CHROME_PREFIXES = (
-    "User:", "/app ", "responding", "── Shortcuts",
-    "❯", ">", ">>>", "│", "╭", "╰", "─",
-    "? for shortcuts", "YOLO mode", "YOLO ctrl+y",
-    "Press Ctrl+O", "[Pasted Text",
-)
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(stdin_data), timeout=TMUX_CMD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(f"Command timed out: {' '.join(argv[:4])}...")
+    return proc.returncode or 0, out.decode(errors="replace")
 
 
-def _is_tui_chrome(line: str) -> bool:
-    """Return True if *line* is TUI chrome rather than model content.
+async def _tmux(*args: str, stdin_data: bytes | None = None) -> tuple[int, str]:
+    return await _exec(TMUX_BIN, "-L", TMUX_SOCKET, *args, stdin_data=stdin_data)
 
-    Blank lines are NOT considered chrome — they can appear inside
-    multi-line model responses (e.g. between paragraphs or code blocks).
+
+async def _ensure_tmux_server() -> None:
+    """Start the dedicated tmux server with fully detached stdio.
+
+    The first tmux client on a fresh socket forks the tmux server daemon.
+    Under uvloop, a pipe inherited by that daemon is never seen as closed,
+    which would hang the first session spawn — so the daemon is started here
+    with DEVNULL stdio. "exit-empty off" keeps it alive with zero sessions.
     """
-    stripped = line.strip()
-    if not stripped:
-        return False
-    return any(stripped.startswith(p) for p in _TUI_CHROME_PREFIXES)
+    proc = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "-L", TMUX_SOCKET,
+        "start-server", ";", "set", "-g", "exit-empty", "off",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
 
 
-def clean_response(raw: str, prompt_sent: str) -> str:
-    """
-    Extract the model's response from raw PTY output.
+# ---------------------------------------------------------------------------
+# agy transcript access
+# ---------------------------------------------------------------------------
 
-    In screen-reader mode, the model's response lines are prefixed with
-    "Model:".  The TUI redraws these lines as the response streams in, so
-    each successive "Model:" block is a progressively longer snapshot.
-
-    Multi-line responses (e.g. code blocks) are rendered as a ``Model:``
-    line followed by continuation lines that lack the prefix.  We collect
-    each block (``Model:`` line + continuations) and return the longest one.
-    """
-    text = strip_ansi(raw)
-
-    # --- Primary: block-based extraction from Model: prefixed output ---
-    # A Model: line starts a new block.  Subsequent lines are appended
-    # to the block *unless* they are TUI chrome, which is silently
-    # skipped (NOT treated as a block terminator — the TUI interleaves
-    # chrome like "/app ..." and "responding ..." between content lines
-    # during redraws).  A block only ends when the next Model: line
-    # starts a new one, or we reach end-of-input.
-    model_re = re.compile(r'Model:\s+(.*)')
-    blocks: list[list[str]] = []       # each element is a list of lines
-    current_block: list[str] | None = None
-
-    for line in text.splitlines():
-        match = model_re.search(line)
-        if match:
-            # Start a new block
-            content = match.group(1).strip()
-            current_block = [content] if content else []
-            blocks.append(current_block)
-        elif current_block is not None:
-            if _is_tui_chrome(line):
-                continue              # skip chrome, keep block open
-            stripped = line.strip()
-            if stripped:
-                current_block.append(stripped)
-            # blank lines are silently skipped (common between redraws)
-
-    if blocks:
-        # Pick the block with the most total content
-        def _block_len(b: list[str]) -> int:
-            return sum(len(l) for l in b)
-        best = max(blocks, key=_block_len)
-        return "\n".join(best).strip()
-
-    # --- Fallback: remove known TUI artifacts and echoed prompt ---
-    lines = text.splitlines()
-    cleaned: list[str] = []
-    prompt_stripped = prompt_sent.strip()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped == prompt_stripped:
-            continue
-        if _is_tui_chrome(line):
-            continue
-        cleaned.append(line)
-
-    result = "\n".join(cleaned).strip()
-    result = re.sub(r"\n{3,}", "\n\n", result)
+def _brain_dirs() -> dict[str, float]:
+    """Map conversation-id -> mtime for all known agy conversations."""
+    brain = AGY_STATE_DIR / "brain"
+    if not brain.is_dir():
+        return {}
+    result: dict[str, float] = {}
+    for entry in brain.iterdir():
+        if entry.is_dir():
+            try:
+                result[entry.name] = entry.stat().st_mtime
+            except OSError:
+                continue
     return result
 
 
+def _transcript_path(conversation_id: str) -> FsPath:
+    return (
+        AGY_STATE_DIR / "brain" / conversation_id
+        / ".system_generated" / "logs" / "transcript.jsonl"
+    )
+
+
+def _read_transcript(conversation_id: str) -> list[dict]:
+    """Parse transcript.jsonl into a list of step dicts (empty if absent)."""
+    path = _transcript_path(conversation_id)
+    if not path.is_file():
+        return []
+    steps: list[dict] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    steps.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # partially-written line; next poll gets it
+    except OSError:
+        return []
+    return steps
+
+
+def _max_step(steps: list[dict]) -> int:
+    return max((s.get("step_index", -1) for s in steps), default=-1)
+
+
+def _new_responses(steps: list[dict], baseline: int) -> list[str]:
+    """Completed model messages with step_index greater than *baseline*."""
+    return [
+        s["content"]
+        for s in steps
+        if s.get("step_index", -1) > baseline
+        and s.get("source") == "MODEL"
+        and s.get("type") == "PLANNER_RESPONSE"
+        and s.get("status") == "DONE"
+        and s.get("content")
+    ]
+
+
 # ---------------------------------------------------------------------------
-# Gemini CLI Process Manager
+# agy Session (one live agy process inside a tmux session)
 # ---------------------------------------------------------------------------
+
+# Serializes spawn//clear windows so a newly created brain dir is always
+# attributable to exactly one session.
+_SPAWN_LOCK = asyncio.Lock()
+
 
 @dataclass
-class GeminiProcess:
-    """Manages a single Gemini CLI interactive subprocess."""
+class AgySession:
+    """Manages a single live agy process hosted in a detached tmux session."""
 
-    _child: pexpect.spawn | None = field(default=None, init=False, repr=False)
+    name: str
+    _conversation_id: str | None = field(default=None, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _ready: bool = field(default=False, init=False)
     _turn_count: int = field(default=0, init=False)
+    # agy keeps cross-conversation memory per project (working directory):
+    # new conversations receive summaries of previous ones and the agent can
+    # read their transcripts. Every spawn therefore gets a fresh generation
+    # directory, which is what makes clear/reset a true context wipe.
+    _generation: int = field(default=0, init=False)
 
-    # --- Lifecycle -----------------------------------------------------------
+    # --- Identity ----------------------------------------------------------
+
+    @property
+    def tmux_session(self) -> str:
+        return f"agy-{self.name}"
+
+    @property
+    def _target(self) -> str:
+        # '=' forces exact-name matching; the trailing ':' makes the target
+        # parse as a session for pane-taking commands (capture-pane etc.).
+        return f"={self.tmux_session}:"
+
+    @property
+    def cwd(self) -> FsPath:
+        return SESSIONS_ROOT / self.name / f"c{self._generation}"
+
+    # --- Lifecycle ---------------------------------------------------------
 
     def _build_command(self) -> str:
-        parts = [GEMINI_CMD]
-        if GEMINI_SCREEN_READER:
-            parts.append("--screen-reader")
-        if GEMINI_YOLO:
-            parts.append("--yolo")
-        if GEMINI_MODEL:
-            parts.extend(["--model", GEMINI_MODEL])
-        if GEMINI_EXTRA_ARGS:
-            parts.extend(GEMINI_EXTRA_ARGS.split())
-        return " ".join(parts)
+        parts = [AGY_CMD]
+        if AGY_SKIP_PERMISSIONS:
+            parts.append("--dangerously-skip-permissions")
+        if AGY_EXTRA_ARGS:
+            parts.extend(AGY_EXTRA_ARGS.split())
+        return shlex.join(parts)
 
     async def start(self) -> None:
-        """Spawn the Gemini CLI process and wait until it's ready."""
         async with self._lock:
-            if self._child and self._child.isalive():
-                logger.info("Process already running (pid=%s)", self._child.pid)
+            if await self.is_alive():
+                logger.info("Session '%s' already running", self.name)
                 return
             await self._spawn()
 
     async def _spawn(self) -> None:
+        self._generation += 1  # fresh project dir → no inherited conversation memory
         cmd = self._build_command()
-        logger.info("Spawning: %s", cmd)
+        self.cwd.mkdir(parents=True, exist_ok=True)
+        logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
-        env = os.environ.copy()
-        env["TERM"] = "dumb"  # minimize TUI escape codes
-        env["NO_COLOR"] = "1"
-
-        self._child = pexpect.spawn(
-            "/bin/bash",
-            ["-c", cmd],
-            encoding="utf-8",
-            timeout=STARTUP_TIMEOUT,
-            env=env,
-            maxread=65536,
-            echo=False,
+        await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
+        rc, out = await _tmux(
+            "new-session", "-d",
+            "-s", self.tmux_session,
+            "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
+            "-c", str(self.cwd),
+            cmd,
         )
-        self._child.setwinsize(50, 200)  # wide terminal avoids line-wrapping
+        if rc != 0:
+            raise RuntimeError(f"tmux new-session failed: {out.strip()}")
+
+        try:
+            await self._wait_ready()
+        except Exception:
+            await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
+            raise
+
+        # agy creates its conversation lazily (on the first message or on
+        # /clear), so the id is resolved during the first send().
+        self._conversation_id = None
         self._turn_count = 0
-        self._ready = False
+        logger.info("Session '%s' ready", self.name)
 
-        # Wait for the CLI to become ready (input prompt / initial output)
-        await self._wait_for_ready()
-        # The TUI continues rendering the status bar after "Type your message".
-        # Give it time to finish, then discard so it doesn't pollute the first turn.
-        await asyncio.sleep(0.5)
-        await self._drain_buffer()
-        self._ready = True
-        logger.info("Gemini CLI ready (pid=%s)", self._child.pid)
-
-    async def _wait_for_ready(self) -> None:
-        """
-        Consume initial startup output until we detect the CLI is ready.
-
-        Waits for the READY_MARKER string (e.g. "Type your message") which
-        indicates the CLI has finished auth and is accepting input.
-        Falls back to idle-timeout if the marker isn't found.
-        """
-        loop = asyncio.get_event_loop()
+    async def _wait_ready(self) -> None:
+        """Poll the rendered screen until agy shows its idle input prompt."""
         start = time.monotonic()
-        accumulated = ""
-
         while time.monotonic() - start < STARTUP_TIMEOUT:
-            try:
-                chunk = await loop.run_in_executor(
-                    None, lambda: self._child.read_nonblocking(4096, timeout=3)
-                )
-                if chunk:
-                    accumulated += chunk
-                    logger.debug("Startup output: %r", chunk[:200])
-                    # Check for the ready marker in accumulated output
-                    if READY_MARKER in strip_ansi(accumulated):
-                        logger.info(
-                            "Ready marker '%s' detected after %.1fs",
-                            READY_MARKER, time.monotonic() - start,
-                        )
-                        return
-            except pexpect.TIMEOUT:
-                # If we've already seen substantial output, silence means ready
-                if len(accumulated) > 100:
-                    logger.info("Startup silence after output → ready (%.1fs)", time.monotonic() - start)
-                    return
-                # Otherwise keep waiting (CLI hasn't started outputting yet)
-                continue
-            except pexpect.EOF:
+            if not await self.is_alive():
                 raise RuntimeError(
-                    "Gemini CLI exited during startup. "
-                    "Check that 'gemini' is installed and authenticated."
+                    "agy exited during startup. Check that it is installed and "
+                    "authenticated (run 'agy' interactively once)."
                 )
+            screen = await self._capture()
+            if READY_MARKER in screen and not self._is_busy(screen):
+                logger.info(
+                    "Session '%s' ready marker after %.1fs",
+                    self.name, time.monotonic() - start,
+                )
+                return
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+        raise RuntimeError(f"agy startup timed out after {STARTUP_TIMEOUT:.0f}s")
 
-        # If we got output but no marker, assume ready anyway
-        if accumulated:
-            logger.warning("Ready marker not found after %.0fs, proceeding anyway", STARTUP_TIMEOUT)
-            return
-
-        raise RuntimeError("Gemini CLI startup timed out")
+    async def _detect_new_conversation(self, before: set[str]) -> str:
+        """Wait for the brain dir agy creates for the new conversation."""
+        start = time.monotonic()
+        while time.monotonic() - start < CONVERSATION_DETECT_TIMEOUT:
+            dirs = _brain_dirs()
+            new = {cid: mtime for cid, mtime in dirs.items() if cid not in before}
+            if new:
+                cid = max(new, key=new.get)  # newest wins
+                return cid
+            await asyncio.sleep(0.5)
+        raise RuntimeError("Could not determine agy conversation id (no new brain dir)")
 
     async def stop(self) -> None:
-        """Gracefully terminate the subprocess."""
         async with self._lock:
-            self._kill()
+            await self._kill()
 
-    def _kill(self) -> None:
-        if self._child and self._child.isalive():
-            logger.info("Stopping Gemini CLI (pid=%s)", self._child.pid)
-            try:
-                self._child.sendline("/quit")
-                self._child.expect(pexpect.EOF, timeout=5)
-            except Exception:
-                pass
-            finally:
-                if self._child.isalive():
-                    self._child.kill(signal.SIGTERM)
-                    time.sleep(0.5)
-                    if self._child.isalive():
-                        self._child.kill(signal.SIGKILL)
-            self._child = None
-            self._ready = False
-            self._turn_count = 0
+    async def _kill(self) -> None:
+        rc, _ = await _tmux("kill-session", "-t", self._target)
+        if rc == 0:
+            logger.info("Killed tmux session %s", self.tmux_session)
+        self._conversation_id = None
+        self._turn_count = 0
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
         async with self._lock:
-            self._kill()
+            await self._kill()
             await self._spawn()
-        return
-
-    async def _drain_buffer(self) -> None:
-        """Drain any pending output from the PTY buffer.
-
-        This prevents _wait_for_ready from matching stale markers
-        left over from previous interactions.
-        """
-        loop = asyncio.get_event_loop()
-        drained = 0
-        while True:
-            try:
-                chunk = await loop.run_in_executor(
-                    None, lambda: self._child.read_nonblocking(65536, timeout=0.3)
-                )
-                if chunk:
-                    drained += len(chunk)
-            except (pexpect.TIMEOUT, pexpect.EOF):
-                break
-        if drained:
-            logger.debug("Drained %d bytes of stale buffer", drained)
 
     async def clear(self) -> None:
-        """Send /clear to the CLI to clear screen and conversation history."""
+        """Wipe conversation context by respawning into a fresh project dir.
+
+        agy's own /clear is NOT enough: it starts a new conversation, but the
+        new one receives summaries of the project's previous conversations
+        and the agent can (and does) read their transcripts to recover
+        "cleared" context. A respawn in a new generation directory is the
+        only true wipe.
+        """
         async with self._lock:
-            if not self._child or not self._child.isalive():
-                raise RuntimeError("Gemini CLI process is not running")
+            if not await self.is_alive():
+                raise RuntimeError("agy process is not running")
+            logger.info("Session '%s': clearing (respawn, fresh project dir)", self.name)
+            await self._kill()
+            await self._spawn()
 
-            logger.info("Clearing conversation context via /clear")
+    # --- Screen access -----------------------------------------------------
 
-            # Drain stale PTY output so _wait_for_ready won't match
-            # an old "Type your message" marker from before the /clear.
-            await self._drain_buffer()
+    async def _capture(self) -> str:
+        rc, out = await _tmux("capture-pane", "-p", "-t", self._target)
+        if rc != 0:
+            raise RuntimeError("agy process died (tmux capture-pane failed)")
+        return out
 
-            self._child.send("/clear")
-            await asyncio.sleep(0.1)
-            self._child.send("\r")
-            self._turn_count = 0
-
-            # Wait for the CLI to be ready again (fresh marker)
-            await self._wait_for_ready()
-
-            # The Ink TUI redraws "Type your message" almost instantly after
-            # /clear, but its stdin handler isn't fully re-attached yet.
-            # Without this delay, the next prompt sent gets swallowed.
-            await asyncio.sleep(CLEAR_SETTLE_DELAY)
-            await self._drain_buffer()
+    @staticmethod
+    def _is_busy(screen: str) -> bool:
+        return any(m in screen for m in BUSY_MARKERS)
 
     # --- Chat ----------------------------------------------------------------
 
     async def send(self, prompt: str) -> str:
-        """
-        Send a prompt and return Gemini's response.
+        """Send a prompt and return agy's response.
 
-        Detection strategy: we read output chunks and consider the response
-        complete when we've seen RESPONSE_IDLE_TIMEOUT seconds of silence.
+        Input goes in as a tmux bracketed paste, so newlines and TUI shortcut
+        characters (!, @, /, backticks...) arrive as literal text. The
+        response is read from the conversation transcript: completion means
+        a new DONE model step exists AND the rendered screen is idle.
         """
         async with self._lock:
-            if not self._child or not self._child.isalive():
-                raise RuntimeError("Gemini CLI process is not running")
+            if not await self.is_alive():
+                raise RuntimeError("agy process is not running")
 
             self._turn_count += 1
-            logger.info("Turn %d — sending prompt (%d chars)", self._turn_count, len(prompt))
+            logger.info(
+                "Session '%s' turn %d — sending prompt (%d chars)",
+                self.name, self._turn_count, len(prompt),
+            )
 
-            # Drain stale output (startup status bar, previous turn leftovers)
-            # so _collect_response doesn't false-positive on an old done marker.
-            await self._drain_buffer()
+            if self._conversation_id is None:
+                # First message: agy creates the conversation when it receives
+                # it. Submit under the spawn lock so the new brain dir is
+                # attributable to this session, then resolve the id.
+                async with _SPAWN_LOCK:
+                    before = set(_brain_dirs())
+                    await self._submit(prompt)
+                    self._conversation_id = await self._detect_new_conversation(before)
+                baseline = -1
+            else:
+                baseline = _max_step(_read_transcript(self._conversation_id))
+                await self._submit(prompt)
 
-            # Wrap prompt in bracketed paste mode so the Ink TUI treats it as
-            # literal text, not as individual key events.  Without this,
-            # characters like '!' (shell mode), backticks, '@', and '\n'
-            # trigger TUI shortcuts instead of being sent as text.
-            #
-            # The Ink TUI collapses ANY multi-line bracketed paste into an
-            # unsubmittable "[Pasted Text: N lines]" widget.  For large
-            # prompts we write to a temp file and use the @file syntax so
-            # the CLI reads the file and includes its content in the API
-            # request to the model.
-            PASTE_FILE_THRESHOLD = 50_000   # chars — above this, use @file
-
-            temp_path: str | None = None
-            try:
-                if len(prompt) > PASTE_FILE_THRESHOLD:
-                    temp_path = f"/app/.gemini_prompt_{id(self)}_{self._turn_count}.md"
-                    with open(temp_path, "w") as f:
-                        f.write(prompt)
-                    logger.info("Large prompt — wrote %d chars to %s", len(prompt), temp_path)
-                    self._child.send(f"@{temp_path}")
-                    await asyncio.sleep(0.5)
-                else:
-                    self._child.send("\x1b[200~")
-                    self._child.send(prompt)
-                    self._child.send("\x1b[201~")
-                    await asyncio.sleep(0.1)
-
-                self._child.send("\r")
-
-                # Collect output
-                response = await self._collect_response(prompt)
-            finally:
-                if temp_path:
-                    try:
-                        os.unlink(temp_path)
-                    except OSError:
-                        pass
-
-            logger.info("Turn %d — response collected (%d chars)", self._turn_count, len(response))
+            response = await self._collect_response(baseline)
+            logger.info(
+                "Session '%s' turn %d — response collected (%d chars)",
+                self.name, self._turn_count, len(response),
+            )
             return response
 
-    async def _collect_response(self, prompt_sent: str) -> str:
-        """Read output until we're confident the response is complete.
+    async def _submit(self, prompt: str) -> None:
+        """Paste the prompt (bracketed), then submit with Enter."""
+        buf = f"agyrest-{self.name}"
+        rc, out = await _tmux(
+            "load-buffer", "-b", buf, "-", stdin_data=prompt.encode()
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux load-buffer failed: {out.strip()}")
+        rc, out = await _tmux(
+            "paste-buffer", "-p", "-d", "-b", buf, "-t", self._target
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux paste-buffer failed: {out.strip()}")
+        await asyncio.sleep(0.15)
+        await _tmux("send-keys", "-t", self._target, "Enter")
 
-        Detection strategy (two tiers):
+    async def _collect_response(self, baseline: int) -> str:
+        """Poll until the turn is complete, then return the new model text.
 
-        1. **Primary markers** (e.g. "YOLO ctrl+y"): high-confidence TUI
-           status-bar indicators that the CLI is idle. Only requires
-           RESPONSE_MIN_WAIT to have elapsed.
-
-        2. **Model-content stabilization** (fallback): after /clear the primary
-           marker may never appear.  Instead we watch for ``Model:`` prefixed
-           lines in the output.  The ``clean_response`` function takes the
-           *longest* ``Model:`` segment as the final answer, so once no chunk
-           has contained a *longer* ``Model:`` segment for
-           RESPONSE_MODEL_STABLE_TIMEOUT seconds, the answer has stabilized
-           and we can stop reading.
+        A turn is complete when:
+          1. the transcript contains >= 1 new DONE model response, and
+          2. the rendered screen is idle (ready marker shown, no busy
+             indicators — covers multi-step turns with tool calls), and
+          3. both hold for two consecutive polls (debounce).
         """
-        loop = asyncio.get_event_loop()
-        chunks: list[str] = []
         start = time.monotonic()
+        responses: list[str] = []
+        confirm = 0
         exit_reason = "unknown"
-
-        # Fallback tracking: length of longest Model: content seen so far,
-        # and the timestamp at which it last grew.
-        best_model_len = 0
-        last_model_growth = 0.0  # monotonic time of last growth
-        last_responding = 0.0    # monotonic time "responding" last seen in output
-        model_re = re.compile(r'Model:\s+(.*)')
-        paste_resubmitted = False  # only retry once
 
         while True:
             elapsed = time.monotonic() - start
             if elapsed > RESPONSE_MAX_TIMEOUT:
                 exit_reason = "max_timeout"
-                logger.warning("Hit max timeout (%.0fs) — returning partial response", RESPONSE_MAX_TIMEOUT)
-                break
-
-            # --- Fallback: model content stabilized? ---
-            # Don't trigger if "responding" appeared recently — the model
-            # may be executing a tool (file read, shell command) in YOLO
-            # mode and Model: content pauses during tool execution.
-            if best_model_len > 0 and elapsed >= RESPONSE_MIN_WAIT:
-                since_growth = time.monotonic() - last_model_growth
-                since_responding = time.monotonic() - last_responding
-                if (since_growth >= RESPONSE_MODEL_STABLE_TIMEOUT
-                        and since_responding >= RESPONSE_MODEL_STABLE_TIMEOUT):
-                    exit_reason = "model_stable"
-                    logger.info(
-                        "Model content stabilized (%d chars, %.1fs since last growth)",
-                        best_model_len, since_growth,
-                    )
-                    break
-
-            try:
-                chunk = await loop.run_in_executor(
-                    None,
-                    lambda: self._child.read_nonblocking(65536, timeout=RESPONSE_IDLE_TIMEOUT),
+                logger.warning(
+                    "Session '%s': hit max timeout (%.0fs) — returning %d partial response(s)",
+                    self.name, RESPONSE_MAX_TIMEOUT, len(responses),
                 )
-                if chunk:
-                    chunks.append(chunk)
-                    stripped_chunk = strip_ansi(chunk)
-                    logger.debug("Chunk (%d bytes): %r", len(chunk), chunk[:200])
-
-                    # Track longest Model: content for stabilization fallback
-                    for line in stripped_chunk.splitlines():
-                        match = model_re.search(line)
-                        if match:
-                            content_len = len(match.group(1).strip())
-                            if content_len > best_model_len:
-                                best_model_len = content_len
-                                last_model_growth = time.monotonic()
-                                logger.debug("Model content grew to %d chars at %.1fs", best_model_len, elapsed)
-
-                    chunk_lower = stripped_chunk.lower()
-
-                    # Track "responding" indicator — present while the model
-                    # is actively streaming.  The TUI status bar always
-                    # contains "YOLO ctrl+y" (it's a persistent element),
-                    # so "responding" in the same chunk means the model is
-                    # NOT done yet — we must not treat the marker as a
-                    # completion signal.
-                    has_responding = "responding" in chunk_lower
-                    if has_responding:
-                        last_responding = time.monotonic()
-
-                    # --- Paste-collapse recovery ---
-                    # For very large inputs the Gemini CLI may collapse the
-                    # bracketed paste into a "[Pasted Text: N lines]" widget
-                    # without actually submitting it to the model.  If we
-                    # detect this pattern early (before any model output has
-                    # appeared), re-send Enter to trigger submission.
-                    if (not paste_resubmitted
-                            and elapsed < 3.0
-                            and best_model_len == 0
-                            and ("pasted text" in chunk_lower
-                                 or "ctrl+o" in chunk_lower)
-                            and not has_responding):
-                        paste_resubmitted = True
-                        logger.info(
-                            "Paste-collapse detected at %.1fs — re-sending Enter to submit",
-                            elapsed,
-                        )
-                        self._child.send("\r")
-                        # Reset state so detection timers apply to the real response
-                        start = time.monotonic()
-                        chunks.clear()
-                        best_model_len = 0
-                        last_model_growth = 0.0
-                        continue
-
-                    # --- Tier 1: primary markers (high confidence) ---
-                    # Guard: skip if "responding" is in the same chunk —
-                    # "YOLO ctrl+y" is always in the status bar, even
-                    # mid-stream.  It only signals completion when
-                    # "responding" is absent.
-                    # Also require that we've actually seen Model: content —
-                    # the TUI redraws "YOLO ctrl+y" during the thinking
-                    # phase before any model output; without this guard
-                    # we false-positive on a status-bar redraw chunk that
-                    # happens to lack "responding".
-                    primary_hit = (
-                        not has_responding
-                        and best_model_len > 0
-                        and any(
-                            m.lower() in chunk_lower
-                            for m in RESPONSE_DONE_MARKERS_PRIMARY
-                        )
-                    )
-                    if primary_hit:
-                        if elapsed >= RESPONSE_MIN_WAIT:
-                            exit_reason = "done_marker"
-                            logger.debug("Primary done marker matched at %.1fs", elapsed)
-                            break
-                        else:
-                            logger.debug("Ignoring early primary marker at %.1fs (min_wait=%.1fs)", elapsed, RESPONSE_MIN_WAIT)
-
-                    # --- Tier 2: secondary marker ("Type your message" without "responding") ---
-                    # For plain-text responses (no tool use / file writes), the TUI
-                    # never shows the primary "YOLO ctrl+y" marker. Instead it shows
-                    # "Type your message" once the model finishes. While still
-                    # streaming, the TUI also shows "responding" alongside "Type your
-                    # message", so we require its absence as a completion signal.
-                    # Same guard as Tier 1: must have seen Model: content first.
-                    if elapsed >= RESPONSE_MIN_WAIT and best_model_len > 0:
-                        has_ready = READY_MARKER.lower() in chunk_lower
-                        if has_ready and not has_responding:
-                            exit_reason = "done_marker_secondary"
-                            logger.debug("Secondary done marker (ready w/o responding) at %.1fs", elapsed)
-                            break
-
-            except pexpect.TIMEOUT:
-                # Idle timeout — response is likely complete
-                if chunks:
-                    exit_reason = "idle_timeout"
-                    break
-                # No output yet — keep waiting (model might be thinking)
-                if elapsed < RESPONSE_MAX_TIMEOUT:
-                    continue
-                exit_reason = "idle_timeout_no_output"
                 break
-            except pexpect.EOF:
-                logger.error("Gemini CLI process terminated unexpectedly")
-                self._ready = False
-                raise RuntimeError("Gemini CLI process died during response")
 
-        raw = "".join(chunks)
-        # Log how the response ended and a tail of the stripped output for debugging
-        stripped_tail = strip_ansi(raw)[-300:] if raw else "(empty)"
-        logger.info(
-            "Response complete via %s (%.1fs, %d bytes raw). Tail: %r",
-            exit_reason, time.monotonic() - start, len(raw), stripped_tail,
-        )
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
 
-        # Safety net: detect if the TUI accidentally entered shell mode.
-        # If so, send Escape to exit and log a warning.
-        stripped_raw = strip_ansi(raw).lower()
-        if "shell mode" in stripped_raw or "type your shell command" in stripped_raw:
-            logger.warning(
-                "Shell mode detected in response — sending Escape to exit"
+            responses = _new_responses(
+                _read_transcript(self._conversation_id), baseline
             )
-            self._child.send("\x1b")        # Escape exits shell mode
-            await asyncio.sleep(0.3)
-            await self._drain_buffer()       # discard shell-mode TUI output
+            screen = await self._capture()  # raises if process died
+            idle = READY_MARKER in screen and not self._is_busy(screen)
 
-        return clean_response(raw, prompt_sent)
+            if responses and idle and elapsed >= RESPONSE_MIN_WAIT:
+                confirm += 1
+                if confirm >= 2:
+                    exit_reason = "transcript_done"
+                    break
+            else:
+                confirm = 0
+
+        logger.info(
+            "Session '%s': response complete via %s (%.1fs, %d message(s))",
+            self.name, exit_reason, time.monotonic() - start, len(responses),
+        )
+        return "\n\n".join(responses).strip()
 
     # --- Status --------------------------------------------------------------
 
-    @property
-    def is_alive(self) -> bool:
-        return bool(self._child and self._child.isalive())
+    async def is_alive(self) -> bool:
+        rc, _ = await _tmux("has-session", "-t", self._target)
+        return rc == 0
 
     @property
     def turn_count(self) -> int:
@@ -629,37 +466,32 @@ class GeminiProcess:
 
 @dataclass
 class ChatManager:
-    """Manages named chat sessions, each backed by its own GeminiProcess."""
+    """Manages named chat sessions, each backed by its own AgySession."""
 
-    _sessions: dict[str, GeminiProcess] = field(default_factory=dict, init=False)
+    _sessions: dict[str, AgySession] = field(default_factory=dict, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
-    async def get_or_create(self, name: str) -> GeminiProcess:
+    async def get_or_create(self, name: str) -> AgySession:
         """Return an existing session or create and start a new one."""
         async with self._lock:
             if name in self._sessions:
                 session = self._sessions[name]
-                if session.is_alive:
-                    return session
-                logger.info("Session '%s' found dead, restarting", name)
             else:
                 logger.info("Creating new session: '%s'", name)
-                session = GeminiProcess()
+                session = AgySession(name)
                 self._sessions[name] = session
 
-        # Start/restart outside the manager lock so other sessions aren't
-        # blocked during the ~10s startup. The session's own _lock in
-        # start() serializes concurrent starts for the same session.
+        # Start (or restart a dead session) outside the manager lock so other
+        # sessions aren't blocked during the ~25s startup. start() is a no-op
+        # when the process is already alive.
         await session.start()
         return session
 
-    async def get(self, name: str) -> GeminiProcess | None:
-        """Return a session by name, or None."""
+    async def get(self, name: str) -> AgySession | None:
         async with self._lock:
             return self._sessions.get(name)
 
     async def remove(self, name: str) -> bool:
-        """Stop and remove a single session. Returns True if it existed."""
         async with self._lock:
             session = self._sessions.pop(name, None)
         if session:
@@ -668,7 +500,6 @@ class ChatManager:
         return False
 
     async def stop_all(self) -> int:
-        """Stop and remove ALL sessions. Returns count stopped."""
         async with self._lock:
             sessions = dict(self._sessions)
             self._sessions.clear()
@@ -677,13 +508,12 @@ class ChatManager:
         return len(sessions)
 
     async def list_sessions(self) -> dict[str, dict]:
-        """Return status info for all sessions."""
         async with self._lock:
             snapshot = dict(self._sessions)
-        return {
-            name: {"alive": s.is_alive, "turn_count": s.turn_count}
-            for name, s in snapshot.items()
-        }
+        result: dict[str, dict] = {}
+        for name, s in snapshot.items():
+            result[name] = {"alive": await s.is_alive(), "turn_count": s.turn_count}
+        return result
 
 
 manager = ChatManager()
@@ -697,6 +527,7 @@ manager = ChatManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Sessions are created lazily. On shutdown, stop all."""
+    await _ensure_tmux_server()
     logger.info("Server starting (sessions will be created on demand)")
     yield
     logger.info("Shutting down — stopping all sessions...")
@@ -705,12 +536,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Gemini CLI REST Bridge",
+    title="Antigravity CLI REST Bridge",
     description=(
-        "REST API that wraps Google's Gemini CLI interactive mode, "
+        "REST API that wraps Google's Antigravity CLI (agy) interactive mode, "
         "providing named multi-session chat with conversation continuity."
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -782,7 +613,7 @@ async def clear(name: str = _NAME):
     session = await manager.get(name)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
-    if not session.is_alive:
+    if not await session.is_alive():
         raise HTTPException(status_code=503, detail=f"Session '{name}' is not running. Use /reset/{name}.")
     try:
         await session.clear()

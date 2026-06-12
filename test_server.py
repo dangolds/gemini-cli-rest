@@ -1,8 +1,8 @@
 """
-E2E tests for the Gemini CLI REST Bridge.
+E2E tests for the Antigravity CLI REST Bridge.
 
 Starts the server as a subprocess (or uses an existing one),
-runs real Gemini sessions, and verifies memory, clear, reset,
+runs real agy sessions, and verifies memory, clear, reset,
 isolation, delete, and stop.
 
 Usage:
@@ -22,7 +22,7 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 BASE = "http://127.0.0.1:8000"
-# Gemini can be slow — first turn spawns the CLI (~30s) + model response time
+# agy can be slow — first turn spawns the CLI (~25s) + model response time
 TIMEOUT = 180.0
 
 
@@ -108,9 +108,9 @@ class TestChatMemory:
         cleanup.append(name)
         token = _unique()
 
-        # Tell it a fact (instruct not to persist to GEMINI.md)
+        # Tell it a fact (instruct not to persist anywhere)
         print(f"  [{_ts()}] Step 1/2: Teaching secret word '{token}'...", flush=True)
-        chat(name, f"For this conversation only, my secret word is {token}. Do NOT save this to memory or GEMINI.md. Just confirm you got it.")
+        chat(name, f"For this conversation only, my secret word is {token}. Do NOT save this to memory, knowledge, or any file. Just confirm you got it.")
 
         # Ask for it back
         print(f"  [{_ts()}] Step 2/2: Asking for the word back...", flush=True)
@@ -132,9 +132,9 @@ class TestClear:
         cleanup.append(name)
         token = _unique()
 
-        # Establish context (instruct not to persist to GEMINI.md)
+        # Establish context (instruct not to persist anywhere)
         print(f"  [{_ts()}] Step 1/3: Teaching secret code '{token}'...", flush=True)
-        chat(name, f"For this conversation only, my secret code is {token}. Do NOT save this to memory or GEMINI.md. Just confirm you got it.")
+        chat(name, f"For this conversation only, my secret code is {token}. Do NOT save this to memory, knowledge, or any file. Just confirm you got it.")
 
         # Clear — should succeed
         print(f"  [{_ts()}] Step 2/3: Sending /clear...", flush=True)
@@ -211,11 +211,11 @@ class TestMultiSessionIsolation:
 
         # Tell alpha a unique token (instruct not to persist)
         print(f"  [{_ts()}] Step 1/4: Teaching alpha token '{token_a}'...", flush=True)
-        chat(alpha, f"For this conversation only, the code is {token_a}. Do NOT save this to memory or GEMINI.md. Just confirm.")
+        chat(alpha, f"For this conversation only, the code is {token_a}. Do NOT save this to memory, knowledge, or any file. Just confirm.")
 
         # Tell beta a different unique token (instruct not to persist)
         print(f"  [{_ts()}] Step 2/4: Teaching beta token '{token_b}'...", flush=True)
-        chat(beta, f"For this conversation only, the code is {token_b}. Do NOT save this to memory or GEMINI.md. Just confirm.")
+        chat(beta, f"For this conversation only, the code is {token_b}. Do NOT save this to memory, knowledge, or any file. Just confirm.")
 
         # Alpha should know its own token
         print(f"  [{_ts()}] Step 3/4: Asking alpha for its token (should NOT know beta's)...", flush=True)
