@@ -1,22 +1,31 @@
 services:
-  agy-rest:
+  # Both bridges in ONE container: agy (Gemini) on :8000 and codex (gpt-5.5) on
+  # :8001, launched by entrypoint-all.sh (the image default). If either bridge
+  # process dies, the container exits and is restarted, bringing both back.
+  bridges:
     build: .
     restart: unless-stopped
+    init: true                       # tini as PID 1: reaps zombies (agy's tmux daemon reparents here)
     ports:
-      - "8000:8000"
+      - "8000:8000"   # agy / Gemini
+      - "8001:8001"   # codex / gpt-5.5
     volumes:
-      - agy-config:/root/.gemini
+      - agy-config:/root/.gemini    # agy auth + settings persist
+      - codex-config:/root/.codex   # codex auth.json + config.toml persist
       - ~/.ssh:/root/.ssh:ro
-      # Repos you want agy to read: mount them under one parent...
+      # Repos you want BOTH bridges to read: mount them under one parent...
       # - ~/dev/slit/slitled-platform:/repos/slitled-platform
       # - ~/dev/other-repo:/repos/other-repo
     environment:
-      - RESPONSE_MAX_TIMEOUT=120
-      - STARTUP_TIMEOUT=60
+      - RESPONSE_MAX_TIMEOUT=120    # agy: max wait for a Gemini turn
+      - STARTUP_TIMEOUT=60          # agy: max wait for the CLI to become ready
+      - CODEX_EXEC_TIMEOUT=300      # codex: max wait for a turn (xhigh is slow)
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
-      # ...and add the parent to every session's workspace (--add-dir is repeatable):
+      # ...and grant both CLIs access to that parent (--add-dir is repeatable):
       # - AGY_EXTRA_ARGS=--add-dir /repos
+      # - CODEX_EXTRA_ARGS=--add-dir /repos
 
 volumes:
   agy-config:
+  codex-config:
