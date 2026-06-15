@@ -17,7 +17,7 @@ services:
       # - ~/dev/slit/slitled-platform:/repos/slitled-platform
       # - ~/dev/other-repo:/repos/other-repo
     environment:
-      - RESPONSE_MAX_TIMEOUT=120    # agy: max wait for a Gemini turn
+      - RESPONSE_MAX_TIMEOUT=140    # agy: max wait for a Gemini turn
       - STARTUP_TIMEOUT=60          # agy: max wait for the CLI to become ready
       - CODEX_EXEC_TIMEOUT=300      # codex: max wait for a turn (xhigh is slow)
       - LOG_LEVEL=INFO

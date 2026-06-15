@@ -55,7 +55,7 @@ SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/agy-rest-sessions")) / R
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
 RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
-RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "120"))
+RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "140"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
