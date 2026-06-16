@@ -16,6 +16,7 @@ import os
 import shlex
 import time
 import uuid
+from logging.handlers import RotatingFileHandler
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
@@ -52,10 +53,27 @@ AGY_STATE_DIR = FsPath(
 RUN_ID = uuid.uuid4().hex[:8]
 SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/agy-rest-sessions")) / RUN_ID
 
+# Local, persisted log destination. Mounted to the host in docker-compose so
+# turns can be investigated after the fact without docker-exec'ing a live
+# container. Holds the rolling server log and per-incident timeout dumps.
+LOG_DIR = FsPath(os.getenv("LOG_DIR", "/app/logs"))
+TIMEOUT_LOG_DIR = LOG_DIR / "timeouts"
+TIMEOUT_DUMP_STEPS = int(os.getenv("TIMEOUT_DUMP_STEPS", "40"))
+
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
 RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
-RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "140"))
+# A turn ends when agy STOPS MAKING PROGRESS, not on a flat wall-clock. agy can
+# work on an agentic turn (reading files, running commands, streaming a long
+# answer) for many minutes; a flat timeout gave up while it was still busy and
+# hadn't yet flushed its final answer to the transcript, returning 0 messages.
+# So: give up only after agy has been idle with no new transcript steps for
+# RESPONSE_STALL_TIMEOUT, or after RESPONSE_HARD_TIMEOUT absolute as a backstop.
+RESPONSE_STALL_TIMEOUT = float(os.getenv("RESPONSE_STALL_TIMEOUT", "90"))
+RESPONSE_HARD_TIMEOUT = float(
+    # honor a legacy RESPONSE_MAX_TIMEOUT as the hard ceiling if someone set it
+    os.getenv("RESPONSE_HARD_TIMEOUT", os.getenv("RESPONSE_MAX_TIMEOUT", "900"))
+)
 # After submitting, how long to wait for agy to *acknowledge* the turn (a new
 # transcript step appears, or the screen goes busy) before concluding the
 # submit Enter was dropped and re-pressing it. Kept deliberately generous: a
@@ -76,9 +94,20 @@ BUSY_MARKERS = ("Generating...", "esc to cancel")
 # tmux client commands are sub-second; anything longer means a stuck client.
 TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
 
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log_handlers.append(
+        RotatingFileHandler(
+            LOG_DIR / "agy-rest.log", maxBytes=10_000_000, backupCount=5
+        )
+    )
+except OSError:
+    pass  # file logging is best-effort; never block startup on it
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("agy-rest")
 
@@ -477,37 +506,68 @@ class AgySession:
                 return True
         return False
 
+    def _transcript_mtime(self) -> float:
+        try:
+            return _transcript_path(self._conversation_id).stat().st_mtime
+        except OSError:
+            return 0.0
+
     async def _collect_response(self, baseline: int) -> str:
         """Poll until the turn is complete, then return the new model text.
 
-        A turn is complete when:
-          1. the transcript contains >= 1 new DONE model response, and
-          2. the rendered screen is idle (ready marker shown, no busy
-             indicators — covers multi-step turns with tool calls), and
-          3. both hold for two consecutive polls (debounce).
+        A turn is complete when a new DONE model response exists in the
+        transcript AND the rendered screen is idle (covers multi-step turns
+        with tool calls), for two consecutive polls (debounce).
+
+        We do NOT cut a turn off on a flat wall-clock: agy can legitimately
+        work for minutes (reading files, running commands, streaming a long
+        answer). Instead we track progress — a busy screen, or the transcript
+        growing/being rewritten — and only give up once agy has made no
+        progress for RESPONSE_STALL_TIMEOUT, or RESPONSE_HARD_TIMEOUT absolute.
         """
         start = time.monotonic()
         responses: list[str] = []
         confirm = 0
         exit_reason = "unknown"
+        last_progress = start
+        last_max_step = baseline
+        last_mtime = self._transcript_mtime()
 
         while True:
-            elapsed = time.monotonic() - start
-            if elapsed > RESPONSE_MAX_TIMEOUT:
-                exit_reason = "max_timeout"
+            now = time.monotonic()
+            elapsed = now - start
+            if elapsed > RESPONSE_HARD_TIMEOUT:
+                exit_reason = "hard_timeout"
                 logger.warning(
-                    "Session '%s': hit max timeout (%.0fs) — returning %d partial response(s)",
-                    self.name, RESPONSE_MAX_TIMEOUT, len(responses),
+                    "Session '%s': hit hard timeout (%.0fs) — returning %d partial "
+                    "response(s)", self.name, RESPONSE_HARD_TIMEOUT, len(responses),
+                )
+                break
+            if now - last_progress > RESPONSE_STALL_TIMEOUT:
+                exit_reason = "stalled"
+                logger.warning(
+                    "Session '%s': no progress for %.0fs (idle, transcript not "
+                    "growing) — returning %d response(s)",
+                    self.name, RESPONSE_STALL_TIMEOUT, len(responses),
                 )
                 break
 
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
 
-            responses = _new_responses(
-                _read_transcript(self._conversation_id), baseline
-            )
+            steps = _read_transcript(self._conversation_id)
+            responses = _new_responses(steps, baseline)
+            cur_max_step = _max_step(steps)
+            cur_mtime = self._transcript_mtime()
             screen = await self._capture()  # raises if process died
-            idle = READY_MARKER in screen and not self._is_busy(screen)
+            busy = self._is_busy(screen)
+            idle = READY_MARKER in screen and not busy
+
+            # agy is demonstrably alive and working if it's generating on
+            # screen or the transcript advanced/was rewritten since last poll.
+            if busy or cur_max_step > last_max_step or cur_mtime > last_mtime:
+                last_progress = now
+                last_max_step = cur_max_step
+                last_mtime = cur_mtime
 
             if responses and idle and elapsed >= RESPONSE_MIN_WAIT:
                 confirm += 1
@@ -517,11 +577,60 @@ class AgySession:
             else:
                 confirm = 0
 
+        total = time.monotonic() - start
         logger.info(
             "Session '%s': response complete via %s (%.1fs, %d message(s))",
-            self.name, exit_reason, time.monotonic() - start, len(responses),
+            self.name, exit_reason, total, len(responses),
         )
+        if exit_reason != "transcript_done":
+            # The failure class we keep having to autopsy by hand — capture a
+            # local snapshot (screen + transcript tail) for later investigation.
+            await self._dump_timeout_diagnostic(exit_reason, baseline, total, responses)
         return "\n\n".join(responses).strip()
+
+    async def _dump_timeout_diagnostic(
+        self, reason: str, baseline: int, elapsed: float, responses: list[str]
+    ) -> None:
+        """Write a self-contained snapshot of a non-clean turn end to LOG_DIR.
+
+        Records what an after-the-fact investigation needs: the resolved
+        conversation id and transcript path, the tail of the transcript (step
+        types/statuses), and the rendered screen at the moment we gave up.
+        Best-effort — diagnostics must never mask the original turn result.
+        """
+        try:
+            screen = await self._capture()
+        except Exception as exc:  # pragma: no cover - capture already failed once
+            screen = f"(screen capture failed: {exc})"
+        steps = _read_transcript(self._conversation_id)
+        tail = steps[-TIMEOUT_DUMP_STEPS:]
+        path = TIMEOUT_LOG_DIR / f"{self.name}-turn{self._turn_count}-{self._conversation_id}.log"
+        try:
+            TIMEOUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"session={self.name} turn={self._turn_count} reason={reason}",
+                f"conversation_id={self._conversation_id}",
+                f"transcript={_transcript_path(self._conversation_id)}",
+                f"baseline={baseline} elapsed={elapsed:.1f}s "
+                f"collected_messages={len(responses)} total_steps={len(steps)}",
+                f"\n=== last {len(tail)} transcript steps ===",
+            ]
+            for d in tail:
+                c = d.get("content")
+                clen = len(c) if isinstance(c, str) else c
+                lines.append(
+                    f"step {d.get('step_index')} | {d.get('source')} "
+                    f"{d.get('type')} {d.get('status')} | "
+                    f"{d.get('created_at')} | content_len={clen}"
+                )
+            lines.append("\n=== rendered screen when we gave up ===")
+            lines.append(screen)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.warning("Session '%s': wrote timeout diagnostic to %s", self.name, path)
+        except OSError as exc:
+            logger.warning(
+                "Session '%s': could not write timeout diagnostic: %s", self.name, exc
+            )
 
     # --- Status --------------------------------------------------------------
 

@@ -6,3 +6,4 @@ __pycache__/
 files.zip
 .antigravitycli/
 .pytest_cache/
+logs/

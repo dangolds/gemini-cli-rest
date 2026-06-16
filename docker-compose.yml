@@ -13,13 +13,18 @@ services:
       - agy-config:/root/.gemini    # agy auth + settings persist
       - codex-config:/root/.codex   # codex auth.json + config.toml persist
       - ~/.ssh:/root/.ssh:ro
+      - ./logs:/app/logs            # bridge logs + per-incident timeout dumps (host-readable)
       # Repos you want BOTH bridges to read: mount them under one parent...
       # - ~/dev/slit/slitled-platform:/repos/slitled-platform
       # - ~/dev/other-repo:/repos/other-repo
     environment:
-      - RESPONSE_MAX_TIMEOUT=140    # agy: max wait for a Gemini turn
+      # agy: a turn ends on inactivity (stall), not a flat wall, so long agentic
+      # reviews aren't cut off mid-work. Hard ceiling is the absolute backstop.
+      - RESPONSE_STALL_TIMEOUT=90   # agy: give up after this long with no progress
+      - RESPONSE_HARD_TIMEOUT=900   # agy: absolute max per turn
       - STARTUP_TIMEOUT=60          # agy: max wait for the CLI to become ready
-      - CODEX_EXEC_TIMEOUT=300      # codex: max wait for a turn (xhigh is slow)
+      - CODEX_EXEC_TIMEOUT=900      # codex: max wait for a turn (a full review > 300s)
+      - LOG_DIR=/app/logs           # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
       # ...and grant both CLIs access to that parent (--add-dir is repeatable):

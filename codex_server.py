@@ -27,6 +27,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
 from fastapi import FastAPI, HTTPException, Path
@@ -48,12 +49,30 @@ CODEX_EXTRA_ARGS = os.getenv("CODEX_EXTRA_ARGS", "")
 RUN_ID = uuid.uuid4().hex[:8]
 SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/codex-rest-sessions")) / RUN_ID
 
-# A single turn with xhigh reasoning can run for a while; this bounds it.
-CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "300"))
+# Local, persisted log destination (mounted to the host in docker-compose), so
+# codex failures can be investigated without docker-exec'ing a live container.
+LOG_DIR = FsPath(os.getenv("LOG_DIR", "/app/logs"))
 
+# A single turn with xhigh reasoning over a real repo can run many minutes (a
+# full code review hit the old 300s ceiling mid-tool-call and was killed, which
+# the client saw as a 502). Bound it generously; the codex turn either finishes
+# or this is the absolute backstop.
+CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "900"))
+
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log_handlers.append(
+        RotatingFileHandler(
+            LOG_DIR / "codex-rest.log", maxBytes=10_000_000, backupCount=5
+        )
+    )
+except OSError:
+    pass  # file logging is best-effort; never block startup on it
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("codex-rest")
 
@@ -172,6 +191,36 @@ class CodexSession:
             raise RuntimeError(f"codex exec timed out after {CODEX_EXEC_TIMEOUT:.0f}s")
         return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
+    def _dump_failure(
+        self, turn: int, argv: list[str], elapsed: float, *,
+        reason: str, rc: int | None, stdout: str, stderr: str,
+    ) -> None:
+        """Snapshot a failed codex invocation to LOG_DIR for later investigation.
+
+        Records the invocation (argv, cwd, session id), why it failed, and the
+        stderr/stdout tails — the context that previously vanished into the 502
+        body. Best-effort: never let diagnostics mask the real failure.
+        """
+        path = LOG_DIR / "timeouts" / f"codex-{self.name}-turn{turn}.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"session={self.name} turn={turn} reason={reason} rc={rc}",
+                f"elapsed={elapsed:.1f}s session_id={self._session_id}",
+                f"cwd={self.cwd}",
+                f"argv={' '.join(argv)}",
+                "\n=== stderr (last 2000 chars) ===",
+                (stderr or "")[-2000:],
+                "\n=== stdout (last 2000 chars) ===",
+                (stdout or "")[-2000:],
+            ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.warning("Session '%s': wrote codex failure diagnostic to %s", self.name, path)
+        except OSError as exc:
+            logger.warning(
+                "Session '%s': could not write codex failure diagnostic: %s", self.name, exc
+            )
+
     # --- Chat --------------------------------------------------------------
 
     async def send(self, prompt: str) -> str:
@@ -204,10 +253,28 @@ class CodexSession:
                         *self._base_args(), "-o", str(out_file), "-"]
 
             run_start = time.monotonic()
-            rc, stdout, stderr = await self._run(argv, prompt)
+            try:
+                rc, stdout, stderr = await self._run(argv, prompt)
+            except RuntimeError as exc:
+                # timeout / spawn failure from _run: log the reason (it was only
+                # ever surfaced in the 502 body before) and snapshot for later.
+                run_elapsed = time.monotonic() - run_start
+                logger.warning(
+                    "Session '%s' turn %d — %s (after %.1fs)",
+                    self.name, turn, exc, run_elapsed,
+                )
+                self._dump_failure(turn, argv, run_elapsed, reason=str(exc),
+                                   rc=None, stdout="", stderr="")
+                raise
             run_elapsed = time.monotonic() - run_start
             if rc != 0:
                 detail = (stderr or stdout).strip()[-500:]
+                logger.error(
+                    "Session '%s' turn %d — codex exec failed in %.1fs (rc=%d): %s",
+                    self.name, turn, run_elapsed, rc, detail,
+                )
+                self._dump_failure(turn, argv, run_elapsed, reason=f"rc={rc}",
+                                   rc=rc, stdout=stdout, stderr=stderr)
                 raise RuntimeError(f"codex exec failed (rc={rc}): {detail}")
 
             if self._session_id is None:
