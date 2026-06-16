@@ -53,11 +53,10 @@ SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/codex-rest-sessions")) /
 # codex failures can be investigated without docker-exec'ing a live container.
 LOG_DIR = FsPath(os.getenv("LOG_DIR", "/app/logs"))
 
-# A single turn with xhigh reasoning over a real repo can run many minutes (a
-# full code review hit the old 300s ceiling mid-tool-call and was killed, which
-# the client saw as a 502). Bound it generously; the codex turn either finishes
-# or this is the absolute backstop.
-CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "900"))
+# Hard cap on a single codex turn. Kept ~140s to match the agy bridge and the
+# client/proxy that waits on the request — a turn that needs longer is the
+# client's cue to re-poll, not a reason to block the request for minutes.
+CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "140"))
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]
 try:

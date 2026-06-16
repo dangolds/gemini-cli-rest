@@ -63,16 +63,16 @@ TIMEOUT_DUMP_STEPS = int(os.getenv("TIMEOUT_DUMP_STEPS", "40"))
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
 RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
-# A turn ends when agy STOPS MAKING PROGRESS, not on a flat wall-clock. agy can
-# work on an agentic turn (reading files, running commands, streaming a long
-# answer) for many minutes; a flat timeout gave up while it was still busy and
-# hadn't yet flushed its final answer to the transcript, returning 0 messages.
-# So: give up only after agy has been idle with no new transcript steps for
-# RESPONSE_STALL_TIMEOUT, or after RESPONSE_HARD_TIMEOUT absolute as a backstop.
+# A turn ends when agy STOPS MAKING PROGRESS, not just on a flat wall-clock —
+# this lets a fast stall be cut off early instead of always burning the full
+# budget. But the request is still HARD-CAPPED (RESPONSE_HARD_TIMEOUT) so it
+# never outlives the client/proxy that's waiting on it. The cap stays ~140s by
+# design; longer agentic turns are handled by the client re-polling, not by the
+# server blocking for minutes.
 RESPONSE_STALL_TIMEOUT = float(os.getenv("RESPONSE_STALL_TIMEOUT", "90"))
 RESPONSE_HARD_TIMEOUT = float(
     # honor a legacy RESPONSE_MAX_TIMEOUT as the hard ceiling if someone set it
-    os.getenv("RESPONSE_HARD_TIMEOUT", os.getenv("RESPONSE_MAX_TIMEOUT", "900"))
+    os.getenv("RESPONSE_HARD_TIMEOUT", os.getenv("RESPONSE_MAX_TIMEOUT", "140"))
 )
 # After submitting, how long to wait for agy to *acknowledge* the turn (a new
 # transcript step appears, or the screen goes busy) before concluding the

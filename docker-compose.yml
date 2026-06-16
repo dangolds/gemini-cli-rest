@@ -18,12 +18,13 @@ services:
       # - ~/dev/slit/slitled-platform:/repos/slitled-platform
       # - ~/dev/other-repo:/repos/other-repo
     environment:
-      # agy: a turn ends on inactivity (stall), not a flat wall, so long agentic
-      # reviews aren't cut off mid-work. Hard ceiling is the absolute backstop.
+      # agy: a turn ends on inactivity (stall) OR the hard cap, whichever first.
+      # Hard cap stays ~140s so a request never outlives the client waiting on
+      # it; longer agentic turns are handled by the client re-polling.
       - RESPONSE_STALL_TIMEOUT=90   # agy: give up after this long with no progress
-      - RESPONSE_HARD_TIMEOUT=900   # agy: absolute max per turn
+      - RESPONSE_HARD_TIMEOUT=140   # agy: absolute max per turn
       - STARTUP_TIMEOUT=60          # agy: max wait for the CLI to become ready
-      - CODEX_EXEC_TIMEOUT=900      # codex: max wait for a turn (a full review > 300s)
+      - CODEX_EXEC_TIMEOUT=140      # codex: absolute max per turn
       - LOG_DIR=/app/logs           # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
