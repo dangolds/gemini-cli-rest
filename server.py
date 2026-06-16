@@ -65,15 +65,17 @@ RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
 # A turn ends when agy STOPS MAKING PROGRESS, not just on a flat wall-clock —
 # this lets a fast stall be cut off early instead of always burning the full
-# budget. But the request is still HARD-CAPPED (RESPONSE_HARD_TIMEOUT) so it
-# never outlives the client/proxy that's waiting on it. The cap stays ~140s by
-# design; longer agentic turns are handled by the client re-polling, not by the
-# server blocking for minutes.
+# budget. But the request is HARD-CAPPED at 3 minutes no matter what
+# (RESPONSE_HARD_TIMEOUT), so it never blocks the client for longer.
 RESPONSE_STALL_TIMEOUT = float(os.getenv("RESPONSE_STALL_TIMEOUT", "90"))
 RESPONSE_HARD_TIMEOUT = float(
     # honor a legacy RESPONSE_MAX_TIMEOUT as the hard ceiling if someone set it
-    os.getenv("RESPONSE_HARD_TIMEOUT", os.getenv("RESPONSE_MAX_TIMEOUT", "140"))
+    os.getenv("RESPONSE_HARD_TIMEOUT", os.getenv("RESPONSE_MAX_TIMEOUT", "180"))
 )
+# Any turn slower than this gets a diagnostic dump even if it SUCCEEDED, so a
+# slow-but-fine turn's transcript (timestamped steps — where the time went) is
+# captured, not just outright timeouts.
+RESPONSE_SLOW_DUMP_SECS = float(os.getenv("RESPONSE_SLOW_DUMP_SECS", "90"))
 # After submitting, how long to wait for agy to *acknowledge* the turn (a new
 # transcript step appears, or the screen goes busy) before concluding the
 # submit Enter was dropped and re-pressing it. Kept deliberately generous: a
@@ -582,10 +584,12 @@ class AgySession:
             "Session '%s': response complete via %s (%.1fs, %d message(s))",
             self.name, exit_reason, total, len(responses),
         )
-        if exit_reason != "transcript_done":
-            # The failure class we keep having to autopsy by hand — capture a
-            # local snapshot (screen + transcript tail) for later investigation.
-            await self._dump_timeout_diagnostic(exit_reason, baseline, total, responses)
+        if exit_reason != "transcript_done" or total > RESPONSE_SLOW_DUMP_SECS:
+            # Snapshot screen + transcript tail for later investigation — on any
+            # timeout, and on a slow-but-successful turn so we can see WHERE the
+            # time went (the transcript steps are timestamped).
+            dump_reason = exit_reason if exit_reason != "transcript_done" else "slow_success"
+            await self._dump_timeout_diagnostic(dump_reason, baseline, total, responses)
         return "\n\n".join(responses).strip()
 
     async def _dump_timeout_diagnostic(

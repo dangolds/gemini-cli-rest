@@ -53,10 +53,11 @@ SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/codex-rest-sessions")) /
 # codex failures can be investigated without docker-exec'ing a live container.
 LOG_DIR = FsPath(os.getenv("LOG_DIR", "/app/logs"))
 
-# Hard cap on a single codex turn. Kept ~140s to match the agy bridge and the
-# client/proxy that waits on the request — a turn that needs longer is the
-# client's cue to re-poll, not a reason to block the request for minutes.
-CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "140"))
+# Hard cap on a single codex turn: 3 minutes, no matter what.
+CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "180"))
+# A turn slower than this gets a breakdown dumped even when it SUCCEEDS, so a
+# slow-but-fine turn is explainable (what did codex spend the time on?).
+CODEX_SLOW_DUMP_SECS = float(os.getenv("CODEX_SLOW_DUMP_SECS", "90"))
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]
 try:
@@ -220,6 +221,41 @@ class CodexSession:
                 "Session '%s': could not write codex failure diagnostic: %s", self.name, exc
             )
 
+    def _dump_slow(self, turn: int, elapsed: float, stdout: str) -> None:
+        """A turn SUCCEEDED but was slow — tally what codex did so the time is
+        explainable. The --json stream records every step; counting item/event
+        types shows whether the turn ran lots of commands, read many files, etc.
+        The full detail lives in ~/.codex/sessions/.../rollout-*.jsonl.
+        """
+        tally: dict[str, int] = {}
+        events = 0
+        for ev in _iter_events(stdout):
+            events += 1
+            etype = ev.get("type")
+            if etype == "item.completed":
+                key = "item:" + str((ev.get("item") or {}).get("type"))
+            else:
+                key = str(etype)
+            tally[key] = tally.get(key, 0) + 1
+        path = LOG_DIR / "timeouts" / f"codex-slow-{self.name}-turn{turn}.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"session={self.name} turn={turn} reason=slow_success",
+                f"elapsed={elapsed:.1f}s session_id={self._session_id} events={events}",
+                f"cwd={self.cwd}",
+                "\n=== --json item/event tally (where the turn went) ===",
+            ]
+            for key, count in sorted(tally.items(), key=lambda kv: -kv[1]):
+                lines.append(f"{count:4d}  {key}")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.info(
+                "Session '%s' turn %d slow (%.0fs) — wrote breakdown to %s",
+                self.name, turn, elapsed, path,
+            )
+        except OSError as exc:
+            logger.warning("Session '%s': could not write codex slow dump: %s", self.name, exc)
+
     # --- Chat --------------------------------------------------------------
 
     async def send(self, prompt: str) -> str:
@@ -298,6 +334,8 @@ class CodexSession:
                 "Session '%s' turn %d — response (%.1fs, %d chars)",
                 self.name, self._turn_count, run_elapsed, len(response),
             )
+            if run_elapsed > CODEX_SLOW_DUMP_SECS:
+                self._dump_slow(self._turn_count, run_elapsed, stdout)
             return response
 
     # --- Lifecycle ---------------------------------------------------------
