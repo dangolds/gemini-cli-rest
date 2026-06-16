@@ -203,7 +203,9 @@ class CodexSession:
                 argv = [CODEX_CMD, "exec",
                         *self._base_args(), "-o", str(out_file), "-"]
 
+            run_start = time.monotonic()
             rc, stdout, stderr = await self._run(argv, prompt)
+            run_elapsed = time.monotonic() - run_start
             if rc != 0:
                 detail = (stderr or stdout).strip()[-500:]
                 raise RuntimeError(f"codex exec failed (rc={rc}): {detail}")
@@ -227,8 +229,8 @@ class CodexSession:
                 response = _parse_agent_message(stdout)
 
             logger.info(
-                "Session '%s' turn %d — response (%d chars)",
-                self.name, self._turn_count, len(response),
+                "Session '%s' turn %d — response (%.1fs, %d chars)",
+                self.name, self._turn_count, run_elapsed, len(response),
             )
             return response
 
