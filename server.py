@@ -56,6 +56,14 @@ STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
 RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
 RESPONSE_MAX_TIMEOUT = float(os.getenv("RESPONSE_MAX_TIMEOUT", "140"))
+# After submitting, how long to wait for agy to *acknowledge* the turn (a new
+# transcript step appears, or the screen goes busy) before concluding the
+# submit Enter was dropped and re-pressing it. Kept deliberately generous: a
+# genuinely-accepted submit acknowledges within ~1s, so waiting this long means
+# a merely-slow-but-accepted submit is never mistaken for a drop and re-sent —
+# which is what would otherwise produce a duplicate message.
+SUBMIT_CONFIRM_WAIT = float(os.getenv("SUBMIT_CONFIRM_WAIT", "8"))
+SUBMIT_MAX_RETRIES = int(os.getenv("SUBMIT_MAX_RETRIES", "2"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
@@ -291,16 +299,32 @@ class AgySession:
         raise RuntimeError(f"agy startup timed out after {STARTUP_TIMEOUT:.0f}s")
 
     async def _detect_new_conversation(self, before: set[str]) -> str:
-        """Wait for the brain dir agy creates for the new conversation."""
+        """Wait for the new brain dir agy populates with this turn's transcript.
+
+        agy also creates *empty* placeholder brain dirs that never receive a
+        transcript. Selecting purely on "newest new dir" can latch onto one of
+        those, which is silent but fatal: every transcript read then returns
+        nothing, so the turn only ends at the max timeout reporting
+        "0 message(s)" while the TUI showed the reply within seconds. Keying on
+        the transcript file — the artifact we actually poll — sidesteps the
+        trap; if several real conversations appear, the newest transcript wins.
+        """
         start = time.monotonic()
         while time.monotonic() - start < CONVERSATION_DETECT_TIMEOUT:
-            dirs = _brain_dirs()
-            new = {cid: mtime for cid, mtime in dirs.items() if cid not in before}
-            if new:
-                cid = max(new, key=new.get)  # newest wins
-                return cid
+            candidates: dict[str, float] = {}
+            for cid in _brain_dirs():
+                if cid in before:
+                    continue
+                try:
+                    candidates[cid] = _transcript_path(cid).stat().st_mtime
+                except OSError:
+                    continue  # dir exists but no transcript yet — keep waiting
+            if candidates:
+                return max(candidates, key=candidates.get)  # newest transcript wins
             await asyncio.sleep(0.5)
-        raise RuntimeError("Could not determine agy conversation id (no new brain dir)")
+        raise RuntimeError(
+            "Could not determine agy conversation id (no new transcript appeared)"
+        )
 
     async def stop(self) -> None:
         async with self._lock:
@@ -375,10 +399,14 @@ class AgySession:
                     before = set(_brain_dirs())
                     await self._submit(prompt)
                     self._conversation_id = await self._detect_new_conversation(before)
+                logger.info(
+                    "Session '%s': resolved conversation id %s",
+                    self.name, self._conversation_id,
+                )
                 baseline = -1
             else:
                 baseline = _max_step(_read_transcript(self._conversation_id))
-                await self._submit(prompt)
+                await self._submit_confirmed(prompt, baseline)
 
             response = await self._collect_response(baseline)
             logger.info(
@@ -402,6 +430,52 @@ class AgySession:
             raise RuntimeError(f"tmux paste-buffer failed: {out.strip()}")
         await asyncio.sleep(0.15)
         await _tmux("send-keys", "-t", self._target, "Enter")
+
+    async def _submit_confirmed(self, prompt: str, baseline: int) -> None:
+        """Submit *prompt* and make sure agy actually ingested it.
+
+        agy occasionally swallows the submit Enter when its TUI is still
+        settling after rendering the previous (often long) response: the pasted
+        text sits in the input box unsubmitted while the screen still looks
+        idle, so the turn stalls until the max timeout and the bridge reports
+        "0 message(s)" even though agy was free the whole time. We confirm
+        ingestion before trusting the submit, and only re-press Enter when agy
+        is plainly idle and has ingested nothing. We never re-paste and we wait
+        a full SUBMIT_CONFIRM_WAIT before each retry, so a slow-but-accepted
+        submit can never be turned into a duplicate message.
+        """
+        await self._submit(prompt)
+        for attempt in range(1, SUBMIT_MAX_RETRIES + 1):
+            if await self._await_ingest(baseline):
+                return
+            logger.warning(
+                "Session '%s': submit unacknowledged after %.0fs (agy idle, "
+                "nothing ingested) — re-pressing Enter [retry %d/%d]",
+                self.name, SUBMIT_CONFIRM_WAIT, attempt, SUBMIT_MAX_RETRIES,
+            )
+            await _tmux("send-keys", "-t", self._target, "Enter")
+        # Final grace wait. If agy still took nothing, fall through and let
+        # _collect_response run its course (it times out exactly as today).
+        await self._await_ingest(baseline)
+
+    async def _await_ingest(self, baseline: int) -> bool:
+        """Wait up to SUBMIT_CONFIRM_WAIT for agy to ingest the submitted turn.
+
+        Ingested == a new transcript step (step_index > baseline) appears — agy
+        logged the turn — OR the screen shows a busy marker — agy is
+        generating. Either way the submit took, so returning here can never
+        cause a duplicate. Returns False only if the whole window elapses with
+        agy idle and nothing new ingested: the signature of a dropped Enter,
+        where re-pressing it is safe because nothing was ever submitted.
+        """
+        deadline = time.monotonic() + SUBMIT_CONFIRM_WAIT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+            if _max_step(_read_transcript(self._conversation_id)) > baseline:
+                return True
+            if self._is_busy(await self._capture()):
+                return True
+        return False
 
     async def _collect_response(self, baseline: int) -> str:
         """Poll until the turn is complete, then return the new model text.
