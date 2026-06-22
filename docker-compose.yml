@@ -19,9 +19,14 @@ services:
       - codex-config:/root/.codex   # codex auth + config + sessions (container-only)
       - ~/.ssh:/root/.ssh:ro
       - ./logs:/app/logs            # bridge logs + per-incident timeout dumps (host-readable)
-      # Repos you want BOTH bridges to read: mount them under one parent...
-      # - ~/dev/slit/slitled-platform:/repos/slitled-platform
-      # - ~/dev/other-repo:/repos/other-repo
+      # The slitled-platform clone lives at /app/slitled-platform INSIDE the
+      # container. Without this volume that path is in the image's ephemeral
+      # layer, so every rebuild/recreate wipes it and forces a re-clone. A
+      # Docker-managed named volume mounted there makes the clone persist across
+      # rebuilds — fully SEPARATE from the host filesystem (nothing on the
+      # laptop). Clone into it ONCE from inside the container:
+      #   docker compose exec bridges git clone <url> /app/slitled-platform
+      - slitled-platform:/app/slitled-platform   # container-only clone, persists across rebuilds
     environment:
       # Both bridges: a turn ends on inactivity (stall) OR the hard cap,
       # whichever first. Hard cap is 3 minutes — a request never blocks longer.
@@ -36,10 +41,13 @@ services:
       - LOG_DIR=/app/logs                  # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
-      # ...and grant both CLIs access to that parent (--add-dir is repeatable):
-      # - AGY_EXTRA_ARGS=--add-dir /repos
-      # - CODEX_EXTRA_ARGS=--add-dir /repos
+      # Grant both CLIs read/write access to the clone (agy already trusts /app
+      # via entrypoint.sh; codex needs the explicit --add-dir since sessions run
+      # in their own per-session cwd):
+      - AGY_EXTRA_ARGS=--add-dir /app/slitled-platform
+      - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
 
 volumes:
   agy-config:
   codex-config:   # container's OWN codex login + config + sessions (independent; never seeded from host)
+  slitled-platform:   # container-only clone at /app/slitled-platform; persists across rebuilds, never on the host
