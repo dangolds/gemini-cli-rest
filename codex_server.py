@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
-from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi import FastAPI, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -135,6 +135,29 @@ logging.basicConfig(
     handlers=_log_handlers,
 )
 logger = logging.getLogger("codex-rest")
+
+
+# --- Audit-trail helpers (used by /last logging) ----------------------------
+
+def _client(request: "Request") -> str:
+    """Best-effort caller identity for the log: the originating IP, honoring a
+    reverse proxy's X-Forwarded-For when present, else the socket peer."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _ua(request: "Request") -> str:
+    """Caller's User-Agent (which client/tool issued the recovery), truncated."""
+    return (request.headers.get("user-agent") or "?")[:120]
+
+
+def _preview(text: str, limit: int = 160) -> str:
+    """One-line, whitespace-collapsed snippet of an answer for the trail — so
+    the log records WHAT was handed back without dumping the whole response."""
+    flat = " ".join((text or "").split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +820,13 @@ class CodexSession:
     def turn_count(self) -> int:
         return self._turn_count
 
+    @property
+    def ref(self) -> str:
+        """Durable artifact this session reads answers from — the codex session
+        id (rollout). Logged on /last so a recovered answer can be traced back
+        to the exact rollout it came from ('-' before the first turn)."""
+        return self._session_id or "-"
+
 
 # ---------------------------------------------------------------------------
 # Session Manager
@@ -884,6 +914,41 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """Log every request to the persisted server log for post-mortem debugging.
+
+    Writes one line when a request ARRIVES and one when it FINISHES, sharing a
+    short id. This is what makes the three failure modes investigable from the
+    file log alone:
+      * stuck  — an arrival line ('-->') with no matching completion ('<--')
+                 is a request still hung in its handler (e.g. a wedged turn).
+      * break  — an unhandled error logs a full traceback ('!!!') and returns
+                 500 instead of vanishing; HTTPExceptions show as their status.
+      * slow   — every completion carries its wall-clock duration in ms.
+    Health checks log at DEBUG so routine polling never floods the file.
+    """
+    rid = uuid.uuid4().hex[:8]
+    level = logging.DEBUG if request.url.path == "/health" else logging.INFO
+    t0 = time.monotonic()
+    logger.log(level, "--> %s %s [%s]", request.method, request.url.path, rid)
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        logger.exception(
+            "!!! %s %s [%s] unhandled error after %dms",
+            request.method, request.url.path, rid, elapsed,
+        )
+        raise
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.log(
+        level, "<-- %s %s [%s] %d in %dms",
+        request.method, request.url.path, rid, response.status_code, elapsed,
+    )
+    return response
+
+
 # --- Request/Response models ------------------------------------------------
 
 _NAME = Path(..., pattern=r"^[a-zA-Z0-9_-]+$", max_length=64,
@@ -954,6 +1019,7 @@ async def chat(req: ChatRequest, name: str = _NAME):
 
 @app.get("/last/{name}", response_model=LastResponse)
 async def get_last(
+    request: Request,
     name: str = _NAME,
     wait: float = Query(
         0.0, ge=0.0,
@@ -969,19 +1035,45 @@ async def get_last(
     {done:true, response} only once the most recent turn has finished;
     {done:false, response:null} while it is still running or was never
     ingested — never a partial answer or a stale previous one.
+
+    /last is the recovery path, so it leaves a full audit trail in the log:
+    WHO/WHY (caller host + user-agent + the wait they asked for) on entry, and
+    WHAT (turn, durable rollout ref, length + a one-line preview of the answer)
+    on exit — enough to reconstruct, after the fact, which client recovered
+    which answer from which rollout and when.
     """
     session = await manager.get(name)
     if not session:
+        logger.warning(
+            "/last MISS session '%s' (unknown) <- %s ua=%r",
+            name, _client(request), _ua(request),
+        )
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
 
+    logger.info(
+        "/last REQUEST session '%s' ref=%s turn=%d wait=%.1fs <- %s ua=%r",
+        name, session.ref, session.turn_count, wait, _client(request), _ua(request),
+    )
     t0 = time.monotonic()
     done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
+    elapsed = int((time.monotonic() - t0) * 1000)
+    if done:
+        logger.info(
+            "/last HIT session '%s' ref=%s turn=%d recovered %d chars in %dms: %r",
+            name, session.ref, turn, len(response), elapsed, _preview(response),
+        )
+    else:
+        logger.info(
+            "/last PENDING session '%s' ref=%s turn=%d — no completed answer yet "
+            "(still running or never ingested) after %dms",
+            name, session.ref, turn, elapsed,
+        )
     return LastResponse(
         done=done,
         response=response if done else None,
         turn=turn,
         session=name,
-        elapsed_ms=int((time.monotonic() - t0) * 1000),
+        elapsed_ms=elapsed,
     )
 
 
