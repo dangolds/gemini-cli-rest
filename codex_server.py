@@ -1,21 +1,26 @@
 """
-REST API server that wraps OpenAI's Codex CLI (codex) in headless mode.
+REST API server that wraps OpenAI's Codex CLI (codex) interactive mode.
 
-Unlike the agy bridge (server.py), which drives a live interactive TUI through a
-tmux terminal-emulator mediator, Codex ships a first-class headless mode:
+Each named session (/chat/{name}) runs its own live `codex` process inside a
+detached tmux session — the same architecture as the agy bridge (server.py).
+tmux acts as a terminal-emulator mediator: instead of parsing the raw PTY
+escape-code stream, we read the *rendered* screen with `tmux capture-pane`
+(used only for startup-ready detection, interstitial handling, and liveness)
+and extract the model's response as structured data from codex's per-session
+rollout file (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    codex exec [PROMPT]                  -> run one turn, print the answer
-    codex exec resume <SESSION_ID> ...   -> continue a prior session statelessly
+Why a warm process instead of `codex exec` per turn: a live interactive session
+keeps conversation context in-process across turns and mirrors the agy bridge
+one-to-one, so a single skill drives both. Context wipe (/clear) respawns into a
+fresh working directory, exactly like agy.
 
-There is therefore NO warm process to keep alive. Process boot is ~0.25s
-(negligible next to the model call), and OpenAI's server-side prompt cache spans
-separate `exec` invocations, so keeping codex warm buys nothing. Each named
-session (/chat/{name}) is just a small bit of state — its codex session UUID
-plus a per-session working directory — and every turn shells out to a fresh
-`codex exec` / `codex exec resume` process.
+Codex's rollout makes response reading cleaner than agy's: it records explicit
+turn boundaries. A turn is `event_msg/task_started{turn_id}` ... a sequence of
+`response_item`s ... `event_msg/task_complete{turn_id, last_agent_message}`. The
+arrival of a NEW task_complete is a definitive done-signal (no screen-scrape
+debounce), and `last_agent_message` is the final answer text.
 
-The REST contract is identical to the agy bridge (server.py) so a future
-codex-bridge skill can mirror the gemini-bridge skill one-to-one.
+The REST contract is identical to the agy bridge (server.py).
 """
 
 import asyncio
@@ -43,21 +48,72 @@ CODEX_CMD = os.getenv("CODEX_CMD", "codex")
 # "--add-dir /repos" to grant read/write access to mounted repositories.
 CODEX_EXTRA_ARGS = os.getenv("CODEX_EXTRA_ARGS", "")
 
-# Each session gets its own working directory. The per-run id keeps paths unique
-# across server restarts (same trick as the agy bridge): codex records sessions
-# on disk keyed partly by cwd, so a fresh path guarantees a clean slate.
+TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
+# Dedicated tmux server socket, distinct from the agy bridge's ("agy-rest"), so
+# the two bridges in one container never collide and neither touches a user tmux.
+TMUX_SOCKET = os.getenv("CODEX_TMUX_SOCKET", "codex-rest")
+TERM_WIDTH = int(os.getenv("TERM_WIDTH", "200"))
+TERM_HEIGHT = int(os.getenv("TERM_HEIGHT", "50"))
+
+# Where codex keeps its state. Sessions (rollout JSONL) live under
+# CODEX_HOME/sessions/YYYY/MM/DD/. CODEX_HOME mirrors codex's own env var.
+CODEX_HOME = FsPath(os.getenv("CODEX_HOME", os.path.expanduser("~/.codex")))
+CODEX_SESSIONS_DIR = FsPath(os.getenv("CODEX_SESSIONS_DIR", str(CODEX_HOME / "sessions")))
+
+# Each session gets its own working directory so codex's per-cwd state never
+# crosses between sessions. The per-run id keeps paths unique across server
+# restarts: a fresh path guarantees a clean slate for a "new" session.
 RUN_ID = uuid.uuid4().hex[:8]
 SESSIONS_ROOT = FsPath(os.getenv("SESSIONS_ROOT", "/tmp/codex-rest-sessions")) / RUN_ID
 
 # Local, persisted log destination (mounted to the host in docker-compose), so
-# codex failures can be investigated without docker-exec'ing a live container.
+# turns can be investigated after the fact without docker-exec'ing a container.
 LOG_DIR = FsPath(os.getenv("LOG_DIR", "/app/logs"))
+TIMEOUT_LOG_DIR = LOG_DIR / "timeouts"
+TIMEOUT_DUMP_STEPS = int(os.getenv("TIMEOUT_DUMP_STEPS", "40"))
 
-# Hard cap on a single codex turn: 3 minutes, no matter what.
-CODEX_EXEC_TIMEOUT = float(os.getenv("CODEX_EXEC_TIMEOUT", "180"))
-# A turn slower than this gets a breakdown dumped even when it SUCCEEDS, so a
-# slow-but-fine turn is explainable (what did codex spend the time on?).
-CODEX_SLOW_DUMP_SECS = float(os.getenv("CODEX_SLOW_DUMP_SECS", "90"))
+STARTUP_TIMEOUT = float(os.getenv("CODEX_STARTUP_TIMEOUT", "60"))
+RESPONSE_POLL_INTERVAL = float(os.getenv("CODEX_RESPONSE_POLL_INTERVAL", "0.5"))
+RESPONSE_MIN_WAIT = float(os.getenv("CODEX_RESPONSE_MIN_WAIT", "1"))
+# A turn ends when codex finishes (a new task_complete) — but we also bound it.
+# A turn that makes NO progress for RESPONSE_STALL_TIMEOUT is cut off early; any
+# turn is HARD-CAPPED at RESPONSE_HARD_TIMEOUT so it never blocks the client
+# longer than the per-request cap (3 min for both bridges).
+RESPONSE_STALL_TIMEOUT = float(os.getenv("CODEX_RESPONSE_STALL_TIMEOUT", "90"))
+RESPONSE_HARD_TIMEOUT = float(
+    # honor a legacy CODEX_EXEC_TIMEOUT as the hard ceiling if someone set it
+    os.getenv("CODEX_RESPONSE_HARD_TIMEOUT", os.getenv("CODEX_EXEC_TIMEOUT", "180"))
+)
+# Any turn slower than this gets a diagnostic dump even if it SUCCEEDED, so a
+# slow-but-fine turn's rollout tail (timestamped events — where the time went)
+# is captured, not just outright timeouts.
+RESPONSE_SLOW_DUMP_SECS = float(os.getenv("CODEX_SLOW_DUMP_SECS", "90"))
+# After submitting, how long to wait for codex to *acknowledge* the turn (a new
+# task_started appears, or the screen goes busy) before concluding the submit
+# Enter was dropped and re-pressing it. A genuinely-accepted submit acknowledges
+# within ~1s, so waiting this long means a merely-slow-but-accepted submit is
+# never mistaken for a drop and re-sent — which would duplicate the message.
+SUBMIT_CONFIRM_WAIT = float(os.getenv("CODEX_SUBMIT_CONFIRM_WAIT", "8"))
+SUBMIT_MAX_RETRIES = int(os.getenv("CODEX_SUBMIT_MAX_RETRIES", "2"))
+# How long after startup we wait for codex to register the new session (its
+# rollout file, tagged with our cwd, appears).
+SESSION_DETECT_TIMEOUT = float(os.getenv("CODEX_SESSION_DETECT_TIMEOUT", "20"))
+
+# Rendered-screen markers (read from tmux's emulated screen, never from the raw
+# escape stream, so these are stable plain-text strings). Correctness rides on
+# the rollout (task_started/task_complete); the screen is only used for startup
+# readiness, dismissing startup interstitials, and liveness.
+# Idle-prompt markers — ANY present means the TUI reached its input prompt.
+# Kept version-tolerant: 0.139 showed a "Context N% used" meter in the idle
+# status line, but 0.141 dropped it; the welcome banner ("OpenAI Codex" /
+# "/model to change") is stable across versions and absent on the trust/update
+# interstitial screens, so it cleanly signals "past startup, at the prompt".
+READY_MARKERS = ("/model to change", "OpenAI Codex", "% used")
+# Best-effort busy hints (secondary to the rollout's in-flight detection).
+BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt", "working", "thinking")
+
+# tmux client commands are sub-second; anything longer means a stuck client.
+TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]
 try:
@@ -78,295 +134,618 @@ logger = logging.getLogger("codex-rest")
 
 
 # ---------------------------------------------------------------------------
-# codex --json event parsing
+# Subprocess / tmux helpers
+# ---------------------------------------------------------------------------
+
+async def _exec(*argv: str, stdin_data: bytes | None = None) -> tuple[int, str]:
+    """Run a command, return (returncode, combined output)."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(stdin_data), timeout=TMUX_CMD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(f"Command timed out: {' '.join(argv[:4])}...")
+    return proc.returncode or 0, out.decode(errors="replace")
+
+
+async def _tmux(*args: str, stdin_data: bytes | None = None) -> tuple[int, str]:
+    return await _exec(TMUX_BIN, "-L", TMUX_SOCKET, *args, stdin_data=stdin_data)
+
+
+async def _ensure_tmux_server() -> None:
+    """Start the dedicated tmux server with fully detached stdio.
+
+    The first tmux client on a fresh socket forks the tmux server daemon.
+    Under uvloop, a pipe inherited by that daemon is never seen as closed,
+    which would hang the first session spawn — so the daemon is started here
+    with DEVNULL stdio. "exit-empty off" keeps it alive with zero sessions.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "-L", TMUX_SOCKET,
+        "start-server", ";", "set", "-g", "exit-empty", "off",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# codex rollout access
 # ---------------------------------------------------------------------------
 #
-# With `--json`, codex exec streams newline-delimited JSON events to stdout.
-# The two we care about (verified against codex-cli 0.139.0):
-#   {"type": "thread.started", "thread_id": "<uuid>"}            -> session id
-#   {"type": "item.completed", "item": {"type": "agent_message", -> answer text
-#                                       "text": "..."}}
-# The session id is needed once (first turn) to enable `exec resume`; the answer
-# text is read primarily from the `-o` last-message file, with the agent_message
-# event as a fallback.
-
-def _iter_events(stdout: str):
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+# An interactive codex session appends every event to a single rollout file for
+# the life of the process. The shapes we depend on (verified against codex-cli
+# 0.139.0):
+#   {"type":"session_meta","payload":{"id":"<uuid>","cwd":"...","originator":"codex-tui",...}}
+#   {"type":"event_msg","payload":{"type":"task_started","turn_id":"..."}}
+#   {"type":"response_item","payload":{"type":"message","role":"assistant",
+#                                      "content":[{"type":"output_text","text":"..."}]}}
+#   {"type":"event_msg","payload":{"type":"task_complete","turn_id":"...",
+#                                  "last_agent_message":"<final answer or null>"}}
 
 
-def _parse_thread_id(stdout: str) -> str | None:
-    for ev in _iter_events(stdout):
-        if ev.get("type") == "thread.started" and ev.get("thread_id"):
-            return ev["thread_id"]
+def _rollout_files() -> list[FsPath]:
+    """All rollout JSONL files codex has written, cheapest-first by nothing."""
+    if not CODEX_SESSIONS_DIR.is_dir():
+        return []
+    try:
+        return list(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    except OSError:
+        return []
+
+
+def _payload(ev: dict) -> dict:
+    p = ev.get("payload")
+    return p if isinstance(p, dict) else {}
+
+
+def _rollout_meta(path: FsPath) -> dict | None:
+    """Read just the session_meta (first line) of a rollout file, if present."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("type") == "session_meta":
+                    return _payload(ev)
+                return None  # first event isn't session_meta — unexpected; bail
+    except (OSError, json.JSONDecodeError):
+        return None
     return None
 
 
-def _parse_agent_message(stdout: str) -> str:
-    """Last agent_message text in the stream (matches `-o` semantics)."""
-    text = ""
-    for ev in _iter_events(stdout):
-        if ev.get("type") == "item.completed":
-            item = ev.get("item", {})
-            if item.get("type") == "agent_message" and item.get("text"):
-                text = item["text"]
-    return text.strip()
+def _read_rollout(path: FsPath | None) -> list[dict]:
+    """Parse a rollout JSONL into a list of event dicts (empty if absent)."""
+    if path is None or not path.is_file():
+        return []
+    events: list[dict] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # partially-written line; next poll gets it
+    except OSError:
+        return []
+    return events
+
+
+def _count_task_completes(events: list[dict]) -> int:
+    return sum(
+        1 for ev in events
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete"
+    )
+
+
+def _count_task_starts(events: list[dict]) -> int:
+    return sum(
+        1 for ev in events
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_started"
+    )
+
+
+def _answer_for_new_turn(events: list[dict], baseline_completes: int) -> str:
+    """Final model text for the turn(s) completed since *baseline_completes*.
+
+    Prefer the latest task_complete's `last_agent_message` (codex's canonical
+    final answer). Fall back to concatenating assistant `output_text` produced
+    after the baseline turn boundary, so a null last_agent_message still yields
+    the visible reply.
+    """
+    # Find the position just after the baseline_completes-th task_complete; the
+    # new turn's events all live beyond it. baseline 0 -> scan from the start.
+    completes = 0
+    start = 0
+    for i, ev in enumerate(events):
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete":
+            completes += 1
+            if completes == baseline_completes:
+                start = i + 1
+                break
+    window = events[start:]
+
+    answer = ""
+    for ev in window:
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete":
+            msg = _payload(ev).get("last_agent_message")
+            if msg:
+                answer = msg
+    if answer:
+        return answer.strip()
+
+    texts: list[str] = []
+    for ev in window:
+        p = _payload(ev)
+        if ev.get("type") == "response_item" and p.get("type") == "message" \
+                and p.get("role") == "assistant":
+            for part in p.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") == "output_text" \
+                        and part.get("text"):
+                    texts.append(part["text"])
+    return "\n".join(texts).strip()
 
 
 # ---------------------------------------------------------------------------
-# Codex Session (pure state — no live process)
+# Codex Session (one live codex process inside a tmux session)
 # ---------------------------------------------------------------------------
+
+# Serializes spawn/clear windows so a newly created rollout file is always
+# attributable to exactly one session.
+_SPAWN_LOCK = asyncio.Lock()
+
 
 @dataclass
 class CodexSession:
-    """A named conversation: a codex session UUID + a working directory.
-
-    There is no process to manage. The first turn runs `codex exec` and records
-    the session UUID from the thread.started event; subsequent turns run
-    `codex exec resume <uuid>` so codex rehydrates context from its on-disk
-    session log.
-    """
+    """Manages a single live codex process hosted in a detached tmux session."""
 
     name: str
+    _rollout_path: FsPath | None = field(default=None, init=False)
     _session_id: str | None = field(default=None, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _turn_count: int = field(default=0, init=False)
-    # Bumped on clear/reset so the next turn lands in a fresh working dir and a
-    # brand-new codex session — a genuine context wipe.
+    # Every spawn gets a fresh generation directory (and a brand-new codex
+    # session), which is what makes clear/reset a true context wipe.
     _generation: int = field(default=0, init=False)
 
     # --- Identity ----------------------------------------------------------
 
     @property
+    def tmux_session(self) -> str:
+        return f"codex-{self.name}"
+
+    @property
+    def _target(self) -> str:
+        # '=' forces exact-name matching; the trailing ':' makes the target
+        # parse as a session for pane-taking commands (capture-pane etc.).
+        return f"={self.tmux_session}:"
+
+    @property
     def cwd(self) -> FsPath:
         return SESSIONS_ROOT / self.name / f"c{self._generation}"
 
-    @property
-    def _output_file(self) -> FsPath:
-        return self.cwd / ".codex-last.txt"
-
-    # --- Command construction ---------------------------------------------
-
-    def _base_args(self) -> list[str]:
-        # --json: machine-readable events (we read thread_id from them)
-        # --skip-git-repo-check: session dirs aren't git repos
-        # --dangerously-bypass-approvals-and-sandbox: never block; the container
-        #   is the sandbox (mirrors agy's "always-proceed"). Belt-and-suspenders
-        #   alongside approval_policy=never in config.toml.
-        args = [
-            "--json",
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]
-        if CODEX_EXTRA_ARGS:
-            args.extend(shlex.split(CODEX_EXTRA_ARGS))
-        return args
-
-    # --- Subprocess --------------------------------------------------------
-
-    async def _run(self, argv: list[str], prompt: str) -> tuple[int, str, str]:
-        """Run a codex invocation with the prompt on stdin; return (rc, out, err)."""
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(self.cwd),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out, err = await asyncio.wait_for(
-                proc.communicate(prompt.encode()), timeout=CODEX_EXEC_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            raise RuntimeError(f"codex exec timed out after {CODEX_EXEC_TIMEOUT:.0f}s")
-        return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
-
-    def _dump_failure(
-        self, turn: int, argv: list[str], elapsed: float, *,
-        reason: str, rc: int | None, stdout: str, stderr: str,
-    ) -> None:
-        """Snapshot a failed codex invocation to LOG_DIR for later investigation.
-
-        Records the invocation (argv, cwd, session id), why it failed, and the
-        stderr/stdout tails — the context that previously vanished into the 502
-        body. Best-effort: never let diagnostics mask the real failure.
-        """
-        path = LOG_DIR / "timeouts" / f"codex-{self.name}-turn{turn}.log"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lines = [
-                f"session={self.name} turn={turn} reason={reason} rc={rc}",
-                f"elapsed={elapsed:.1f}s session_id={self._session_id}",
-                f"cwd={self.cwd}",
-                f"argv={' '.join(argv)}",
-                "\n=== stderr (last 2000 chars) ===",
-                (stderr or "")[-2000:],
-                "\n=== stdout (last 2000 chars) ===",
-                (stdout or "")[-2000:],
-            ]
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.warning("Session '%s': wrote codex failure diagnostic to %s", self.name, path)
-        except OSError as exc:
-            logger.warning(
-                "Session '%s': could not write codex failure diagnostic: %s", self.name, exc
-            )
-
-    def _dump_slow(self, turn: int, elapsed: float, stdout: str) -> None:
-        """A turn SUCCEEDED but was slow — tally what codex did so the time is
-        explainable. The --json stream records every step; counting item/event
-        types shows whether the turn ran lots of commands, read many files, etc.
-        The full detail lives in ~/.codex/sessions/.../rollout-*.jsonl.
-        """
-        tally: dict[str, int] = {}
-        events = 0
-        for ev in _iter_events(stdout):
-            events += 1
-            etype = ev.get("type")
-            if etype == "item.completed":
-                key = "item:" + str((ev.get("item") or {}).get("type"))
-            else:
-                key = str(etype)
-            tally[key] = tally.get(key, 0) + 1
-        path = LOG_DIR / "timeouts" / f"codex-slow-{self.name}-turn{turn}.log"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lines = [
-                f"session={self.name} turn={turn} reason=slow_success",
-                f"elapsed={elapsed:.1f}s session_id={self._session_id} events={events}",
-                f"cwd={self.cwd}",
-                "\n=== --json item/event tally (where the turn went) ===",
-            ]
-            for key, count in sorted(tally.items(), key=lambda kv: -kv[1]):
-                lines.append(f"{count:4d}  {key}")
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.info(
-                "Session '%s' turn %d slow (%.0fs) — wrote breakdown to %s",
-                self.name, turn, elapsed, path,
-            )
-        except OSError as exc:
-            logger.warning("Session '%s': could not write codex slow dump: %s", self.name, exc)
-
-    # --- Chat --------------------------------------------------------------
-
-    async def send(self, prompt: str) -> str:
-        """Send a prompt and return codex's final answer.
-
-        The prompt is fed on stdin (the `-` argument), so newlines, quotes, and
-        shell metacharacters arrive as literal text with no escaping concerns.
-        """
-        async with self._lock:
-            self.cwd.mkdir(parents=True, exist_ok=True)
-            turn = self._turn_count + 1  # committed only once the turn succeeds
-            out_file = self._output_file
-            try:
-                out_file.unlink()  # avoid reading a stale answer
-            except FileNotFoundError:
-                pass
-
-            resuming = self._session_id is not None
-            logger.info(
-                "Session '%s' turn %d — %s (%d chars)",
-                self.name, turn,
-                "resume" if resuming else "new session", len(prompt),
-            )
-
-            if resuming:
-                argv = [CODEX_CMD, "exec", "resume", self._session_id,
-                        *self._base_args(), "-o", str(out_file), "-"]
-            else:
-                argv = [CODEX_CMD, "exec",
-                        *self._base_args(), "-o", str(out_file), "-"]
-
-            run_start = time.monotonic()
-            try:
-                rc, stdout, stderr = await self._run(argv, prompt)
-            except RuntimeError as exc:
-                # timeout / spawn failure from _run: log the reason (it was only
-                # ever surfaced in the 502 body before) and snapshot for later.
-                run_elapsed = time.monotonic() - run_start
-                logger.warning(
-                    "Session '%s' turn %d — %s (after %.1fs)",
-                    self.name, turn, exc, run_elapsed,
-                )
-                self._dump_failure(turn, argv, run_elapsed, reason=str(exc),
-                                   rc=None, stdout="", stderr="")
-                raise
-            run_elapsed = time.monotonic() - run_start
-            if rc != 0:
-                detail = (stderr or stdout).strip()[-500:]
-                logger.error(
-                    "Session '%s' turn %d — codex exec failed in %.1fs (rc=%d): %s",
-                    self.name, turn, run_elapsed, rc, detail,
-                )
-                self._dump_failure(turn, argv, run_elapsed, reason=f"rc={rc}",
-                                   rc=rc, stdout=stdout, stderr=stderr)
-                raise RuntimeError(f"codex exec failed (rc={rc}): {detail}")
-
-            if self._session_id is None:
-                self._session_id = _parse_thread_id(stdout)
-                if self._session_id is None:
-                    raise RuntimeError("Could not determine codex session id (no thread.started event)")
-                logger.info("Session '%s' bound to codex thread %s", self.name, self._session_id)
-
-            # The turn ran (rc==0, session bound) — commit the counter now so a
-            # hard failure above never advances the client-visible turn number.
-            self._turn_count = turn
-
-            response = ""
-            try:
-                response = out_file.read_text(errors="replace").strip()
-            except OSError:
-                pass
-            if not response:
-                response = _parse_agent_message(stdout)
-
-            logger.info(
-                "Session '%s' turn %d — response (%.1fs, %d chars)",
-                self.name, self._turn_count, run_elapsed, len(response),
-            )
-            if run_elapsed > CODEX_SLOW_DUMP_SECS:
-                self._dump_slow(self._turn_count, run_elapsed, stdout)
-            return response
-
     # --- Lifecycle ---------------------------------------------------------
 
-    async def clear(self) -> None:
-        """Wipe context: new working dir + forget the codex session id.
+    def _build_command(self) -> str:
+        # --dangerously-bypass-approvals-and-sandbox: never block on an approval
+        #   or the "do you trust this directory?" prompt (the container is the
+        #   sandbox; mirrors agy's "always-proceed"). Belt-and-suspenders with
+        #   approval_policy=never + sandbox_mode=danger-full-access in config.toml.
+        parts = [CODEX_CMD, "--dangerously-bypass-approvals-and-sandbox"]
+        if CODEX_EXTRA_ARGS:
+            parts.extend(shlex.split(CODEX_EXTRA_ARGS))
+        return shlex.join(parts)
 
-        Unlike agy, codex does not summarize prior sessions into new ones, so
-        simply starting a fresh session is a true context wipe.
-        """
+    async def start(self) -> None:
         async with self._lock:
-            logger.info("Session '%s': clearing (fresh codex session)", self.name)
-            self._generation += 1
-            self._session_id = None
-            self._turn_count = 0
+            if await self.is_alive():
+                logger.info("Session '%s' already running", self.name)
+                return
+            await self._spawn()
 
-    async def reset(self) -> None:
-        """Identical to clear for codex (there is no process to reboot)."""
-        await self.clear()
+    async def _spawn(self) -> None:
+        self._generation += 1  # fresh dir + fresh codex session → clean slate
+        cmd = self._build_command()
+        self.cwd.mkdir(parents=True, exist_ok=True)
+        logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
+
+        await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
+        rc, out = await _tmux(
+            "new-session", "-d",
+            "-s", self.tmux_session,
+            "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
+            "-c", str(self.cwd),
+            cmd,
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux new-session failed: {out.strip()}")
+
+        try:
+            await self._wait_ready()
+        except Exception:
+            await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
+            raise
+
+        # codex creates its rollout lazily (on the first turn), so the session
+        # id / rollout path are resolved during the first send().
+        self._rollout_path = None
+        self._session_id = None
+        self._turn_count = 0
+        logger.info("Session '%s' ready", self.name)
+
+    async def _wait_ready(self) -> None:
+        """Poll the rendered screen until codex shows its idle input prompt.
+
+        The codex TUI may gate startup behind interstitials that `codex exec`
+        never shows — a trust-directory prompt, an "Update available" prompt, a
+        model NUX. The bypass flag preempts the trust prompt, but we still
+        dismiss any interstitial defensively so a warm spawn never hangs on one.
+        """
+        start = time.monotonic()
+        while time.monotonic() - start < STARTUP_TIMEOUT:
+            if not await self.is_alive():
+                raise RuntimeError(
+                    "codex exited during startup. Check that it is installed and "
+                    "authenticated (run 'codex login' once)."
+                )
+            screen = await self._capture()
+            if any(m in screen for m in READY_MARKERS):
+                logger.info(
+                    "Session '%s' ready marker after %.1fs",
+                    self.name, time.monotonic() - start,
+                )
+                return
+            await self._maybe_dismiss_interstitial(screen)
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+        raise RuntimeError(f"codex startup timed out after {STARTUP_TIMEOUT:.0f}s")
+
+    async def _maybe_dismiss_interstitial(self, screen: str) -> bool:
+        """Clear a known startup interstitial; return True if we acted.
+
+        Conservative by design: the only prompt whose DEFAULT button is
+        dangerous is the update prompt ("Update now" runs `npm install`), so we
+        never blind-press Enter on it — we send Escape and let the next poll
+        re-check. Trust / NUX / tip prompts are safe to confirm with Enter.
+        """
+        low = screen.lower()
+        if "update available" in low or "update now" in low:
+            logger.warning(
+                "Session '%s': codex update prompt at startup — sending Esc "
+                "(NOT Enter; its default runs npm install)", self.name,
+            )
+            await _tmux("send-keys", "-t", self._target, "Escape")
+            return True
+        if "do you trust" in low or "trust the contents" in low:
+            await _tmux("send-keys", "-t", self._target, "Enter")  # default: Yes
+            return True
+        if "press enter to continue" in low:  # model NUX, tips, etc.
+            await _tmux("send-keys", "-t", self._target, "Enter")
+            return True
+        return False
+
+    async def _detect_new_session(self, before: set[str]) -> FsPath:
+        """Wait for the new rollout file codex tags with this session's cwd.
+
+        codex writes the rollout lazily on the first turn; its session_meta
+        records the cwd, so we key on that — the per-run cwd is unique to this
+        session, so at most one new rollout can match.
+        """
+        start = time.monotonic()
+        want = str(self.cwd)
+        while time.monotonic() - start < SESSION_DETECT_TIMEOUT:
+            candidates: dict[FsPath, float] = {}
+            for path in _rollout_files():
+                if str(path) in before:
+                    continue
+                meta = _rollout_meta(path)
+                if not meta or meta.get("cwd") != want:
+                    continue  # not ours, or session_meta not written yet
+                try:
+                    candidates[path] = path.stat().st_mtime
+                except OSError:
+                    continue
+            if candidates:
+                return max(candidates, key=candidates.get)  # newest wins
+            await asyncio.sleep(0.5)
+        raise RuntimeError(
+            "Could not determine codex session (no new rollout for this cwd appeared)"
+        )
 
     async def stop(self) -> None:
-        """Drop session state. No process to kill."""
         async with self._lock:
-            self._session_id = None
-            self._turn_count = 0
+            await self._kill()
 
-    # --- Status ------------------------------------------------------------
+    async def _kill(self) -> None:
+        rc, _ = await _tmux("kill-session", "-t", self._target)
+        if rc == 0:
+            logger.info("Killed tmux session %s", self.tmux_session)
+        self._rollout_path = None
+        self._session_id = None
+        self._turn_count = 0
+
+    async def reset(self) -> None:
+        """Kill and re-spawn the process (new conversation)."""
+        async with self._lock:
+            await self._kill()
+            await self._spawn()
+
+    async def clear(self) -> None:
+        """Wipe conversation context by respawning into a fresh working dir.
+
+        A fresh generation directory + a brand-new codex process (hence a new
+        rollout/session) is an unambiguous context wipe.
+        """
+        async with self._lock:
+            if not await self.is_alive():
+                raise RuntimeError("codex process is not running")
+            logger.info("Session '%s': clearing (respawn, fresh working dir)", self.name)
+            await self._kill()
+            await self._spawn()
+
+    # --- Screen access -----------------------------------------------------
+
+    async def _capture(self) -> str:
+        rc, out = await _tmux("capture-pane", "-p", "-t", self._target)
+        if rc != 0:
+            raise RuntimeError("codex process died (tmux capture-pane failed)")
+        return out
+
+    @staticmethod
+    def _is_busy(screen: str) -> bool:
+        low = screen.lower()
+        return any(m in low for m in BUSY_MARKERS)
+
+    # --- Chat ----------------------------------------------------------------
+
+    async def send(self, prompt: str) -> str:
+        """Send a prompt and return codex's response.
+
+        Input goes in as a tmux bracketed paste, so newlines and TUI shortcut
+        characters (!, @, /, backticks...) arrive as literal text. The response
+        is read from the rollout: completion means a new task_complete event
+        appeared for this turn.
+        """
+        async with self._lock:
+            if not await self.is_alive():
+                raise RuntimeError("codex process is not running")
+
+            self._turn_count += 1
+            logger.info(
+                "Session '%s' turn %d — sending prompt (%d chars)",
+                self.name, self._turn_count, len(prompt),
+            )
+
+            if self._rollout_path is None:
+                # First message: codex creates the rollout when it receives the
+                # turn. Submit under the spawn lock so the new file is
+                # attributable to this session, then resolve it.
+                async with _SPAWN_LOCK:
+                    before = {str(p) for p in _rollout_files()}
+                    await self._submit(prompt)
+                    self._rollout_path = await self._detect_new_session(before)
+                meta = _rollout_meta(self._rollout_path) or {}
+                self._session_id = meta.get("id")
+                logger.info(
+                    "Session '%s': bound to codex session %s (%s)",
+                    self.name, self._session_id, self._rollout_path.name,
+                )
+                baseline_completes = 0
+                baseline_starts = _count_task_starts(_read_rollout(self._rollout_path))
+            else:
+                events = _read_rollout(self._rollout_path)
+                baseline_completes = _count_task_completes(events)
+                baseline_starts = _count_task_starts(events)
+                await self._submit_confirmed(prompt, baseline_starts)
+
+            response = await self._collect_response(baseline_completes, baseline_starts)
+            logger.info(
+                "Session '%s' turn %d — response collected (%d chars)",
+                self.name, self._turn_count, len(response),
+            )
+            return response
+
+    async def _submit(self, prompt: str) -> None:
+        """Paste the prompt (bracketed), then submit with Enter."""
+        buf = f"codexrest-{self.name}"
+        rc, out = await _tmux(
+            "load-buffer", "-b", buf, "-", stdin_data=prompt.encode()
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux load-buffer failed: {out.strip()}")
+        rc, out = await _tmux(
+            "paste-buffer", "-p", "-d", "-b", buf, "-t", self._target
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux paste-buffer failed: {out.strip()}")
+        await asyncio.sleep(0.15)
+        await _tmux("send-keys", "-t", self._target, "Enter")
+
+    async def _submit_confirmed(self, prompt: str, baseline_starts: int) -> None:
+        """Submit *prompt* and make sure codex actually ingested it.
+
+        A TUI can swallow the submit Enter when it is still settling after a long
+        previous response: the pasted text sits unsubmitted while the screen
+        looks idle, so the turn stalls. We confirm ingestion before trusting the
+        submit, and only re-press Enter when codex is plainly idle and has
+        ingested nothing. We never re-paste and we wait a full SUBMIT_CONFIRM_WAIT
+        before each retry, so a slow-but-accepted submit can't become a duplicate.
+        """
+        await self._submit(prompt)
+        for attempt in range(1, SUBMIT_MAX_RETRIES + 1):
+            if await self._await_ingest(baseline_starts):
+                return
+            logger.warning(
+                "Session '%s': submit unacknowledged after %.0fs (codex idle, "
+                "nothing ingested) — re-pressing Enter [retry %d/%d]",
+                self.name, SUBMIT_CONFIRM_WAIT, attempt, SUBMIT_MAX_RETRIES,
+            )
+            await _tmux("send-keys", "-t", self._target, "Enter")
+        # Final grace wait. If codex still took nothing, fall through and let
+        # _collect_response run its course (it times out exactly as today).
+        await self._await_ingest(baseline_starts)
+
+    async def _await_ingest(self, baseline_starts: int) -> bool:
+        """Wait up to SUBMIT_CONFIRM_WAIT for codex to ingest the submitted turn.
+
+        Ingested == a new task_started appears (codex began the turn) OR the
+        screen shows a busy marker. Either way the submit took, so returning
+        here can never cause a duplicate. Returns False only if the whole window
+        elapses with codex idle and no new task_started: the signature of a
+        dropped Enter, where re-pressing it is safe because nothing was submitted.
+        """
+        deadline = time.monotonic() + SUBMIT_CONFIRM_WAIT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+            if _count_task_starts(_read_rollout(self._rollout_path)) > baseline_starts:
+                return True
+            if self._is_busy(await self._capture()):
+                return True
+        return False
+
+    def _rollout_mtime(self) -> float:
+        try:
+            return self._rollout_path.stat().st_mtime  # type: ignore[union-attr]
+        except (OSError, AttributeError):
+            return 0.0
+
+    async def _collect_response(self, baseline_completes: int, baseline_starts: int) -> str:
+        """Poll until the turn completes, then return the new model text.
+
+        A turn is complete when a NEW task_complete event appears in the rollout
+        (codex's definitive end-of-turn signal).
+
+        We do NOT cut a turn off on a flat wall-clock: codex can legitimately
+        work for minutes (reading files, running commands, long reasoning). A
+        turn that has started but not completed counts as progress (it is
+        in-flight), so a long pure-thinking turn — which may write nothing else
+        for ~90s — is never mistaken for a stall. We give up only after
+        RESPONSE_STALL_TIMEOUT of genuine no-progress, or RESPONSE_HARD_TIMEOUT
+        absolute.
+        """
+        start = time.monotonic()
+        response = ""
+        exit_reason = "unknown"
+        last_progress = start
+        last_mtime = self._rollout_mtime()
+        last_starts = baseline_starts
+
+        while True:
+            now = time.monotonic()
+            elapsed = now - start
+            if elapsed > RESPONSE_HARD_TIMEOUT:
+                exit_reason = "hard_timeout"
+                logger.warning(
+                    "Session '%s': hit hard timeout (%.0fs) — returning partial "
+                    "(%d chars)", self.name, RESPONSE_HARD_TIMEOUT, len(response),
+                )
+                break
+            if now - last_progress > RESPONSE_STALL_TIMEOUT:
+                exit_reason = "stalled"
+                logger.warning(
+                    "Session '%s': no progress for %.0fs (idle, rollout not "
+                    "growing) — returning %d chars", self.name,
+                    RESPONSE_STALL_TIMEOUT, len(response),
+                )
+                break
+
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
+            events = _read_rollout(self._rollout_path)
+            cur_completes = _count_task_completes(events)
+            cur_starts = _count_task_starts(events)
+            cur_mtime = self._rollout_mtime()
+            await self._capture()  # raises if the codex process died
+
+            # codex is demonstrably alive and working if the rollout grew, a new
+            # turn started, or a started turn has not yet completed (in-flight).
+            in_flight = cur_starts > baseline_starts and cur_completes <= baseline_completes
+            if cur_mtime > last_mtime or cur_starts > last_starts or in_flight:
+                last_progress = now
+                last_mtime = cur_mtime
+                last_starts = cur_starts
+
+            if cur_completes > baseline_completes and elapsed >= RESPONSE_MIN_WAIT:
+                response = _answer_for_new_turn(events, baseline_completes)
+                exit_reason = "rollout_done"
+                break
+
+        total = time.monotonic() - start
+        logger.info(
+            "Session '%s': response complete via %s (%.1fs, %d chars)",
+            self.name, exit_reason, total, len(response),
+        )
+        if exit_reason != "rollout_done" or total > RESPONSE_SLOW_DUMP_SECS:
+            # Snapshot screen + rollout tail for later investigation — on any
+            # timeout, and on a slow-but-successful turn so we can see WHERE the
+            # time went (the rollout events are timestamped).
+            dump_reason = exit_reason if exit_reason != "rollout_done" else "slow_success"
+            await self._dump_diagnostic(dump_reason, baseline_completes, total, response)
+        return response
+
+    async def _dump_diagnostic(
+        self, reason: str, baseline: int, elapsed: float, response: str
+    ) -> None:
+        """Write a self-contained snapshot of a non-clean/slow turn to LOG_DIR.
+
+        Records what an after-the-fact investigation needs: the resolved session
+        id and rollout path, the tail of the rollout (event types/turn ids), and
+        the rendered screen at the moment we gave up. Best-effort — diagnostics
+        must never mask the original turn result.
+        """
+        try:
+            screen = await self._capture()
+        except Exception as exc:  # pragma: no cover - capture already failed once
+            screen = f"(screen capture failed: {exc})"
+        events = _read_rollout(self._rollout_path)
+        tail = events[-TIMEOUT_DUMP_STEPS:]
+        rollout_name = self._rollout_path.name if self._rollout_path else "unresolved"
+        path = TIMEOUT_LOG_DIR / f"codex-{self.name}-turn{self._turn_count}-{rollout_name}.log"
+        try:
+            TIMEOUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"session={self.name} turn={self._turn_count} reason={reason}",
+                f"session_id={self._session_id}",
+                f"rollout={self._rollout_path}",
+                f"baseline_completes={baseline} elapsed={elapsed:.1f}s "
+                f"response_len={len(response)} total_events={len(events)}",
+                f"\n=== last {len(tail)} rollout events ===",
+            ]
+            for ev in tail:
+                p = _payload(ev)
+                lines.append(
+                    f"{ev.get('type')}/{p.get('type')} | turn={p.get('turn_id')} | "
+                    f"ts={ev.get('timestamp')}"
+                )
+            lines.append("\n=== rendered screen when we gave up ===")
+            lines.append(screen)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.warning("Session '%s': wrote diagnostic to %s", self.name, path)
+        except OSError as exc:
+            logger.warning(
+                "Session '%s': could not write diagnostic: %s", self.name, exc
+            )
+
+    # --- Status --------------------------------------------------------------
 
     async def is_alive(self) -> bool:
-        # A codex session is "alive" once registered — it is just state.
-        return True
+        rc, _ = await _tmux("has-session", "-t", self._target)
+        return rc == 0
 
     @property
     def turn_count(self) -> int:
@@ -385,13 +764,20 @@ class ChatManager:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def get_or_create(self, name: str) -> CodexSession:
+        """Return an existing session or create and start a new one."""
         async with self._lock:
-            session = self._sessions.get(name)
-            if session is None:
+            if name in self._sessions:
+                session = self._sessions[name]
+            else:
                 logger.info("Creating new session: '%s'", name)
                 session = CodexSession(name)
                 self._sessions[name] = session
-            return session
+
+        # Start (or restart a dead session) outside the manager lock so other
+        # sessions aren't blocked during startup. start() is a no-op when the
+        # process is already alive.
+        await session.start()
+        return session
 
     async def get(self, name: str) -> CodexSession | None:
         async with self._lock:
@@ -416,10 +802,10 @@ class ChatManager:
     async def list_sessions(self) -> dict[str, dict]:
         async with self._lock:
             snapshot = dict(self._sessions)
-        return {
-            name: {"alive": await s.is_alive(), "turn_count": s.turn_count}
-            for name, s in snapshot.items()
-        }
+        result: dict[str, dict] = {}
+        for name, s in snapshot.items():
+            result[name] = {"alive": await s.is_alive(), "turn_count": s.turn_count}
+        return result
 
 
 manager = ChatManager()
@@ -431,23 +817,23 @@ manager = ChatManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Sessions are created lazily. On shutdown, drop all state."""
-    SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+    """Sessions are created lazily. On shutdown, stop all."""
+    await _ensure_tmux_server()
     logger.info("Server starting (sessions will be created on demand)")
     yield
-    logger.info("Shutting down — dropping all sessions...")
+    logger.info("Shutting down — stopping all sessions...")
     count = await manager.stop_all()
-    logger.info("Dropped %d session(s)", count)
+    logger.info("Stopped %d session(s)", count)
 
 
 app = FastAPI(
     title="Codex CLI REST Bridge",
     description=(
-        "REST API that wraps OpenAI's Codex CLI (codex) in headless mode, "
+        "REST API that wraps OpenAI's Codex CLI (codex) interactive mode, "
         "providing named multi-session chat with conversation continuity. "
-        "Mirrors the agy bridge's REST contract."
+        "Mirrors the agy bridge's tmux architecture and REST contract."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -486,7 +872,10 @@ class MessageResponse(BaseModel):
 @app.post("/chat/{name}", response_model=ChatResponse)
 async def chat(req: ChatRequest, name: str = _NAME):
     """Send a message to a named session. Creates the session on first use."""
-    session = await manager.get_or_create(name)
+    try:
+        session = await manager.get_or_create(name)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=f"Failed to start session '{name}': {e}")
 
     t0 = time.monotonic()
     try:
@@ -512,10 +901,12 @@ async def chat(req: ChatRequest, name: str = _NAME):
 
 @app.post("/clear/{name}", response_model=MessageResponse)
 async def clear(name: str = _NAME):
-    """Clear conversation context for a session (starts a fresh codex session)."""
+    """Clear conversation context for a session (respawn in a fresh dir)."""
     session = await manager.get(name)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+    if not await session.is_alive():
+        raise HTTPException(status_code=503, detail=f"Session '{name}' is not running. Use /reset/{name}.")
     try:
         await session.clear()
     except RuntimeError as e:
@@ -525,7 +916,7 @@ async def clear(name: str = _NAME):
 
 @app.post("/reset/{name}", response_model=MessageResponse)
 async def reset(name: str = _NAME):
-    """Reset a specific session (fresh conversation)."""
+    """Kill and restart a specific session (fresh conversation)."""
     session = await manager.get(name)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
@@ -538,7 +929,7 @@ async def reset(name: str = _NAME):
 
 @app.delete("/chat/{name}", response_model=MessageResponse)
 async def delete_session(name: str = _NAME):
-    """Permanently remove a specific session."""
+    """Kill and permanently remove a specific session."""
     removed = await manager.remove(name)
     if not removed:
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
@@ -547,7 +938,7 @@ async def delete_session(name: str = _NAME):
 
 @app.post("/stop", response_model=MessageResponse)
 async def stop_all():
-    """Drop ALL sessions. Clean slate."""
+    """Kill ALL sessions. Clean slate."""
     count = await manager.stop_all()
     return MessageResponse(status="ok", message=f"Stopped {count} session(s).")
 

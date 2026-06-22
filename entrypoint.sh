@@ -17,5 +17,11 @@ if [ ! -f "$SETTINGS" ]; then
 EOF
 fi
 
+# Best-effort: pull the latest agy on every (re)start. Guarded so a missing
+# network / transient failure can never stop the bridge from coming up (the
+# `|| echo` keeps `set -e` from aborting here).
+echo "[agy] update check (best-effort)..."
+timeout 90 agy update </dev/null 2>&1 || echo "[agy] update skipped/failed (continuing)"
+
 # --loop asyncio: uvloop's subprocess pipes mishandle the forked tmux daemon
 exec uvicorn server:app --host 0.0.0.0 --port 8000 --loop asyncio

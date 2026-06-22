@@ -140,16 +140,15 @@ Everything lands under `LOG_DIR` (`/app/logs`), which docker-compose mounts to
 ├── agy-rest.log              # rolling agy bridge log (10MB x 5)
 ├── codex-rest.log            # rolling codex bridge log
 └── timeouts/                 # one file per slow/failed turn — START HERE
-    ├── <session>-turn<N>-<conversation-id>.log   # agy
-    ├── codex-<session>-turn<N>.log               # codex failure (timeout / nonzero rc)
-    └── codex-slow-<session>-turn<N>.log          # codex slow-but-successful turn
+    ├── <session>-turn<N>-<conversation-id>.log         # agy
+    └── codex-<session>-turn<N>-<rollout>.log           # codex
 ```
 
 **When does a dump get written?** Whenever a turn hits the hard cap, stalls, or
 simply runs **slower than `*_SLOW_DUMP_SECS` (90s)** — even if it succeeded.
 A turn faster than that leaves no dump.
 
-**What's in each dump:**
+**What's in each dump** (both bridges follow the same shape now):
 
 - **agy** — the resolved conversation id + transcript path, the *timestamped*
   tail of the transcript (the step-by-step record — where the time actually
@@ -157,18 +156,17 @@ A turn faster than that leaves no dump.
   and the **rendered screen** at the moment the bridge stopped waiting. That
   screen tells you whether a missed answer was already on-screen (transcript
   flush lag) or agy was still `Generating...`.
-- **codex failure** — the exact `argv`, the failure reason (`timed out after
-  180s` or `rc=<n>`), elapsed time, and the tail of stderr/stdout. (Previously
-  this only existed in the HTTP 502 body and was never logged.)
-- **codex slow** — a tally of `--json` item types (how many commands,
-  file reads, etc. the turn ran), so a slow turn is explainable. Full detail is
-  in codex's own rollout at `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+- **codex** — the resolved session id + rollout path, the tail of the rollout
+  events (`task_started` / `response_item` / `task_complete` with their
+  `turn_id`s — the turn-by-turn record), and the **rendered screen** at give-up
+  time. Full detail lives in codex's own rollout at
+  `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
 **Turn timeouts.** A single request is hard-capped at **3 minutes**
-(`RESPONSE_HARD_TIMEOUT` / `CODEX_EXEC_TIMEOUT = 180`); agy additionally gives
-up early if it makes no progress for `RESPONSE_STALL_TIMEOUT` (90s). Work that
-genuinely needs longer should be handled by the client **re-polling**, not by
-raising these caps.
+(`RESPONSE_HARD_TIMEOUT` / `CODEX_RESPONSE_HARD_TIMEOUT = 180`); each bridge also
+gives up early if its CLI makes no progress for `*_STALL_TIMEOUT` (90s). Work
+that genuinely needs longer should be handled by the client **re-polling**, not
+by raising these caps.
 
 ## Running Without Docker
 
@@ -208,7 +206,7 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `LOG_DIR` | `/app/logs` | Rolling logs + per-incident dumps written here (mounted to `./logs`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
-The codex bridge (port 8001) has the matching `CODEX_EXEC_TIMEOUT` (`180`) and `CODEX_SLOW_DUMP_SECS` (`90`), and shares `LOG_DIR` / `LOG_LEVEL`. See [Logs & diagnostics](#logs--diagnostics).
+The codex bridge (port 8001) shares this tmux architecture and has matching, `CODEX_`-prefixed knobs — `CODEX_RESPONSE_HARD_TIMEOUT` (`180`), `CODEX_RESPONSE_STALL_TIMEOUT` (`90`), `CODEX_STARTUP_TIMEOUT` (`60`), `CODEX_SLOW_DUMP_SECS` (`90`), `CODEX_TMUX_SOCKET` (`codex-rest`) — and shares `LOG_DIR` / `LOG_LEVEL`. See [CODEX.md](CODEX.md) and [Logs & diagnostics](#logs--diagnostics).
 
 The model is **not** selected per-request — set `"model"` in agy's `settings.json` (`~/.gemini/antigravity-cli/settings.json`).
 

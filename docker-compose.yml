@@ -11,22 +11,29 @@ services:
       - "8001:8001"   # codex / gpt-5.5
     volumes:
       - agy-config:/root/.gemini    # agy auth + settings persist
-      - codex-config:/root/.codex   # codex auth.json + config.toml persist
+      # codex gets its OWN independent login in this volume — run `codex login`
+      # INSIDE the container once. Do NOT bind-mount or copy the host's auth.json
+      # in: codex's ChatGPT OAuth refresh token ROTATES, so a shared token family
+      # means whichever side refreshes first revokes the other's session. Host
+      # and container must authenticate separately (multiple logins are allowed).
+      - codex-config:/root/.codex   # codex auth + config + sessions (container-only)
       - ~/.ssh:/root/.ssh:ro
       - ./logs:/app/logs            # bridge logs + per-incident timeout dumps (host-readable)
       # Repos you want BOTH bridges to read: mount them under one parent...
       # - ~/dev/slit/slitled-platform:/repos/slitled-platform
       # - ~/dev/other-repo:/repos/other-repo
     environment:
-      # agy: a turn ends on inactivity (stall) OR the hard cap, whichever first.
-      # Hard cap is 3 minutes, no matter what — a request never blocks longer.
-      - RESPONSE_STALL_TIMEOUT=90   # agy: give up after this long with no progress
-      - RESPONSE_HARD_TIMEOUT=180   # agy: absolute max per turn (3 min)
-      - RESPONSE_SLOW_DUMP_SECS=90  # agy: dump a diagnostic for any turn slower than this
-      - STARTUP_TIMEOUT=60          # agy: max wait for the CLI to become ready
-      - CODEX_EXEC_TIMEOUT=180      # codex: absolute max per turn (3 min)
-      - CODEX_SLOW_DUMP_SECS=90     # codex: dump a breakdown for any turn slower than this
-      - LOG_DIR=/app/logs           # bridges write logs + timeout dumps here
+      # Both bridges: a turn ends on inactivity (stall) OR the hard cap,
+      # whichever first. Hard cap is 3 minutes — a request never blocks longer.
+      - RESPONSE_STALL_TIMEOUT=90          # agy: give up after this long with no progress
+      - RESPONSE_HARD_TIMEOUT=180          # agy: absolute max per turn (3 min)
+      - RESPONSE_SLOW_DUMP_SECS=90         # agy: dump a diagnostic for any turn slower than this
+      - STARTUP_TIMEOUT=60                 # agy: max wait for the CLI to become ready
+      - CODEX_RESPONSE_STALL_TIMEOUT=90    # codex: give up after this long with no progress
+      - CODEX_RESPONSE_HARD_TIMEOUT=180    # codex: absolute max per turn (3 min)
+      - CODEX_SLOW_DUMP_SECS=90            # codex: dump a diagnostic for any turn slower than this
+      - CODEX_STARTUP_TIMEOUT=60           # codex: max wait for the TUI to reach its idle prompt
+      - LOG_DIR=/app/logs                  # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
       # ...and grant both CLIs access to that parent (--add-dir is repeatable):
@@ -35,4 +42,4 @@ services:
 
 volumes:
   agy-config:
-  codex-config:
+  codex-config:   # container's OWN codex login + config + sessions (independent; never seeded from host)
