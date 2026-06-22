@@ -95,6 +95,7 @@ Identical to the agy bridge, on `http://localhost:8001`:
 | Action | Command | Purpose |
 | --- | --- | --- |
 | Send message | `POST /chat/{session}` | Send prompt, creates session if new |
+| Recover answer | `GET /last/{session}?wait=N` | Re-read the last COMPLETED answer (no re-ask) when a `/chat` response was lost |
 | Clear context | `POST /clear/{session}` | Start a fresh codex session (true wipe) |
 | Reset | `POST /reset/{session}` | Same as clear (codex has no process to reboot) |
 | Delete session | `DELETE /chat/{session}` | Forget the session |
@@ -118,6 +119,7 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_RESPONSE_STALL_TIMEOUT` | `90` | Give up after this long with no progress (idle, rollout not growing) |
 | `CODEX_STARTUP_TIMEOUT` | `60` | Max wait for the TUI to reach its idle prompt |
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
+| `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |
 | `CODEX_EXTRA_ARGS` | _(empty)_ | Extra flags for every `codex` process, e.g. `--add-dir /repos` |
 | `CODEX_TMUX_SOCKET` | `codex-rest` | Dedicated tmux socket (distinct from agy's `agy-rest`) |
 | `SESSIONS_ROOT` | `/tmp/codex-rest-sessions` | Per-session working dirs |

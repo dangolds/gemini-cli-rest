@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -98,6 +98,10 @@ SUBMIT_MAX_RETRIES = int(os.getenv("CODEX_SUBMIT_MAX_RETRIES", "2"))
 # How long after startup we wait for codex to register the new session (its
 # rollout file, tagged with our cwd, appears).
 SESSION_DETECT_TIMEOUT = float(os.getenv("CODEX_SESSION_DETECT_TIMEOUT", "20"))
+
+# /last read-back: cap how long a single /last?wait=N call may block, so it
+# never holds the client longer than a /chat would (same hard ceiling).
+LAST_MAX_WAIT = float(os.getenv("CODEX_LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 
 # Rendered-screen markers (read from tmux's emulated screen, never from the raw
 # escape stream, so these are stable plain-text strings). Correctness rides on
@@ -320,6 +324,10 @@ class CodexSession:
     _session_id: str | None = field(default=None, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _turn_count: int = field(default=0, init=False)
+    # Completed-turn count captured when the most recent turn was submitted.
+    # /last uses it to tell THIS turn's answer apart from a previous one: a new
+    # task_complete beyond this baseline means your submitted turn has finished.
+    _last_baseline_completes: int = field(default=0, init=False)
     # Every spawn gets a fresh generation directory (and a brand-new codex
     # session), which is what makes clear/reset a true context wipe.
     _generation: int = field(default=0, init=False)
@@ -387,6 +395,7 @@ class CodexSession:
         self._rollout_path = None
         self._session_id = None
         self._turn_count = 0
+        self._last_baseline_completes = 0
         logger.info("Session '%s' ready", self.name)
 
     async def _wait_ready(self) -> None:
@@ -478,6 +487,7 @@ class CodexSession:
         self._rollout_path = None
         self._session_id = None
         self._turn_count = 0
+        self._last_baseline_completes = 0
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -547,10 +557,16 @@ class CodexSession:
                 )
                 baseline_completes = 0
                 baseline_starts = _count_task_starts(_read_rollout(self._rollout_path))
+                # Record where this turn began so a later /last can recover its
+                # answer and never mistake a previous turn's for it.
+                self._last_baseline_completes = baseline_completes
             else:
                 events = _read_rollout(self._rollout_path)
                 baseline_completes = _count_task_completes(events)
                 baseline_starts = _count_task_starts(events)
+                # Publish the baseline BEFORE submitting, so a /last arriving
+                # while this turn runs reads the right turn boundary.
+                self._last_baseline_completes = baseline_completes
                 await self._submit_confirmed(prompt, baseline_starts)
 
             response = await self._collect_response(baseline_completes, baseline_starts)
@@ -741,6 +757,36 @@ class CodexSession:
                 "Session '%s': could not write diagnostic: %s", self.name, exc
             )
 
+    # --- Read-back -----------------------------------------------------------
+
+    async def last(self, wait: float) -> tuple[bool, str, int]:
+        """Re-read the most recent turn's final answer — only once it is done.
+
+        Read-only and LOCK-FREE: it inspects the rollout file (never the tmux
+        pane), so it works WHILE a turn is still in flight. The point is to
+        recover an answer a /chat call never received — a 3-min hard cap, or a
+        connectivity blip after codex had already finished — WITHOUT re-asking.
+        The answer is durable in the rollout regardless of whether the HTTP
+        response arrived.
+
+        Returns (done, answer, turn). done=True only after a NEW task_complete
+        appears beyond the baseline captured when this turn was submitted; until
+        then done=False with no text, so a still-running or never-ingested turn
+        never yields a partial answer or a stale previous one. With wait>0 it
+        polls up to `wait` seconds for an in-flight turn to finish.
+        """
+        deadline = time.monotonic() + max(0.0, wait)
+        while True:
+            path = self._rollout_path
+            baseline = self._last_baseline_completes
+            if path is not None:
+                events = _read_rollout(path)
+                if _count_task_completes(events) > baseline:
+                    return True, _answer_for_new_turn(events, baseline), self._turn_count
+            if time.monotonic() >= deadline:
+                return False, "", self._turn_count
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
     # --- Status --------------------------------------------------------------
 
     async def is_alive(self) -> bool:
@@ -852,6 +898,13 @@ class ChatResponse(BaseModel):
     turn: int
     elapsed_ms: int
 
+class LastResponse(BaseModel):
+    done: bool          # True only if the most recent turn has FINISHED
+    response: str | None  # the answer when done; null while still running
+    turn: int
+    session: str
+    elapsed_ms: int
+
 class SessionStatus(BaseModel):
     name: str
     alive: bool
@@ -896,6 +949,39 @@ async def chat(req: ChatRequest, name: str = _NAME):
         session=name,
         turn=session.turn_count,
         elapsed_ms=elapsed,
+    )
+
+
+@app.get("/last/{name}", response_model=LastResponse)
+async def get_last(
+    name: str = _NAME,
+    wait: float = Query(
+        0.0, ge=0.0,
+        description="Seconds to wait for an in-flight turn to finish "
+                    f"(capped at {LAST_MAX_WAIT:.0f}s). 0 = instant snapshot.",
+    ),
+):
+    """Re-read a session's latest COMPLETED answer, without re-asking.
+
+    For recovering a turn whose /chat response was lost (the 3-min cap, a
+    connectivity blip after codex already answered): the answer is durable in
+    the rollout even when the HTTP response never arrived. Returns
+    {done:true, response} only once the most recent turn has finished;
+    {done:false, response:null} while it is still running or was never
+    ingested — never a partial answer or a stale previous one.
+    """
+    session = await manager.get(name)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+
+    t0 = time.monotonic()
+    done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
+    return LastResponse(
+        done=done,
+        response=response if done else None,
+        turn=turn,
+        session=name,
+        elapsed_ms=int((time.monotonic() - t0) * 1000),
     )
 
 

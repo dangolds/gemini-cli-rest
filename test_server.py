@@ -78,6 +78,16 @@ def chat(session: str, prompt: str) -> dict:
     return data
 
 
+def last(session: str, wait: float = 15.0) -> dict:
+    """GET /last/{session}?wait=N and return the JSON response."""
+    r = httpx.get(f"{BASE}/last/{session}", params={"wait": wait}, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    print(f"  [{_ts()}] /last {session}: done={data['done']} turn={data['turn']} "
+          f"resp={data['response']!r}", flush=True)
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Cleanup: each test that creates sessions cleans up after itself
 # ---------------------------------------------------------------------------
@@ -121,6 +131,74 @@ class TestChatMemory:
         assert resp["session"] == name
         assert resp["turn"] == 2
         print(f"  [{_ts()}] PASS: Session correctly remembered '{token}'", flush=True)
+
+
+class TestLastReadback:
+    """Verify the /chat -> /last flow: re-read a completed answer without re-asking."""
+
+    def test_last_recovers_the_completed_answer(self, cleanup):
+        print(f"\n[{_ts()}] TEST: /last — recover the answer a /chat just produced", flush=True)
+        name = f"test-last-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+
+        sent = chat(name, f"Reply with exactly this token and nothing else: {token}")
+        got = last(name, wait=15)
+
+        assert got["done"] is True, f"expected done=True, got {got}"
+        assert got["session"] == name
+        assert got["turn"] == sent["turn"]
+        assert token in (got["response"] or "").lower(), (
+            f"/last should return the same answer the turn produced, got: {got['response']!r}"
+        )
+        print(f"  [{_ts()}] PASS: /last returned the completed answer", flush=True)
+
+    def test_last_returns_latest_turn_not_a_previous_one(self, cleanup):
+        """The baseline guard, over real HTTP: after a 2nd turn, /last is turn 2 — never turn 1."""
+        print(f"\n[{_ts()}] TEST: /last — returns the LATEST turn, not a stale previous one", flush=True)
+        name = f"test-last2-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        tok1 = _unique("firstx")
+        tok2 = _unique("secndx")
+
+        chat(name, f"Reply with exactly this token and nothing else: {tok1}")
+        sent2 = chat(name, f"Reply with exactly this token and nothing else: {tok2}")
+        got = last(name, wait=15)
+
+        assert got["done"] is True
+        assert got["turn"] == sent2["turn"] == 2
+        resp = (got["response"] or "").lower()
+        assert tok2 in resp, f"expected the latest turn's token {tok2!r}, got: {got['response']!r}"
+        assert tok1 not in resp, f"/last must NOT return the previous turn's answer: {got['response']!r}"
+        print(f"  [{_ts()}] PASS: /last returned turn 2's answer, not turn 1's", flush=True)
+
+    def test_last_after_clear_does_not_return_precleared_answer(self, cleanup):
+        """/clear respawns the session; /last must not surface the pre-clear answer."""
+        print(f"\n[{_ts()}] TEST: /last after /clear → no stale pre-clear answer", flush=True)
+        name = f"test-lastclr-{uuid.uuid4().hex[:8]}"
+        cleanup.append(name)
+        token = _unique()
+
+        chat(name, f"Reply with exactly this token and nothing else: {token}")
+        r = httpx.post(f"{BASE}/clear/{name}", timeout=60)
+        assert r.status_code == 200
+
+        got = last(name, wait=2)  # no new turn since clear → nothing to return
+        assert got["done"] is False, f"expected done=False after clear, got {got}"
+        assert got["response"] is None
+        print(f"  [{_ts()}] PASS: /last returns done=False after a clear", flush=True)
+
+    def test_last_unknown_session_returns_404(self):
+        print(f"\n[{_ts()}] TEST: /last nonexistent session → expect 404", flush=True)
+        r = httpx.get(f"{BASE}/last/nonexistent-session-xyz", timeout=10)
+        assert r.status_code == 404
+        print(f"  [{_ts()}] PASS: Got 404 as expected", flush=True)
+
+    def test_last_invalid_name_returns_422(self):
+        print(f"\n[{_ts()}] TEST: /last invalid session name → expect 422", flush=True)
+        r = httpx.get(f"{BASE}/last/bad name!", timeout=10)
+        assert r.status_code == 422
+        print(f"  [{_ts()}] PASS: Got 422 as expected", flush=True)
 
 
 class TestClear:

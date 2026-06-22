@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
 
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -87,6 +87,10 @@ SUBMIT_MAX_RETRIES = int(os.getenv("SUBMIT_MAX_RETRIES", "2"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
+
+# /last read-back: cap how long a single /last?wait=N call may block, so it
+# never holds the client longer than a /chat would (same hard ceiling).
+LAST_MAX_WAIT = float(os.getenv("LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 
 # Rendered-screen markers (read from tmux's emulated screen, never from the
 # raw escape stream, so these are stable plain-text strings).
@@ -242,6 +246,10 @@ class AgySession:
     _conversation_id: str | None = field(default=None, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _turn_count: int = field(default=0, init=False)
+    # Highest transcript step that existed when the most recent turn was
+    # submitted. /last uses it to tell THIS turn's answer apart from a previous
+    # one: a new completed PLANNER_RESPONSE beyond this step is your turn's.
+    _last_baseline_step: int = field(default=-1, init=False)
     # agy keeps cross-conversation memory per project (working directory):
     # new conversations receive summaries of previous ones and the agent can
     # read their transcripts. Every spawn therefore gets a fresh generation
@@ -308,6 +316,7 @@ class AgySession:
         # /clear), so the id is resolved during the first send().
         self._conversation_id = None
         self._turn_count = 0
+        self._last_baseline_step = -1
         logger.info("Session '%s' ready", self.name)
 
     async def _wait_ready(self) -> None:
@@ -367,6 +376,7 @@ class AgySession:
             logger.info("Killed tmux session %s", self.tmux_session)
         self._conversation_id = None
         self._turn_count = 0
+        self._last_baseline_step = -1
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -435,8 +445,14 @@ class AgySession:
                     self.name, self._conversation_id,
                 )
                 baseline = -1
+                # Record where this turn began so a later /last can recover its
+                # answer and never mistake a previous turn's for it.
+                self._last_baseline_step = baseline
             else:
                 baseline = _max_step(_read_transcript(self._conversation_id))
+                # Publish the baseline BEFORE submitting, so a /last arriving
+                # while this turn runs reads the right turn boundary.
+                self._last_baseline_step = baseline
                 await self._submit_confirmed(prompt, baseline)
 
             response = await self._collect_response(baseline)
@@ -636,6 +652,53 @@ class AgySession:
                 "Session '%s': could not write timeout diagnostic: %s", self.name, exc
             )
 
+    # --- Read-back -----------------------------------------------------------
+
+    async def last(self, wait: float) -> tuple[bool, str, int]:
+        """Re-read the most recent turn's answer — only once it is done.
+
+        Read-only and LOCK-FREE: it reads the transcript for the answer and only
+        GLANCES at the rendered screen to confirm agy has stopped working — so
+        it can recover an answer a /chat call never received (a 3-min hard cap,
+        or a connectivity blip) while the turn keeps running in the warm process.
+
+        Unlike codex, agy's transcript carries NO in-flight marker — every step
+        is written already-DONE — so "finished" cannot be read from the file
+        alone; it is decided by the idle screen, exactly as _collect_response
+        does. done=True therefore needs BOTH a new completed answer past the
+        submit baseline AND an idle (or gone) process. Otherwise done=False with
+        no text, so a still-working turn never yields a partial, and a previous
+        turn's answer is never returned in place of one that has not landed.
+
+        Returns (done, answer, turn). With wait>0 it polls up to `wait` seconds.
+        """
+        deadline = time.monotonic() + max(0.0, wait)
+        while True:
+            cid = self._conversation_id
+            baseline = self._last_baseline_step
+            if cid is not None:
+                responses = _new_responses(_read_transcript(cid), baseline)
+                if responses and await self._idle_or_gone():
+                    return True, "\n\n".join(responses).strip(), self._turn_count
+            if time.monotonic() >= deadline:
+                return False, "", self._turn_count
+            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
+    async def _idle_or_gone(self) -> bool:
+        """True if agy is at its idle prompt, or the process is gone.
+
+        A content-bearing DONE planner response is itself complete, so a dead
+        process still has a final answer; only a *live* process that is still
+        generating means "not done yet".
+        """
+        if not await self.is_alive():
+            return True
+        try:
+            screen = await self._capture()
+        except RuntimeError:
+            return True  # died between the check and the capture
+        return READY_MARKER in screen and not self._is_busy(screen)
+
     # --- Status --------------------------------------------------------------
 
     async def is_alive(self) -> bool:
@@ -747,6 +810,13 @@ class ChatResponse(BaseModel):
     turn: int
     elapsed_ms: int
 
+class LastResponse(BaseModel):
+    done: bool          # True only if the most recent turn has FINISHED
+    response: str | None  # the answer when done; null while still running
+    turn: int
+    session: str
+    elapsed_ms: int
+
 class SessionStatus(BaseModel):
     name: str
     alive: bool
@@ -791,6 +861,39 @@ async def chat(req: ChatRequest, name: str = _NAME):
         session=name,
         turn=session.turn_count,
         elapsed_ms=elapsed,
+    )
+
+
+@app.get("/last/{name}", response_model=LastResponse)
+async def get_last(
+    name: str = _NAME,
+    wait: float = Query(
+        0.0, ge=0.0,
+        description="Seconds to wait for an in-flight turn to finish "
+                    f"(capped at {LAST_MAX_WAIT:.0f}s). 0 = instant snapshot.",
+    ),
+):
+    """Re-read a session's latest COMPLETED answer, without re-asking.
+
+    For recovering a turn whose /chat response was lost (the 3-min cap, a
+    connectivity blip after agy already answered): the answer is durable in the
+    transcript even when the HTTP response never arrived. Returns
+    {done:true, response} only once the most recent turn has finished;
+    {done:false, response:null} while it is still running or was never
+    ingested — never a partial answer or a stale previous one.
+    """
+    session = await manager.get(name)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+
+    t0 = time.monotonic()
+    done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
+    return LastResponse(
+        done=done,
+        response=response if done else None,
+        turn=turn,
+        session=name,
+        elapsed_ms=int((time.monotonic() - t0) * 1000),
     )
 
 

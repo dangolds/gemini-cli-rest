@@ -59,6 +59,32 @@ curl -s -X POST http://localhost:8000/chat/coding \
   -d '{"prompt": "Write a Python fibonacci generator"}'
 ```
 
+### `GET /last/{name}` — Re-read the last answer (recover a lost response)
+
+Returns a session's most recent **completed** answer **without re-asking** — for when a `POST /chat` response never reached you (the 3-min hard cap, or a connectivity blip after the CLI had already answered). The answer is durable in the CLI's own transcript/rollout regardless of whether the HTTP response arrived, so `/last` simply reads it back.
+
+It is binary by design: you get the answer **only once the turn is done**, never a partial and never a *previous* turn's answer in its place.
+
+```bash
+# instant snapshot
+curl -s http://localhost:8000/last/research
+
+# or wait up to 30s for an in-flight turn to finish, then return it
+curl -s "http://localhost:8000/last/research?wait=30"
+```
+
+Response when the turn has finished:
+```json
+{ "done": true, "response": "…the answer…", "turn": 2, "session": "research", "elapsed_ms": 12 }
+```
+
+While the turn is still running (or was never ingested) — poll again:
+```json
+{ "done": false, "response": null, "turn": 2, "session": "research", "elapsed_ms": 30001 }
+```
+
+`wait` is capped at `LAST_MAX_WAIT` (default 180s) so `/last` never blocks longer than a `/chat` would. Recovery works while the **server is up** (the warm process holds the session); it does not survive a full server restart.
+
 ### `POST /clear/{name}` — Clear conversation context
 
 Wipes the conversation by respawning agy in a fresh project directory (~5s). A respawn is required because agy keeps **cross-conversation memory per project**: its own `/clear` starts a new conversation that still receives summaries of the previous ones — and the agent can read their transcripts to recover "cleared" context.
@@ -166,7 +192,10 @@ A turn faster than that leaves no dump.
 (`RESPONSE_HARD_TIMEOUT` / `CODEX_RESPONSE_HARD_TIMEOUT = 180`); each bridge also
 gives up early if its CLI makes no progress for `*_STALL_TIMEOUT` (90s). Work
 that genuinely needs longer should be handled by the client **re-polling**, not
-by raising these caps.
+by raising these caps. That re-poll is [`GET /last/{name}`](#get-lastname--re-read-the-last-answer-recover-a-lost-response):
+the turn keeps running in the warm process after a request gives up, its answer
+is written to the CLI's transcript/rollout, and `/last` reads it back once it is
+done — so a capped or dropped `/chat` never loses the reply.
 
 ## Running Without Docker
 
@@ -226,6 +255,7 @@ POST /chat/foo ──────→│  session "foo"       │       tmux sess
 POST /chat/bar ──────→│  session "bar"       │       tmux session
                       │  AgySession ─────────────→  "agy-bar"   ─────→  live agy TUI
                       └──────────────────────┘
+GET   /last/{name} ─→ re-read the last COMPLETED answer (recover a lost response)
 POST  /clear/{name} → respawn in a fresh project dir (true context wipe)
 POST  /reset/{name} → kill + respawn session's process
 DELETE /chat/{name} → stop + remove session entirely
