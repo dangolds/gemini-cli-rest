@@ -19,6 +19,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path as FsPath
 
 from fastapi import FastAPI, HTTPException, Path, Query, Request
@@ -143,6 +144,23 @@ def _preview(text: str, limit: int = 160) -> str:
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
+def _parse_iso_ts(ts: str | None) -> float | None:
+    """An ISO-8601 timestamp (with or without fractional secs / a 'Z') -> epoch
+    seconds, or None if absent/unparseable. Lets /last turn the transcript's own
+    timestamps into the durations it logs (model time vs poll-wait)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+# Session names used by liveness probes, not real callers: a /last MISS for one
+# is routine noise, so it logs at DEBUG instead of warning the operator.
+_PROBE_NAMES = frozenset({"__livecheck__"})
+
+
 # ---------------------------------------------------------------------------
 # Subprocess / tmux helpers
 # ---------------------------------------------------------------------------
@@ -254,6 +272,26 @@ def _new_responses(steps: list[dict], baseline: int) -> list[str]:
     ]
 
 
+def _new_response_bounds(steps: list[dict], baseline: int) -> tuple[str | None, str | None]:
+    """(turn_start, answer_complete) ISO timestamps for steps past *baseline*.
+
+    Read straight from the durable transcript so /last can report how long the
+    model actually worked and how long the finished answer then sat before a
+    poll claimed it — i.e. tell genuine model time apart from our own flow
+    latency, from the log alone. start = the earliest new step; complete = the
+    last DONE planner response (the moment the recovered answer existed)."""
+    new = [s for s in steps if s.get("step_index", -1) > baseline]
+    if not new:
+        return None, None
+    start = min((s["created_at"] for s in new if s.get("created_at")), default=None)
+    complete = None
+    for s in new:
+        if (s.get("source") == "MODEL" and s.get("type") == "PLANNER_RESPONSE"
+                and s.get("status") == "DONE" and s.get("content") and s.get("created_at")):
+            complete = s["created_at"]
+    return start, complete
+
+
 # ---------------------------------------------------------------------------
 # agy Session (one live agy process inside a tmux session)
 # ---------------------------------------------------------------------------
@@ -280,6 +318,13 @@ class AgySession:
     # read their transcripts. Every spawn therefore gets a fresh generation
     # directory, which is what makes clear/reset a true context wipe.
     _generation: int = field(default=0, init=False)
+    # /last observability only (never affects correctness): how many /last polls
+    # the current turn has taken, and the timeout dump (if any) still awaiting a
+    # completion footer once /last recovers the answer the turn went on to make.
+    _last_attempt: int = field(default=0, init=False)
+    _last_dump_path: str | None = field(default=None, init=False)
+    _last_dump_turn: int = field(default=-1, init=False)
+    _last_dump_finished: bool = field(default=False, init=False)
 
     # --- Identity ----------------------------------------------------------
 
@@ -480,6 +525,7 @@ class AgySession:
                 raise RuntimeError("agy process is not running")
 
             self._turn_count += 1
+            self._last_attempt = 0  # new turn -> fresh recovery-poll count
             logger.info(
                 "Session '%s' turn %d — sending prompt (%d chars)",
                 self.name, self._turn_count, len(prompt),
@@ -610,16 +656,19 @@ class AgySession:
             if elapsed > RESPONSE_HARD_TIMEOUT:
                 exit_reason = "hard_timeout"
                 logger.warning(
-                    "Session '%s': hit hard timeout (%.0fs) — returning %d partial "
-                    "response(s)", self.name, RESPONSE_HARD_TIMEOUT, len(responses),
+                    "Session '%s' ref=%s: hit hard timeout (%.0fs) — returning %d "
+                    "partial response(s); turn keeps running, recover via /last",
+                    self.name, self._conversation_id or "-", RESPONSE_HARD_TIMEOUT,
+                    len(responses),
                 )
                 break
             if now - last_progress > RESPONSE_STALL_TIMEOUT:
                 exit_reason = "stalled"
                 logger.warning(
-                    "Session '%s': no progress for %.0fs (idle, transcript not "
-                    "growing) — returning %d response(s)",
-                    self.name, RESPONSE_STALL_TIMEOUT, len(responses),
+                    "Session '%s' ref=%s: no progress for %.0fs (idle, transcript "
+                    "not growing) — returning %d response(s)",
+                    self.name, self._conversation_id or "-", RESPONSE_STALL_TIMEOUT,
+                    len(responses),
                 )
                 break
 
@@ -676,7 +725,10 @@ class AgySession:
         except Exception as exc:  # pragma: no cover - capture already failed once
             screen = f"(screen capture failed: {exc})"
         steps = _read_transcript(self._conversation_id)
-        tail = steps[-TIMEOUT_DUMP_STEPS:]
+        # Drop EPHEMERAL_MESSAGE housekeeping (one per step, identical filler) so
+        # the tail is the model/tool steps that actually show where time went.
+        signal = [s for s in steps if s.get("type") != "EPHEMERAL_MESSAGE"]
+        tail = signal[-TIMEOUT_DUMP_STEPS:]
         # safe_name, not raw self.name: a base like @origin/dev contains '/',
         # which would nest the dump under a missing parent dir and get the write
         # silently swallowed by the except OSError below.
@@ -689,7 +741,8 @@ class AgySession:
                 f"transcript={_transcript_path(self._conversation_id)}",
                 f"baseline={baseline} elapsed={elapsed:.1f}s "
                 f"collected_messages={len(responses)} total_steps={len(steps)}",
-                f"\n=== last {len(tail)} transcript steps ===",
+                f"\n=== last {len(tail)} of {len(signal)} steps "
+                f"(EPHEMERAL_MESSAGE filtered; {len(steps)} total) ===",
             ]
             for d in tail:
                 c = d.get("content")
@@ -703,6 +756,12 @@ class AgySession:
             lines.append(screen)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             logger.warning("Session '%s': wrote timeout diagnostic to %s", self.name, path)
+            if reason in ("hard_timeout", "stalled"):
+                # Mark this turn's dump so /last can append a completion footer
+                # once it recovers the answer the turn produced after give-up.
+                self._last_dump_path = str(path)
+                self._last_dump_turn = self._turn_count
+                self._last_dump_finished = False
         except OSError as exc:
             logger.warning(
                 "Session '%s': could not write timeout diagnostic: %s", self.name, exc
@@ -754,6 +813,42 @@ class AgySession:
         except RuntimeError:
             return True  # died between the check and the capture
         return READY_MARKER in screen and not self._is_busy(screen)
+
+    def next_attempt(self) -> int:
+        """Increment and return this turn's /last poll count (observability)."""
+        self._last_attempt += 1
+        return self._last_attempt
+
+    def recovery_timing(self) -> tuple[str | None, str | None]:
+        """(turn_start, answer_complete) ISO timestamps for the most recent turn,
+        from the durable transcript — so /last can log model_turn (real work) vs
+        the gap the answer waited for a poll. (None, None) before the first turn."""
+        if self._conversation_id is None:
+            return None, None
+        return _new_response_bounds(
+            _read_transcript(self._conversation_id), self._last_baseline_step
+        )
+
+    def record_recovery(self, completed_at: str | None, model_secs: float | None) -> None:
+        """Append a completion footer to this turn's timeout dump, once /last has
+        recovered the answer the turn produced after we gave up — turning the
+        dump (frozen at the give-up snapshot) into a complete turn record. Only
+        the turn that timed out is touched, and only once. Best-effort."""
+        if (not self._last_dump_path or self._last_dump_turn != self._turn_count
+                or self._last_dump_finished):
+            return
+        lines = [
+            "\n=== turn COMPLETED after give-up (recovered via /last) ===",
+            f"answer_completed_at={completed_at}",
+        ]
+        if model_secs is not None:
+            lines.append(f"model_turn_secs={model_secs:.1f}")
+        try:
+            with open(self._last_dump_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._last_dump_finished = True
+        except OSError:
+            pass
 
     # --- Status --------------------------------------------------------------
 
@@ -881,6 +976,7 @@ async def access_log(request: Request, call_next):
     Health checks log at DEBUG so routine polling never floods the file.
     """
     rid = uuid.uuid4().hex[:8]
+    request.state.rid = rid  # so endpoint-level audit lines share the HTTP id
     level = logging.DEBUG if request.url.path == "/health" else logging.INFO
     t0 = time.monotonic()
     logger.log(level, "--> %s %s [%s]", request.method, request.url.path, rid)
@@ -1030,31 +1126,56 @@ async def get_last(
     answer) on exit — enough to reconstruct, after the fact, which client
     recovered which answer from which transcript and when.
     """
+    rid = getattr(request.state, "rid", "-")
     session = await manager.get(name)
     if not session:
-        logger.warning(
-            "/last MISS session '%s' (unknown) <- %s ua=%r",
-            name, _client(request), _ua(request),
+        # A liveness probe asking for its sentinel session is routine, not a real
+        # lost-answer lookup — keep it out of the operator's WARNING stream.
+        level = logging.DEBUG if name in _PROBE_NAMES else logging.WARNING
+        logger.log(
+            level, "[%s] /last MISS session '%s' (unknown) <- %s ua=%r",
+            rid, name, _client(request), _ua(request),
         )
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
 
+    attempt = session.next_attempt()
     logger.info(
-        "/last REQUEST session '%s' ref=%s turn=%d wait=%.1fs <- %s ua=%r",
-        name, session.ref, session.turn_count, wait, _client(request), _ua(request),
+        "[%s] /last REQUEST session '%s' ref=%s turn=%d attempt=%d wait=%.1fs <- %s ua=%r",
+        rid, name, session.ref, session.turn_count, attempt, wait,
+        _client(request), _ua(request),
     )
     t0 = time.monotonic()
     done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
     elapsed = int((time.monotonic() - t0) * 1000)
     if done:
+        # Pull the turn's real timing from the transcript: model_turn = how long
+        # the agent actually worked; waited_for_poll = how long the finished
+        # answer sat before a poll claimed it (~poll cadence + idle settle, i.e.
+        # our flow's share, not the model's). Answers "why so slow?" from the log.
+        start_ts, done_ts = session.recovery_timing()
+        start_epoch, done_epoch = _parse_iso_ts(start_ts), _parse_iso_ts(done_ts)
+        model_secs = (done_epoch - start_epoch) if (start_epoch and done_epoch) else None
+        waited_secs = max(0.0, time.time() - done_epoch) if done_epoch else None
+        session.record_recovery(done_ts, model_secs)
+        timing = ""
+        if done_ts:
+            bits = [f"completed_at={done_ts}"]
+            if model_secs is not None:
+                bits.append(f"model_turn={model_secs:.0f}s")
+            if waited_secs is not None:
+                bits.append(f"waited_for_poll={waited_secs:.0f}s")
+            timing = " (" + ", ".join(bits) + ")"
         logger.info(
-            "/last HIT session '%s' ref=%s turn=%d recovered %d chars in %dms: %r",
-            name, session.ref, turn, len(response), elapsed, _preview(response),
+            "[%s] /last HIT session '%s' ref=%s turn=%d attempt=%d recovered %d "
+            "chars in %dms%s: %r",
+            rid, name, session.ref, turn, attempt, len(response), elapsed, timing,
+            _preview(response),
         )
     else:
         logger.info(
-            "/last PENDING session '%s' ref=%s turn=%d — no completed answer yet "
-            "(still running or never ingested) after %dms",
-            name, session.ref, turn, elapsed,
+            "[%s] /last PENDING session '%s' ref=%s turn=%d attempt=%d — no completed "
+            "answer yet (still running or never ingested) after %dms",
+            rid, name, session.ref, turn, attempt, elapsed,
         )
     return LastResponse(
         done=done,
