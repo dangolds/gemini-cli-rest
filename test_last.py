@@ -300,3 +300,124 @@ class TestAgyLast:
         t0 = time.monotonic()
         assert _run(sess.last(0.3)) == (False, "", 1)
         assert time.monotonic() - t0 >= 0.3 - 0.05
+
+
+# ===========================================================================
+# /last observability (audit-log improvements): model-timing derivation,
+# per-turn attempt count, and the dump completion footer. Pure helpers — no
+# server / CLI / Docker. The exact log-line WORDING is intentionally not
+# asserted; these pin the data the lines are built from.
+# ===========================================================================
+
+class TestParseIsoTs:
+    """Both bridges turn the transcript/rollout's own timestamps into the
+    durations /last logs, so the parse must accept 'Z' and fractional seconds."""
+
+    def test_z_equals_explicit_offset_and_orders_correctly(self):
+        for mod in (server, codex_server):
+            assert mod._parse_iso_ts("2026-06-23T02:38:57Z") == \
+                mod._parse_iso_ts("2026-06-23T02:38:57+00:00")
+            a = mod._parse_iso_ts("2026-06-23T02:34:23.965Z")
+            b = mod._parse_iso_ts("2026-06-23T02:34:24.965Z")
+            assert b - a == pytest.approx(1.0)
+
+    def test_missing_or_junk_is_none(self):
+        for mod in (server, codex_server):
+            assert mod._parse_iso_ts(None) is None
+            assert mod._parse_iso_ts("not-a-timestamp") is None
+
+
+class TestAgyResponseBounds:
+    def test_start_is_earliest_complete_is_last_done_answer(self):
+        steps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+             "status": "DONE", "content": "q", "created_at": "2026-06-23T02:00:00Z"},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+             "status": "DONE", "content": "interim", "created_at": "2026-06-23T02:01:00Z"},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE",
+             "status": "DONE", "content": "final", "created_at": "2026-06-23T02:03:00Z"},
+        ]
+        assert server._new_response_bounds(steps, baseline=-1) == \
+            ("2026-06-23T02:00:00Z", "2026-06-23T02:03:00Z")
+
+    def test_baseline_excludes_a_prior_turn(self):
+        steps = [
+            {"step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE",
+             "status": "DONE", "content": "prev", "created_at": "2026-06-23T01:00:00Z"},
+            {"step_index": 9, "source": "MODEL", "type": "PLANNER_RESPONSE",
+             "status": "DONE", "content": "this", "created_at": "2026-06-23T02:00:00Z"},
+        ]
+        assert server._new_response_bounds(steps, baseline=5) == \
+            ("2026-06-23T02:00:00Z", "2026-06-23T02:00:00Z")
+
+    def test_no_new_steps_returns_none(self):
+        assert server._new_response_bounds([], baseline=-1) == (None, None)
+
+
+class TestCodexTurnBounds:
+    def test_start_and_complete_for_first_turn(self):
+        events = [
+            {"type": "event_msg", "timestamp": "2026-06-23T02:00:00Z",
+             "payload": {"type": "task_started", "turn_id": "t1"}},
+            {"type": "event_msg", "timestamp": "2026-06-23T02:05:00Z",
+             "payload": {"type": "task_complete", "turn_id": "t1"}},
+        ]
+        assert codex_server._turn_bounds(events, baseline_completes=0) == \
+            ("2026-06-23T02:00:00Z", "2026-06-23T02:05:00Z")
+
+    def test_baseline_skips_an_already_completed_turn(self):
+        events = [
+            {"type": "event_msg", "timestamp": "2026-06-23T01:00:00Z",
+             "payload": {"type": "task_started", "turn_id": "t1"}},
+            {"type": "event_msg", "timestamp": "2026-06-23T01:01:00Z",
+             "payload": {"type": "task_complete", "turn_id": "t1"}},
+            {"type": "event_msg", "timestamp": "2026-06-23T02:00:00Z",
+             "payload": {"type": "task_started", "turn_id": "t2"}},
+            {"type": "event_msg", "timestamp": "2026-06-23T02:09:00Z",
+             "payload": {"type": "task_complete", "turn_id": "t2"}},
+        ]
+        assert codex_server._turn_bounds(events, baseline_completes=1) == \
+            ("2026-06-23T02:00:00Z", "2026-06-23T02:09:00Z")
+
+
+_SESSIONS = ((server, server.AgySession), (codex_server, codex_server.CodexSession))
+
+
+class TestNextAttempt:
+    def test_increments_and_send_resets_it(self):
+        for _mod, cls in _SESSIONS:
+            s = cls(name="unit")
+            assert s.next_attempt() == 1
+            assert s.next_attempt() == 2
+            s._last_attempt = 0  # what send() does at each new turn boundary
+            assert s.next_attempt() == 1
+
+
+class TestRecordRecovery:
+    def test_appends_footer_once_for_the_matching_turn(self, tmp_path):
+        for _mod, cls in _SESSIONS:
+            dump = tmp_path / f"{cls.__name__}.log"
+            dump.write_text("=== give-up snapshot ===\n")
+            s = cls(name="unit")
+            s._turn_count = 3
+            s._last_dump_path = str(dump)
+            s._last_dump_turn = 3
+            s._last_dump_finished = False
+            s.record_recovery("2026-06-23T02:05:00Z", 300.0)
+            text = dump.read_text()
+            assert "COMPLETED after give-up" in text
+            assert "answer_completed_at=2026-06-23T02:05:00Z" in text
+            assert "model_turn_secs=300.0" in text
+            s.record_recovery("2026-06-23T02:05:00Z", 300.0)  # idempotent
+            assert dump.read_text().count("COMPLETED after give-up") == 1
+
+    def test_leaves_a_dump_from_a_different_turn_untouched(self, tmp_path):
+        for _mod, cls in _SESSIONS:
+            dump = tmp_path / f"{cls.__name__}-mismatch.log"
+            dump.write_text("snapshot\n")
+            s = cls(name="unit")
+            s._turn_count = 5            # current turn
+            s._last_dump_path = str(dump)
+            s._last_dump_turn = 4        # dump belongs to a previous turn
+            s.record_recovery("2026-06-23T02:05:00Z", 1.0)
+            assert dump.read_text() == "snapshot\n"

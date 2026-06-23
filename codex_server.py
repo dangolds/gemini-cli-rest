@@ -32,6 +32,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
@@ -160,6 +161,23 @@ def _preview(text: str, limit: int = 160) -> str:
     the log records WHAT was handed back without dumping the whole response."""
     flat = " ".join((text or "").split())
     return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def _parse_iso_ts(ts: str | None) -> float | None:
+    """An ISO-8601 timestamp (with or without fractional secs / a 'Z') -> epoch
+    seconds, or None if absent/unparseable. Lets /last turn the rollout's own
+    timestamps into the durations it logs (model time vs poll-wait)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+# Session names used by liveness probes, not real callers: a /last MISS for one
+# is routine noise, so it logs at DEBUG instead of warning the operator.
+_PROBE_NAMES = frozenset({"__livecheck__"})
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +349,34 @@ def _answer_for_new_turn(events: list[dict], baseline_completes: int) -> str:
     return "\n".join(texts).strip()
 
 
+def _turn_bounds(events: list[dict], baseline_completes: int) -> tuple[str | None, str | None]:
+    """(turn_start, turn_complete) ISO timestamps for the turn that finished just
+    past *baseline_completes* — task_started -> task_complete, read from the
+    durable rollout so /last can log real model time vs our flow latency. The
+    end is the model's definitive finish; the start falls back to the window's
+    first event if no task_started is visible."""
+    completes = 0
+    start_i = 0
+    for i, ev in enumerate(events):
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete":
+            completes += 1
+            if completes == baseline_completes:
+                start_i = i + 1
+                break
+    window = events[start_i:]
+    start_ts = end_ts = None
+    for ev in window:
+        p = _payload(ev)
+        if p.get("type") == "task_started" and start_ts is None:
+            start_ts = ev.get("timestamp")
+        if p.get("type") == "task_complete":
+            end_ts = ev.get("timestamp")
+            break
+    if start_ts is None and window:
+        start_ts = window[0].get("timestamp")
+    return start_ts, end_ts
+
+
 # ---------------------------------------------------------------------------
 # Codex Session (one live codex process inside a tmux session)
 # ---------------------------------------------------------------------------
@@ -356,6 +402,13 @@ class CodexSession:
     # Every spawn gets a fresh generation directory (and a brand-new codex
     # session), which is what makes clear/reset a true context wipe.
     _generation: int = field(default=0, init=False)
+    # /last observability only (never affects correctness): how many /last polls
+    # the current turn has taken, and the timeout dump (if any) still awaiting a
+    # completion footer once /last recovers the answer the turn went on to make.
+    _last_attempt: int = field(default=0, init=False)
+    _last_dump_path: str | None = field(default=None, init=False)
+    _last_dump_turn: int = field(default=-1, init=False)
+    _last_dump_finished: bool = field(default=False, init=False)
 
     # --- Identity ----------------------------------------------------------
 
@@ -589,6 +642,7 @@ class CodexSession:
                 raise RuntimeError("codex process is not running")
 
             self._turn_count += 1
+            self._last_attempt = 0  # new turn -> fresh recovery-poll count
             logger.info(
                 "Session '%s' turn %d — sending prompt (%d chars)",
                 self.name, self._turn_count, len(prompt),
@@ -720,16 +774,18 @@ class CodexSession:
             if elapsed > RESPONSE_HARD_TIMEOUT:
                 exit_reason = "hard_timeout"
                 logger.warning(
-                    "Session '%s': hit hard timeout (%.0fs) — returning partial "
-                    "(%d chars)", self.name, RESPONSE_HARD_TIMEOUT, len(response),
+                    "Session '%s' ref=%s: hit hard timeout (%.0fs) — returning "
+                    "partial (%d chars); turn keeps running, recover via /last",
+                    self.name, self._session_id or "-", RESPONSE_HARD_TIMEOUT,
+                    len(response),
                 )
                 break
             if now - last_progress > RESPONSE_STALL_TIMEOUT:
                 exit_reason = "stalled"
                 logger.warning(
-                    "Session '%s': no progress for %.0fs (idle, rollout not "
+                    "Session '%s' ref=%s: no progress for %.0fs (idle, rollout not "
                     "growing) — returning %d chars", self.name,
-                    RESPONSE_STALL_TIMEOUT, len(response),
+                    self._session_id or "-", RESPONSE_STALL_TIMEOUT, len(response),
                 )
                 break
 
@@ -782,7 +838,14 @@ class CodexSession:
         except Exception as exc:  # pragma: no cover - capture already failed once
             screen = f"(screen capture failed: {exc})"
         events = _read_rollout(self._rollout_path)
-        tail = events[-TIMEOUT_DUMP_STEPS:]
+        # Drop token_count housekeeping events (one per step, no timing signal) so
+        # the tail is reasoning + tool calls — what actually shows where time went.
+        signal = [
+            ev for ev in events
+            if not (ev.get("type") == "event_msg"
+                    and _payload(ev).get("type") == "token_count")
+        ]
+        tail = signal[-TIMEOUT_DUMP_STEPS:]
         rollout_name = self._rollout_path.name if self._rollout_path else "unresolved"
         # safe_name, not raw self.name: a base like @origin/dev contains '/',
         # which would nest the dump under a missing parent dir and get the write
@@ -796,7 +859,8 @@ class CodexSession:
                 f"rollout={self._rollout_path}",
                 f"baseline_completes={baseline} elapsed={elapsed:.1f}s "
                 f"response_len={len(response)} total_events={len(events)}",
-                f"\n=== last {len(tail)} rollout events ===",
+                f"\n=== last {len(tail)} of {len(signal)} events "
+                f"(token_count filtered; {len(events)} total) ===",
             ]
             for ev in tail:
                 p = _payload(ev)
@@ -808,6 +872,12 @@ class CodexSession:
             lines.append(screen)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             logger.warning("Session '%s': wrote diagnostic to %s", self.name, path)
+            if reason in ("hard_timeout", "stalled"):
+                # Mark this turn's dump so /last can append a completion footer
+                # once it recovers the answer the turn produced after give-up.
+                self._last_dump_path = str(path)
+                self._last_dump_turn = self._turn_count
+                self._last_dump_finished = False
         except OSError as exc:
             logger.warning(
                 "Session '%s': could not write diagnostic: %s", self.name, exc
@@ -842,6 +912,42 @@ class CodexSession:
             if time.monotonic() >= deadline:
                 return False, "", self._turn_count
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
+    def next_attempt(self) -> int:
+        """Increment and return this turn's /last poll count (observability)."""
+        self._last_attempt += 1
+        return self._last_attempt
+
+    def recovery_timing(self) -> tuple[str | None, str | None]:
+        """(turn_start, answer_complete) ISO timestamps for the most recent turn,
+        from the durable rollout — so /last can log model_turn (real work) vs the
+        gap the answer waited for a poll. (None, None) before the first turn."""
+        if self._rollout_path is None:
+            return None, None
+        return _turn_bounds(
+            _read_rollout(self._rollout_path), self._last_baseline_completes
+        )
+
+    def record_recovery(self, completed_at: str | None, model_secs: float | None) -> None:
+        """Append a completion footer to this turn's timeout dump, once /last has
+        recovered the answer the turn produced after we gave up — turning the
+        dump (frozen at the give-up snapshot) into a complete turn record. Only
+        the turn that timed out is touched, and only once. Best-effort."""
+        if (not self._last_dump_path or self._last_dump_turn != self._turn_count
+                or self._last_dump_finished):
+            return
+        lines = [
+            "\n=== turn COMPLETED after give-up (recovered via /last) ===",
+            f"answer_completed_at={completed_at}",
+        ]
+        if model_secs is not None:
+            lines.append(f"model_turn_secs={model_secs:.1f}")
+        try:
+            with open(self._last_dump_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._last_dump_finished = True
+        except OSError:
+            pass
 
     # --- Status --------------------------------------------------------------
 
@@ -970,6 +1076,7 @@ async def access_log(request: Request, call_next):
     Health checks log at DEBUG so routine polling never floods the file.
     """
     rid = uuid.uuid4().hex[:8]
+    request.state.rid = rid  # so endpoint-level audit lines share the HTTP id
     level = logging.DEBUG if request.url.path == "/health" else logging.INFO
     t0 = time.monotonic()
     logger.log(level, "--> %s %s [%s]", request.method, request.url.path, rid)
@@ -1122,31 +1229,56 @@ async def get_last(
     on exit — enough to reconstruct, after the fact, which client recovered
     which answer from which rollout and when.
     """
+    rid = getattr(request.state, "rid", "-")
     session = await manager.get(name)
     if not session:
-        logger.warning(
-            "/last MISS session '%s' (unknown) <- %s ua=%r",
-            name, _client(request), _ua(request),
+        # A liveness probe asking for its sentinel session is routine, not a real
+        # lost-answer lookup — keep it out of the operator's WARNING stream.
+        level = logging.DEBUG if name in _PROBE_NAMES else logging.WARNING
+        logger.log(
+            level, "[%s] /last MISS session '%s' (unknown) <- %s ua=%r",
+            rid, name, _client(request), _ua(request),
         )
         raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
 
+    attempt = session.next_attempt()
     logger.info(
-        "/last REQUEST session '%s' ref=%s turn=%d wait=%.1fs <- %s ua=%r",
-        name, session.ref, session.turn_count, wait, _client(request), _ua(request),
+        "[%s] /last REQUEST session '%s' ref=%s turn=%d attempt=%d wait=%.1fs <- %s ua=%r",
+        rid, name, session.ref, session.turn_count, attempt, wait,
+        _client(request), _ua(request),
     )
     t0 = time.monotonic()
     done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
     elapsed = int((time.monotonic() - t0) * 1000)
     if done:
+        # Pull the turn's real timing from the rollout: model_turn = how long the
+        # agent actually worked; waited_for_poll = how long the finished answer
+        # sat before a poll claimed it (~poll cadence + settle, i.e. our flow's
+        # share, not the model's). Answers "why so slow?" from the log.
+        start_ts, done_ts = session.recovery_timing()
+        start_epoch, done_epoch = _parse_iso_ts(start_ts), _parse_iso_ts(done_ts)
+        model_secs = (done_epoch - start_epoch) if (start_epoch and done_epoch) else None
+        waited_secs = max(0.0, time.time() - done_epoch) if done_epoch else None
+        session.record_recovery(done_ts, model_secs)
+        timing = ""
+        if done_ts:
+            bits = [f"completed_at={done_ts}"]
+            if model_secs is not None:
+                bits.append(f"model_turn={model_secs:.0f}s")
+            if waited_secs is not None:
+                bits.append(f"waited_for_poll={waited_secs:.0f}s")
+            timing = " (" + ", ".join(bits) + ")"
         logger.info(
-            "/last HIT session '%s' ref=%s turn=%d recovered %d chars in %dms: %r",
-            name, session.ref, turn, len(response), elapsed, _preview(response),
+            "[%s] /last HIT session '%s' ref=%s turn=%d attempt=%d recovered %d "
+            "chars in %dms%s: %r",
+            rid, name, session.ref, turn, attempt, len(response), elapsed, timing,
+            _preview(response),
         )
     else:
         logger.info(
-            "/last PENDING session '%s' ref=%s turn=%d — no completed answer yet "
-            "(still running or never ingested) after %dms",
-            name, session.ref, turn, elapsed,
+            "[%s] /last PENDING session '%s' ref=%s turn=%d attempt=%d — no completed "
+            "answer yet (still running or never ingested) after %dms",
+            rid, name, session.ref, turn, attempt, elapsed,
         )
     return LastResponse(
         done=done,
