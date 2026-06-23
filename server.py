@@ -24,6 +24,8 @@ from pathlib import Path as FsPath
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 
+import worktree
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -283,7 +285,11 @@ class AgySession:
 
     @property
     def tmux_session(self) -> str:
-        return f"agy-{self.name}"
+        # safe_name(): the key now carries '@' and '/' (from bases like
+        # origin/dev), which are illegal in a tmux session name — so every
+        # tmux-name derivation goes through it. The raw self.name stays the
+        # manager key / identity; only the tmux/path encoding is sanitized.
+        return f"agy-{worktree.safe_name(self.name)}"
 
     @property
     def _target(self) -> str:
@@ -293,7 +299,9 @@ class AgySession:
 
     @property
     def cwd(self) -> FsPath:
-        return SESSIONS_ROOT / self.name / f"c{self._generation}"
+        # safe_name() collapses the '@'/'/'-bearing key into a single safe path
+        # component; a raw key would otherwise fragment into nested dirs.
+        return SESSIONS_ROOT / worktree.safe_name(self.name) / f"c{self._generation}"
 
     # --- Lifecycle ---------------------------------------------------------
 
@@ -303,6 +311,10 @@ class AgySession:
             parts.append("--dangerously-skip-permissions")
         if AGY_EXTRA_ARGS:
             parts.extend(AGY_EXTRA_ARGS.split())
+        # Grant the read-only agent access to THIS session's worktree. The
+        # static env grant points at the main clone, not the per-session /tmp
+        # worktree, so each generation's checkout must be trusted dynamically.
+        parts.extend(["--add-dir", str(self.cwd)])
         return shlex.join(parts)
 
     async def start(self) -> None:
@@ -315,7 +327,17 @@ class AgySession:
     async def _spawn(self) -> None:
         self._generation += 1  # fresh project dir → no inherited conversation memory
         cmd = self._build_command()
-        self.cwd.mkdir(parents=True, exist_ok=True)
+        # Each session reads inside its own DETACHED worktree of WORKTREE_REPO,
+        # pinned to the caller-named base. resolve_base fetches every spawn
+        # (freshness is intentional) and raises if the branch is missing —
+        # /chat catches that and replies conversationally so the agent can
+        # self-correct. The branchless case is gated at /chat; this guard is
+        # only defensive in case _spawn is ever reached without a base.
+        _, base = worktree.split_base(self.name)
+        if base is None:
+            raise RuntimeError("session has no base branch")
+        ref = await worktree.resolve_base(base)
+        await worktree.add(self.cwd, ref)
         logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
         await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
@@ -326,13 +348,15 @@ class AgySession:
             "-c", str(self.cwd),
             cmd,
         )
-        if rc != 0:
-            raise RuntimeError(f"tmux new-session failed: {out.strip()}")
-
+        # The worktree already exists; any spawn failure from here must tear it
+        # down, or this generation's checkout leaks until the next prune_stale().
         try:
+            if rc != 0:
+                raise RuntimeError(f"tmux new-session failed: {out.strip()}")
             await self._wait_ready()
         except Exception:
             await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
+            await worktree.remove(self.cwd)                   # tear down half-spawned worktree
             raise
 
         # agy creates its conversation lazily (on the first message or on
@@ -405,6 +429,9 @@ class AgySession:
         """Kill and re-spawn the process (new conversation)."""
         async with self._lock:
             await self._kill()
+            # Drop the current generation's worktree before _spawn re-cuts a
+            # fresh one (idempotent; the next generation gets a new path).
+            await worktree.remove(self.cwd)
             await self._spawn()
 
     async def clear(self) -> None:
@@ -421,6 +448,9 @@ class AgySession:
                 raise RuntimeError("agy process is not running")
             logger.info("Session '%s': clearing (respawn, fresh project dir)", self.name)
             await self._kill()
+            # Tear down this generation's worktree before _spawn re-cuts a fresh
+            # one, so the wipe covers the read surface too, not just the process.
+            await worktree.remove(self.cwd)
             await self._spawn()
 
     # --- Screen access -----------------------------------------------------
@@ -647,7 +677,10 @@ class AgySession:
             screen = f"(screen capture failed: {exc})"
         steps = _read_transcript(self._conversation_id)
         tail = steps[-TIMEOUT_DUMP_STEPS:]
-        path = TIMEOUT_LOG_DIR / f"{self.name}-turn{self._turn_count}-{self._conversation_id}.log"
+        # safe_name, not raw self.name: a base like @origin/dev contains '/',
+        # which would nest the dump under a missing parent dir and get the write
+        # silently swallowed by the except OSError below.
+        path = TIMEOUT_LOG_DIR / f"{worktree.safe_name(self.name)}-turn{self._turn_count}-{self._conversation_id}.log"
         try:
             TIMEOUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
             lines = [
@@ -776,6 +809,8 @@ class ChatManager:
             session = self._sessions.pop(name, None)
         if session:
             await session.stop()
+            # Deleting a session removes its read surface too (idempotent).
+            await worktree.remove(session.cwd)
             return True
         return False
 
@@ -785,6 +820,7 @@ class ChatManager:
             self._sessions.clear()
         for session in sessions.values():
             await session.stop()
+            await worktree.remove(session.cwd)  # drop each session's worktree
         return len(sessions)
 
     async def list_sessions(self) -> dict[str, dict]:
@@ -808,6 +844,10 @@ manager = ChatManager()
 async def lifespan(app: FastAPI):
     """Sessions are created lazily. On shutdown, stop all."""
     await _ensure_tmux_server()
+    # Startup hygiene: the ephemeral SESSIONS_ROOT under /tmp is wiped on
+    # container restart while the repo's worktree registry survives in the named
+    # volume, so drop registry entries whose checkouts vanished.
+    await worktree.prune_stale()
     logger.info("Server starting (sessions will be created on demand)")
     yield
     logger.info("Shutting down — stopping all sessions...")
@@ -863,8 +903,12 @@ async def access_log(request: Request, call_next):
 
 # --- Request/Response models ------------------------------------------------
 
-_NAME = Path(..., pattern=r"^[a-zA-Z0-9_-]+$", max_length=64,
-             description="Session name (alphanumeric, hyphens, underscores)")
+# The key is "<name>@<base>": the base is encoded in the path so callers can ask
+# about many branches concurrently. The optional "@<base>" suffix permits the
+# '.', '/', and '@' a ref name carries (e.g. origin/dev, a SHA). max_length is
+# bumped to fit a long base on top of the name.
+_NAME = Path(..., pattern=r"^[A-Za-z0-9_-]+(@[A-Za-z0-9._/-]+)?$", max_length=128,
+             description="Session name, optionally '<name>@<base-branch>'")
 
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=500_000, description="The message to send")
@@ -899,18 +943,50 @@ class MessageResponse(BaseModel):
 
 # --- Endpoints ---------------------------------------------------------------
 
-@app.post("/chat/{name}", response_model=ChatResponse)
+# Words that mark a RuntimeError as a caller branch/repo mistake (raised by
+# worktree.resolve_base / the no-base guard) rather than a genuine tmux/agy
+# startup failure. A caller mistake is handed back as a conversational 200 so
+# the agent can self-correct (name a real branch); a startup failure keeps 5xx.
+_BRANCH_ERROR_HINTS = ("not found in", "not a git clone", "no base branch")
+
+
+def _is_branch_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _BRANCH_ERROR_HINTS)
+
+
+@app.post("/chat/{name:path}", response_model=ChatResponse)
 async def chat(req: ChatRequest, name: str = _NAME):
     """Send a message to a named session. Creates the session on first use."""
+    # No base in the key -> nothing is spawned; reply conversationally telling
+    # the caller to re-send to /chat/<name>@<branch>. The agent reads this and
+    # retries with a branch, so a missing base never costs a CLI spawn.
+    session_name, base = worktree.split_base(name)
+    if base is None:
+        return ChatResponse(
+            response=worktree.NEEDS_BRANCH_MSG.format(name=name),
+            session=name, turn=0, elapsed_ms=0,
+        )
+
     try:
         session = await manager.get_or_create(name)
     except RuntimeError as e:
+        # A bad/missing branch surfaces here (resolve_base raised inside
+        # _spawn). Hand it back as a 200 so the calling agent can self-correct
+        # instead of seeing an opaque 5xx; genuine startup failures stay 503.
+        if _is_branch_error(e):
+            return ChatResponse(response=str(e), session=name, turn=0, elapsed_ms=0)
         raise HTTPException(status_code=503, detail=f"Failed to start session '{name}': {e}")
 
     t0 = time.monotonic()
     try:
         response = await session.send(req.prompt)
     except RuntimeError as e:
+        # The first send can also trigger a (re)spawn whose resolve_base fails;
+        # treat the same branch errors conversationally rather than as a 502.
+        if _is_branch_error(e):
+            elapsed = int((time.monotonic() - t0) * 1000)
+            return ChatResponse(response=str(e), session=name, turn=0, elapsed_ms=elapsed)
         raise HTTPException(status_code=502, detail=str(e))
 
     elapsed = int((time.monotonic() - t0) * 1000)
@@ -929,7 +1005,7 @@ async def chat(req: ChatRequest, name: str = _NAME):
     )
 
 
-@app.get("/last/{name}", response_model=LastResponse)
+@app.get("/last/{name:path}", response_model=LastResponse)
 async def get_last(
     request: Request,
     name: str = _NAME,
@@ -989,7 +1065,7 @@ async def get_last(
     )
 
 
-@app.post("/clear/{name}", response_model=MessageResponse)
+@app.post("/clear/{name:path}", response_model=MessageResponse)
 async def clear(name: str = _NAME):
     """Clear conversation context for a session without restarting the process."""
     session = await manager.get(name)
@@ -1004,7 +1080,7 @@ async def clear(name: str = _NAME):
     return MessageResponse(status="ok", message=f"Session '{name}' context cleared.")
 
 
-@app.post("/reset/{name}", response_model=MessageResponse)
+@app.post("/reset/{name:path}", response_model=MessageResponse)
 async def reset(name: str = _NAME):
     """Kill and restart a specific session (fresh conversation)."""
     session = await manager.get(name)
@@ -1017,7 +1093,7 @@ async def reset(name: str = _NAME):
     return MessageResponse(status="ok", message=f"Session '{name}' reset.")
 
 
-@app.delete("/chat/{name}", response_model=MessageResponse)
+@app.delete("/chat/{name:path}", response_model=MessageResponse)
 async def delete_session(name: str = _NAME):
     """Kill and permanently remove a specific session."""
     removed = await manager.remove(name)

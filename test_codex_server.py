@@ -45,12 +45,22 @@ def _server_already_running() -> bool:
         return False
 
 
-@pytest.fixture(scope="session", autouse=True)
-def server():
-    """Require a running server (e.g. Docker). Fails fast if none is found."""
+@pytest.fixture(autouse=True)
+def server(request):
+    """Require a running server (e.g. Docker) for the E2E suite.
+
+    Autouse, but a no-op for the mocked worktree unit tests (TestWorktreeBranching,
+    appended at the end of this file) — those mock tmux/git and need NO live
+    server. For every E2E test it SKIPs (not fails) when no server is up, so
+    running this file without Docker still exercises the mocked unit tests rather
+    than erroring the whole file out.
+    """
+    if request.cls is TestWorktreeBranching:
+        yield  # mocked unit tests — no live bridge needed, no teardown
+        return
     print(f"\n[{_ts()}] Checking for server at {BASE}...", flush=True)
     if not _server_already_running():
-        pytest.fail(
+        pytest.skip(
             f"No server running at {BASE}. Start it first with: docker compose up -d"
         )
     print(f"[{_ts()}] Server is up and healthy", flush=True)
@@ -65,6 +75,11 @@ def server():
 
 def chat(session: str, prompt: str) -> dict:
     """Send a chat message and return the JSON response."""
+    # A bare session name (no "@base") now hits the branchless handshake gate
+    # instead of spawning, so default-base E2E sessions to "@main" (main exists)
+    # — callers that already key their name (e.g. for /health membership) keep it.
+    if "@" not in session:
+        session = f"{session}@main"
     print(f"  [{_ts()}] >>> {session}: {prompt}", flush=True)
     t0 = time.monotonic()
     r = httpx.post(
@@ -81,6 +96,10 @@ def chat(session: str, prompt: str) -> dict:
 
 def last(session: str, wait: float = 15.0) -> dict:
     """GET /last/{session}?wait=N and return the JSON response."""
+    # Mirror chat(): a bare name is keyed to "@main" so /last addresses the same
+    # session the chat() helper spawned under that key.
+    if "@" not in session:
+        session = f"{session}@main"
     r = httpx.get(f"{BASE}/last/{session}", params={"wait": wait}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -115,7 +134,9 @@ class TestChatMemory:
 
     def test_remembers_fact(self, cleanup):
         print(f"\n[{_ts()}] TEST: Chat memory — does session remember a secret word?", flush=True)
-        name = f"test-memory-{uuid.uuid4().hex[:8]}"
+        # Key with "@main": the handler echoes back the full session key, so the
+        # resp["session"] == name assertion below must compare against that key.
+        name = f"test-memory-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -139,7 +160,9 @@ class TestLastReadback:
 
     def test_last_recovers_the_completed_answer(self, cleanup):
         print(f"\n[{_ts()}] TEST: /last — recover the answer a /chat just produced", flush=True)
-        name = f"test-last-{uuid.uuid4().hex[:8]}"
+        # Key with "@main": both chat() and the resp["session"] == name assertion
+        # use the full key the handler echoes.
+        name = f"test-last-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -157,7 +180,9 @@ class TestLastReadback:
     def test_last_returns_latest_turn_not_a_previous_one(self, cleanup):
         """The baseline guard, over real HTTP: after a 2nd turn, /last is turn 2 — never turn 1."""
         print(f"\n[{_ts()}] TEST: /last — returns the LATEST turn, not a stale previous one", flush=True)
-        name = f"test-last2-{uuid.uuid4().hex[:8]}"
+        # Key with "@main" so chat()/last() and cleanup's DELETE all address the
+        # same session key.
+        name = f"test-last2-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         tok1 = _unique("firstx")
         tok2 = _unique("secndx")
@@ -176,7 +201,8 @@ class TestLastReadback:
     def test_last_after_clear_does_not_return_precleared_answer(self, cleanup):
         """/clear respawns the codex session; /last must not surface the pre-clear answer."""
         print(f"\n[{_ts()}] TEST: /last after /clear → no stale pre-clear answer", flush=True)
-        name = f"test-lastclr-{uuid.uuid4().hex[:8]}"
+        # Key with "@main": /clear addresses by the full session key.
+        name = f"test-lastclr-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -207,7 +233,8 @@ class TestClear:
 
     def test_clear_forgets_context(self, cleanup):
         print(f"\n[{_ts()}] TEST: Clear — does /clear wipe conversation context?", flush=True)
-        name = f"test-clear-{uuid.uuid4().hex[:8]}"
+        # Key with "@main": /clear addresses by the full session key.
+        name = f"test-clear-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -245,7 +272,8 @@ class TestReset:
 
     def test_reset_returns_200_and_resets_turn_count(self, cleanup):
         print(f"\n[{_ts()}] TEST: Reset — does /reset start fresh with a reset turn count?", flush=True)
-        name = f"test-reset-{uuid.uuid4().hex[:8]}"
+        # Key with "@main": /reset addresses by the full session key.
+        name = f"test-reset-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
 
         # Build up some turns
@@ -282,8 +310,9 @@ class TestMultiSessionIsolation:
     def test_sessions_are_isolated(self, cleanup):
         print(f"\n[{_ts()}] TEST: Multi-session isolation — do sessions leak context?", flush=True)
         suffix = uuid.uuid4().hex[:8]
-        alpha = f"test-alpha-{suffix}"
-        beta = f"test-beta-{suffix}"
+        # Key with "@main" so cleanup's DELETE addresses the spawned session keys.
+        alpha = f"test-alpha-{suffix}@main"
+        beta = f"test-beta-{suffix}@main"
         cleanup.extend([alpha, beta])
         token_a = _unique("cola")
         token_b = _unique("anlb")
@@ -327,7 +356,9 @@ class TestDelete:
 
     def test_delete_removes_from_health(self):
         print(f"\n[{_ts()}] TEST: Delete — does DELETE remove session from /health?", flush=True)
-        name = f"test-delete-{uuid.uuid4().hex[:8]}"
+        # Key the name with "@main": the bridge stores the session under the full
+        # key, so /health membership and the DELETE URL must use that same key.
+        name = f"test-delete-{uuid.uuid4().hex[:8]}@main"
 
         # Create session
         print(f"  [{_ts()}] Step 1/3: Creating session...", flush=True)
@@ -364,10 +395,10 @@ class TestStop:
     def test_stop_clears_everything(self):
         print(f"\n[{_ts()}] TEST: Stop — does /stop kill all sessions?", flush=True)
 
-        # Create two sessions
+        # Create two sessions (keyed with "@main" so they spawn, not handshake)
         suffix = uuid.uuid4().hex[:8]
-        stop_a = f"test-stop-a-{suffix}"
-        stop_b = f"test-stop-b-{suffix}"
+        stop_a = f"test-stop-a-{suffix}@main"
+        stop_b = f"test-stop-b-{suffix}@main"
         print(f"  [{_ts()}] Step 1/3: Creating two sessions...", flush=True)
         chat(stop_a, "hello")
         chat(stop_b, "hello")
@@ -418,7 +449,7 @@ class TestSpecialCharacters:
 
     def test_special_chars_treated_as_text(self, cleanup):
         print(f"\n[{_ts()}] TEST: Special characters — do dangerous chars get treated as text?", flush=True)
-        name = f"test-specchar-{uuid.uuid4().hex[:8]}"
+        name = f"test-specchar-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
 
         # Each tuple: (label, prompt_template with {token} placeholder)
@@ -479,7 +510,7 @@ class TestSpecialCharacters:
     def test_simple_prompt_baseline(self, cleanup):
         """Baseline: a trivial prompt returns a coherent response."""
         print(f"\n[{_ts()}] TEST: Simple prompt baseline", flush=True)
-        name = f"test-baseline-{uuid.uuid4().hex[:8]}"
+        name = f"test-baseline-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
         resp = chat(name, f'Say "OK" and then repeat this token exactly: {token}')
@@ -491,7 +522,7 @@ class TestSpecialCharacters:
     def test_long_prompt(self, cleanup):
         """~3000-char prompt (60x repeated pangram) is handled correctly."""
         print(f"\n[{_ts()}] TEST: Long prompt (~3000 chars)", flush=True)
-        name = f"test-longprompt-{uuid.uuid4().hex[:8]}"
+        name = f"test-longprompt-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
         pangram = "The quick brown fox jumps over the lazy dog. " * 60
@@ -506,7 +537,7 @@ class TestSpecialCharacters:
     def test_very_long_single_line(self, cleanup):
         """~5000-char single line is handled correctly."""
         print(f"\n[{_ts()}] TEST: Very long single line (~5000 chars)", flush=True)
-        name = f"test-longline-{uuid.uuid4().hex[:8]}"
+        name = f"test-longline-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
         filler = "abcdefghijklmnopqrstuvwxyz0123456789" * 140
@@ -517,3 +548,250 @@ class TestSpecialCharacters:
             f"Expected token '{token}' in response: {resp['response']!r}"
         )
         print(f"  [{_ts()}] PASS: Very long single line handled correctly", flush=True)
+
+
+# ===========================================================================
+# Worktree branching (mocked — no live server, no real git/tmux/network)
+# ===========================================================================
+#
+# These pin the per-session git-worktree backing added to the codex bridge.
+# They mock worktree.resolve_base/add/remove/prune_stale with AsyncMock so NO
+# real git runs, and (where a session must spawn) stub the tmux/codex layer the
+# same way the rollout/diagnostic unit tests do — so a "spawn" creates no real
+# process. Run:  ./.venv/bin/python -m pytest test_codex_server.py -q
+#
+# The E2E classes above require a live bridge (their autouse `server` fixture
+# SKIPs when none is up); this class is exempt from that fixture, so it runs
+# standalone with everything mocked.
+
+import asyncio
+import re
+from unittest.mock import AsyncMock
+
+from fastapi.testclient import TestClient
+
+import codex_server
+import worktree
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestWorktreeBranching:
+    """The detached-worktree session backing: branchless gate, spawn wiring,
+    safe-name derivation, teardown on reset/delete, and the conversational
+    branch-error path. All git/tmux is mocked — nothing real is spawned."""
+
+    @pytest.fixture()
+    def wt(self, monkeypatch):
+        """Mock every worktree side-effect with AsyncMock (no real git)."""
+        resolve = AsyncMock(return_value="origin/dev-resolved")
+        add = AsyncMock()
+        remove = AsyncMock()
+        prune = AsyncMock()
+        monkeypatch.setattr(codex_server.worktree, "resolve_base", resolve)
+        monkeypatch.setattr(codex_server.worktree, "add", add)
+        monkeypatch.setattr(codex_server.worktree, "remove", remove)
+        monkeypatch.setattr(codex_server.worktree, "prune_stale", prune)
+
+        # The FastAPI lifespan (run by TestClient) bootstraps a real tmux server;
+        # stub it so these unit tests never touch tmux.
+        async def fake_ensure():
+            return None
+
+        monkeypatch.setattr(codex_server, "_ensure_tmux_server", fake_ensure)
+        return {"resolve": resolve, "add": add, "remove": remove, "prune": prune}
+
+    @pytest.fixture()
+    def no_tmux(self, monkeypatch):
+        """Stub the tmux/codex layer so a 'spawn' starts no real process.
+
+        _build_command still runs (we want it to exercise --add-dir), but the
+        tmux new-session, ready-wait, and liveness check are all no-ops. is_alive
+        reports True so a spawned session looks live to send()/health.
+        """
+        async def fake_tmux(*args, **kwargs):
+            return (0, "")
+
+        async def fake_wait_ready(self):
+            return None
+
+        async def fake_is_alive(self):
+            return True
+
+        monkeypatch.setattr(codex_server, "_tmux", fake_tmux)
+        monkeypatch.setattr(codex_server.CodexSession, "_wait_ready", fake_wait_ready)
+        monkeypatch.setattr(codex_server.CodexSession, "is_alive", fake_is_alive)
+
+    @pytest.fixture()
+    def spawn_path(self, monkeypatch):
+        """Like no_tmux, but is_alive starts False so get_or_create -> start()
+        actually reaches _spawn (the path where a branch error is raised)."""
+        async def fake_tmux(*args, **kwargs):
+            return (0, "")
+
+        async def fake_wait_ready(self):
+            return None
+
+        async def fake_is_alive(self):
+            return False  # force start() to spawn rather than short-circuit
+
+        monkeypatch.setattr(codex_server, "_tmux", fake_tmux)
+        monkeypatch.setattr(codex_server.CodexSession, "_wait_ready", fake_wait_ready)
+        monkeypatch.setattr(codex_server.CodexSession, "is_alive", fake_is_alive)
+
+    # --- (e) regex --------------------------------------------------------
+
+    def test_name_regex_accepts_bare_and_based_keys(self):
+        raw = next(m.pattern for m in codex_server._NAME.metadata
+                   if getattr(m, "pattern", None))
+        pat = re.compile(raw)
+        assert pat.fullmatch("name")
+        assert pat.fullmatch("name@origin/dev")
+        # and still rejects an unsafe key / a trailing-only '@'
+        assert not pat.fullmatch("bad name!")
+        assert not pat.fullmatch("name@")
+
+    # --- safe_name derivation --------------------------------------------
+
+    def test_cwd_and_tmux_name_use_safe_name(self):
+        """A key with '@' and '/' must not leak into the tmux name or fragment
+        the path — both derive from worktree.safe_name(self.name)."""
+        name = "feat@origin/dev"
+        sess = codex_server.CodexSession(name=name)
+        safe = worktree.safe_name(name)
+        assert sess.tmux_session == f"codex-{safe}"
+        # path is one component (no nested origin/dev dir) ending in the gen dir
+        assert sess.cwd == codex_server.SESSIONS_ROOT / safe / "c0"
+        assert "@" not in sess.tmux_session and "/" not in safe
+
+    # --- (a) branchless POST /chat/{name} ---------------------------------
+
+    def test_branchless_chat_returns_needs_branch_and_spawns_nothing(self, wt, monkeypatch):
+        """A key with no @<base> -> 200 NEEDS_BRANCH_MSG, and NOTHING is started:
+        get_or_create and worktree.add are never called."""
+        goc = AsyncMock()
+        monkeypatch.setattr(codex_server.manager, "get_or_create", goc)
+
+        with TestClient(codex_server.app) as client:
+            r = client.post("/chat/lonely", json={"prompt": "hi"})
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["response"] == worktree.NEEDS_BRANCH_MSG.format(name="lonely")
+        assert body["session"] == "lonely"
+        assert body["turn"] == 0
+        goc.assert_not_called()       # nothing spawned
+        wt["add"].assert_not_called()  # no worktree cut
+
+    def test_slash_base_key_routes_and_passes_full_key(self, wt, monkeypatch):
+        """A key whose base contains '/' ('q@origin/dev') must route via
+        {name:path} -> 200 (NOT a 404 from a non-greedy path converter), and the
+        handler must hand get_or_create the WHOLE key, not a truncated prefix."""
+        sess = AsyncMock()
+        sess.send = AsyncMock(return_value="ok")
+        sess.turn_count = 1
+        goc = AsyncMock(return_value=sess)
+        monkeypatch.setattr(codex_server.manager, "get_or_create", goc)
+
+        with TestClient(codex_server.app) as client:
+            r = client.post("/chat/q@origin/dev", json={"prompt": "hi"})
+
+        assert r.status_code == 200, r.status_code  # routed, not 404
+        body = r.json()
+        assert body["session"] == "q@origin/dev"
+        goc.assert_awaited_once_with("q@origin/dev")  # full slash-base key received
+
+    # --- (b) spawn wires resolve_base -> add(cwd, ref) --------------------
+
+    def test_spawn_resolves_base_then_adds_worktree(self, wt, no_tmux):
+        """_spawn parses the base, resolves it, and cuts the worktree at cwd
+        pinned to the resolved ref — using the safe_name-derived cwd."""
+        sess = codex_server.CodexSession(name="work@dev")
+        _run(sess._spawn())
+
+        wt["resolve"].assert_awaited_once_with("dev")
+        # add(cwd, ref) — cwd uses safe_name, ref is resolve_base's return
+        (cwd_arg, ref_arg), _ = wt["add"].call_args
+        assert cwd_arg == sess.cwd
+        assert cwd_arg == codex_server.SESSIONS_ROOT / worktree.safe_name("work@dev") / "c1"
+        assert ref_arg == "origin/dev-resolved"
+        # the worktree is also granted to codex dynamically via --add-dir
+        assert f"--add-dir {sess.cwd}" in sess._build_command()
+
+    def test_spawn_without_base_raises_defensively(self, wt, no_tmux):
+        """_spawn is gated by /chat, but defends itself if reached branchless."""
+        sess = codex_server.CodexSession(name="nobranch")
+        with pytest.raises(RuntimeError, match="no base branch"):
+            _run(sess._spawn())
+        wt["resolve"].assert_not_called()
+
+    # --- (c) reset and DELETE both tear down the worktree -----------------
+
+    def test_reset_removes_then_respawns_worktree(self, wt, no_tmux):
+        sess = codex_server.CodexSession(name="r@dev")
+        _run(sess._spawn())            # generation 1 cut
+        wt["remove"].reset_mock()
+        wt["add"].reset_mock()
+
+        _run(sess.reset())
+
+        wt["remove"].assert_awaited_once_with(sess.cwd.parent / "c1")  # old gen torn down
+        wt["add"].assert_awaited_once()                                 # fresh gen re-cut
+
+    def test_delete_removes_worktree(self, wt, no_tmux):
+        """DELETE /chat/{name} stops the session AND removes its worktree."""
+        sess = codex_server.CodexSession(name="d@dev")
+        _run(sess._spawn())
+        _run(codex_server.manager._lock.acquire())
+        codex_server.manager._sessions["d@dev"] = sess
+        codex_server.manager._lock.release()
+        cwd = sess.cwd
+
+        with TestClient(codex_server.app) as client:
+            r = client.delete("/chat/d@dev")
+
+        assert r.status_code == 200
+        wt["remove"].assert_awaited_with(cwd)
+
+    # --- (d) invalid branch surfaces as the conversational message --------
+
+    def test_invalid_branch_is_conversational_200(self, wt, spawn_path):
+        """resolve_base raising (bad branch) -> 200 carrying that message, so the
+        agent can self-correct, NOT a 5xx it would read as the bridge being down."""
+        _run(codex_server.manager.stop_all())  # no leftover session short-circuits start()
+        wt["resolve"].side_effect = RuntimeError(
+            "Base branch 'nope' not found in /app/slitled-platform. Name an existing branch."
+        )
+        with TestClient(codex_server.app) as client:
+            r = client.post("/chat/ask@nope", json={"prompt": "hi"})
+
+        assert r.status_code == 200
+        body = r.json()
+        assert "not found in" in body["response"]
+        assert body["session"] == "ask@nope"
+        assert body["turn"] == 0
+
+    def test_genuine_startup_failure_stays_5xx(self, wt, spawn_path, monkeypatch):
+        """A non-branch RuntimeError during start keeps its 503 (bridge fault)."""
+        _run(codex_server.manager.stop_all())
+        async def boom(self):
+            raise RuntimeError("tmux new-session failed: server not running")
+
+        monkeypatch.setattr(codex_server.CodexSession, "_spawn", boom)
+        with TestClient(codex_server.app) as client:
+            r = client.post("/chat/boom@dev", json={"prompt": "hi"})
+        assert r.status_code == 503
+
+    # --- (8) startup prune --------------------------------------------------
+
+    def test_lifespan_prunes_stale_worktrees(self, wt, monkeypatch):
+        """The FastAPI lifespan runs worktree.prune_stale() once on startup."""
+        async def fake_ensure():
+            return None
+
+        monkeypatch.setattr(codex_server, "_ensure_tmux_server", fake_ensure)
+        with TestClient(codex_server.app):
+            pass
+        wt["prune"].assert_awaited()

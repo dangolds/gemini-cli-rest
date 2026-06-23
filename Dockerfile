@@ -26,6 +26,10 @@ COPY requirements.txt .
 RUN python -m venv /app/.venv && \
     /app/.venv/bin/pip install --no-cache-dir -r requirements.txt
 
+# Shared helper imported by BOTH bridges (server.py + codex_server.py): backs
+# each session with a detached, branch-pinned git worktree. Must be copied in or
+# the servers crash on `import worktree` at startup.
+COPY worktree.py .
 COPY server.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh

@@ -38,6 +38,8 @@ from pathlib import Path as FsPath
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 
+import worktree
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -359,7 +361,10 @@ class CodexSession:
 
     @property
     def tmux_session(self) -> str:
-        return f"codex-{self.name}"
+        # self.name now carries '@' and '/' (from a base like origin/dev), which
+        # are unsafe in a tmux session name — derive the tmux name from the
+        # sanitized, collision-proof token instead. self.name stays the dict key.
+        return f"codex-{worktree.safe_name(self.name)}"
 
     @property
     def _target(self) -> str:
@@ -369,7 +374,9 @@ class CodexSession:
 
     @property
     def cwd(self) -> FsPath:
-        return SESSIONS_ROOT / self.name / f"c{self._generation}"
+        # Same reason as tmux_session: '@'/'/' in self.name would fragment the
+        # path into nested dirs, so the safe_name token is the path component.
+        return SESSIONS_ROOT / worktree.safe_name(self.name) / f"c{self._generation}"
 
     # --- Lifecycle ---------------------------------------------------------
 
@@ -381,6 +388,12 @@ class CodexSession:
         parts = [CODEX_CMD, "--dangerously-bypass-approvals-and-sandbox"]
         if CODEX_EXTRA_ARGS:
             parts.extend(shlex.split(CODEX_EXTRA_ARGS))
+        # Grant codex read access to THIS session's per-run worktree. The static
+        # CODEX_EXTRA_ARGS env grant (if any) points at the main clone, not the
+        # ephemeral /tmp checkout, so the worktree must be trusted dynamically.
+        # codex's flag is --add-dir <DIR> ("Additional directories that should be
+        # writable alongside the primary workspace") — same name as agy's.
+        parts.extend(["--add-dir", str(self.cwd)])
         return shlex.join(parts)
 
     async def start(self) -> None:
@@ -393,7 +406,15 @@ class CodexSession:
     async def _spawn(self) -> None:
         self._generation += 1  # fresh dir + fresh codex session → clean slate
         cmd = self._build_command()
-        self.cwd.mkdir(parents=True, exist_ok=True)
+        # The session runs inside a DETACHED git worktree of WORKTREE_REPO pinned
+        # to the caller-named base, so the read-only agent answers about that
+        # branch. resolve_base re-fetches every spawn (freshness is intentional)
+        # and raises if the branch is gone — /chat surfaces that conversationally.
+        _, base = worktree.split_base(self.name)
+        if base is None:  # defensive: /chat already gated the branchless case
+            raise RuntimeError("session has no base branch")
+        ref = await worktree.resolve_base(base)
+        await worktree.add(self.cwd, ref)
         logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
         await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
@@ -404,13 +425,15 @@ class CodexSession:
             "-c", str(self.cwd),
             cmd,
         )
-        if rc != 0:
-            raise RuntimeError(f"tmux new-session failed: {out.strip()}")
-
+        # The worktree already exists; any spawn failure from here must tear it
+        # down, or this generation's checkout leaks until the next prune_stale().
         try:
+            if rc != 0:
+                raise RuntimeError(f"tmux new-session failed: {out.strip()}")
             await self._wait_ready()
         except Exception:
             await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
+            await worktree.remove(self.cwd)                   # tear down half-spawned worktree
             raise
 
         # codex creates its rollout lazily (on the first turn), so the session
@@ -516,6 +539,10 @@ class CodexSession:
         """Kill and re-spawn the process (new conversation)."""
         async with self._lock:
             await self._kill()
+            # Tear down the CURRENT generation's worktree before the fresh re-cut
+            # so the registry doesn't accumulate a stale checkout (detached: no
+            # branch to clean up).
+            await worktree.remove(self.cwd)
             await self._spawn()
 
     async def clear(self) -> None:
@@ -529,6 +556,9 @@ class CodexSession:
                 raise RuntimeError("codex process is not running")
             logger.info("Session '%s': clearing (respawn, fresh working dir)", self.name)
             await self._kill()
+            # Drop the current generation's worktree before respawning into a
+            # fresh one (same rationale as reset()).
+            await worktree.remove(self.cwd)
             await self._spawn()
 
     # --- Screen access -----------------------------------------------------
@@ -754,7 +784,10 @@ class CodexSession:
         events = _read_rollout(self._rollout_path)
         tail = events[-TIMEOUT_DUMP_STEPS:]
         rollout_name = self._rollout_path.name if self._rollout_path else "unresolved"
-        path = TIMEOUT_LOG_DIR / f"codex-{self.name}-turn{self._turn_count}-{rollout_name}.log"
+        # safe_name, not raw self.name: a base like @origin/dev contains '/',
+        # which would nest the dump under a missing parent dir and get the write
+        # silently swallowed by the except OSError below.
+        path = TIMEOUT_LOG_DIR / f"codex-{worktree.safe_name(self.name)}-turn{self._turn_count}-{rollout_name}.log"
         try:
             TIMEOUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
             lines = [
@@ -864,6 +897,9 @@ class ChatManager:
             session = self._sessions.pop(name, None)
         if session:
             await session.stop()
+            # Deleting a session removes its worktree too (idempotent; safe even
+            # if the session never spawned and so has no checkout on disk).
+            await worktree.remove(session.cwd)
             return True
         return False
 
@@ -873,6 +909,7 @@ class ChatManager:
             self._sessions.clear()
         for session in sessions.values():
             await session.stop()
+            await worktree.remove(session.cwd)  # tear down each session's worktree
         return len(sessions)
 
     async def list_sessions(self) -> dict[str, dict]:
@@ -895,6 +932,10 @@ manager = ChatManager()
 async def lifespan(app: FastAPI):
     """Sessions are created lazily. On shutdown, stop all."""
     await _ensure_tmux_server()
+    # Startup hygiene: the ephemeral SESSIONS_ROOT under /tmp is wiped on a
+    # container restart while the repo's worktree registry survives in the named
+    # volume, so drop registry entries whose checkouts vanished.
+    await worktree.prune_stale()
     logger.info("Server starting (sessions will be created on demand)")
     yield
     logger.info("Shutting down — stopping all sessions...")
@@ -951,8 +992,13 @@ async def access_log(request: Request, call_next):
 
 # --- Request/Response models ------------------------------------------------
 
-_NAME = Path(..., pattern=r"^[a-zA-Z0-9_-]+$", max_length=64,
-             description="Session name (alphanumeric, hyphens, underscores)")
+# The session key may carry an optional "@<base>" suffix naming the git branch
+# this session reads (e.g. "fix@origin/dev"). The base half allows '.', '/' and
+# '@' so remote-tracking refs and SHAs pass; max_length is raised so a long
+# remote ref isn't rejected. The bare-name half is unchanged.
+_NAME = Path(..., pattern=r"^[A-Za-z0-9_-]+(@[A-Za-z0-9._/-]+)?$", max_length=128,
+             description="Session name (alphanumeric, hyphens, underscores), "
+                         "optionally suffixed with @<branch> (e.g. name@origin/dev)")
 
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=500_000, description="The message to send")
@@ -987,18 +1033,52 @@ class MessageResponse(BaseModel):
 
 # --- Endpoints --------------------------------------------------------------
 
-@app.post("/chat/{name}", response_model=ChatResponse)
+# A spawn-time RuntimeError that names a branch/worktree/repo problem (raised by
+# worktree.resolve_base / _spawn's defensive guard) is the agent's fault — a
+# typo'd or deleted branch — not a server fault. We return it CONVERSATIONALLY
+# (200) so the calling agent can read the message and self-correct, rather than
+# as a 5xx it would treat as the bridge being down. Genuine startup failures
+# (tmux/codex) carry none of these phrases and keep their 5xx.
+_BRANCH_ERROR_HINTS = ("not found in", "not a git clone", "no base branch")
+
+
+def _is_branch_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _BRANCH_ERROR_HINTS)
+
+
+@app.post("/chat/{name:path}", response_model=ChatResponse)
 async def chat(req: ChatRequest, name: str = _NAME):
     """Send a message to a named session. Creates the session on first use."""
+    # Branchless guard: a key with no @<base> never spawns anything — we ask the
+    # caller to name a branch and return immediately (turn 0, nothing started).
+    session_name, base = worktree.split_base(name)
+    if base is None:
+        return ChatResponse(
+            response=worktree.NEEDS_BRANCH_MSG.format(name=name),
+            session=name,
+            turn=0,
+            elapsed_ms=0,
+        )
+
     try:
         session = await manager.get_or_create(name)
     except RuntimeError as e:
+        # A bad/deleted branch surfaces here (resolve_base raised during the
+        # first spawn) — hand it back conversationally so the agent retries with
+        # a valid branch. A real startup failure stays a 503.
+        if _is_branch_error(e):
+            return ChatResponse(response=str(e), session=name, turn=0, elapsed_ms=0)
         raise HTTPException(status_code=503, detail=f"Failed to start session '{name}': {e}")
 
     t0 = time.monotonic()
     try:
         response = await session.send(req.prompt)
     except RuntimeError as e:
+        # The first send can also trip a branch error (a session that spawned
+        # lazily). Same conversational treatment.
+        if _is_branch_error(e):
+            return ChatResponse(response=str(e), session=name, turn=0, elapsed_ms=0)
         raise HTTPException(status_code=502, detail=str(e))
 
     elapsed = int((time.monotonic() - t0) * 1000)
@@ -1017,7 +1097,7 @@ async def chat(req: ChatRequest, name: str = _NAME):
     )
 
 
-@app.get("/last/{name}", response_model=LastResponse)
+@app.get("/last/{name:path}", response_model=LastResponse)
 async def get_last(
     request: Request,
     name: str = _NAME,
@@ -1077,7 +1157,7 @@ async def get_last(
     )
 
 
-@app.post("/clear/{name}", response_model=MessageResponse)
+@app.post("/clear/{name:path}", response_model=MessageResponse)
 async def clear(name: str = _NAME):
     """Clear conversation context for a session (respawn in a fresh dir)."""
     session = await manager.get(name)
@@ -1092,7 +1172,7 @@ async def clear(name: str = _NAME):
     return MessageResponse(status="ok", message=f"Session '{name}' context cleared.")
 
 
-@app.post("/reset/{name}", response_model=MessageResponse)
+@app.post("/reset/{name:path}", response_model=MessageResponse)
 async def reset(name: str = _NAME):
     """Kill and restart a specific session (fresh conversation)."""
     session = await manager.get(name)
@@ -1105,7 +1185,7 @@ async def reset(name: str = _NAME):
     return MessageResponse(status="ok", message=f"Session '{name}' reset.")
 
 
-@app.delete("/chat/{name}", response_model=MessageResponse)
+@app.delete("/chat/{name:path}", response_model=MessageResponse)
 async def delete_session(name: str = _NAME):
     """Kill and permanently remove a specific session."""
     removed = await manager.remove(name)

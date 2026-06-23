@@ -44,14 +44,26 @@ def _server_already_running() -> bool:
         return False
 
 
-@pytest.fixture(scope="session", autouse=True)
-def server():
-    """Require a running server (e.g. Docker). Fails fast if none is found."""
+# NOTE: named `live_server`, NOT `server` — the hermetic unit section below does
+# `import server` (the module), which would shadow a fixture named `server` and
+# silently disable the live-bridge gate + /stop teardown for the whole file.
+@pytest.fixture(autouse=True)
+def live_server(request):
+    """Gate the E2E tests on a live bridge at BASE; tear sessions down after.
+
+    Hermetic unit classes mock everything and need no bridge, so they return
+    early with NO gate. Otherwise, a missing bridge SKIPS (not fails) so the host
+    suite stays green whether or not `docker compose up -d` is running.
+    """
+    # Hermetic unit classes never touch the network — run them unconditionally.
+    if request.cls in (TestSpawnWorktree, TestChatBranchGating,
+                       TestWorktreeTeardown, TestNameRegex):
+        yield
+        return
+
     print(f"\n[{_ts()}] Checking for server at {BASE}...", flush=True)
     if not _server_already_running():
-        pytest.fail(
-            f"No server running at {BASE}. Start it first with: docker compose up -d"
-        )
+        pytest.skip(f"No bridge at {BASE}; run docker compose up -d")
     print(f"[{_ts()}] Server is up and healthy", flush=True)
     yield
     print(f"\n[{_ts()}] Tearing down — stopping all sessions...", flush=True)
@@ -64,6 +76,11 @@ def server():
 
 def chat(session: str, prompt: str) -> dict:
     """Send a chat message and return the JSON response."""
+    # Sessions now spawn inside a worktree keyed "<name>@<base>"; a bare name
+    # hits the branchless handshake instead of spawning. Default-base any plain
+    # name to "@main" so E2E sessions actually start.
+    if "@" not in session:
+        session = f"{session}@main"
     print(f"  [{_ts()}] >>> {session}: {prompt}", flush=True)
     t0 = time.monotonic()
     r = httpx.post(
@@ -80,6 +97,9 @@ def chat(session: str, prompt: str) -> dict:
 
 def last(session: str, wait: float = 15.0) -> dict:
     """GET /last/{session}?wait=N and return the JSON response."""
+    # Same default-basing as chat(): a bare name addresses the wrong key.
+    if "@" not in session:
+        session = f"{session}@main"
     r = httpx.get(f"{BASE}/last/{session}", params={"wait": wait}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -98,6 +118,10 @@ def cleanup():
     sessions = []
     yield sessions
     for name in sessions:
+        # chat() default-bases bare names to "@main"; mirror that so the DELETE
+        # URL addresses the SAME key the session was actually created under.
+        if "@" not in name:
+            name = f"{name}@main"
         print(f"  [{_ts()}] Cleaning up session '{name}'...", flush=True)
         try:
             httpx.delete(f"{BASE}/chat/{name}", timeout=30)
@@ -114,7 +138,8 @@ class TestChatMemory:
 
     def test_remembers_fact(self, cleanup):
         print(f"\n[{_ts()}] TEST: Chat memory — does session remember a secret word?", flush=True)
-        name = f"test-memory-{uuid.uuid4().hex[:8]}"
+        # Keyed: the response's "session" field echoes the full "<name>@<base>" key.
+        name = f"test-memory-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -138,7 +163,8 @@ class TestLastReadback:
 
     def test_last_recovers_the_completed_answer(self, cleanup):
         print(f"\n[{_ts()}] TEST: /last — recover the answer a /chat just produced", flush=True)
-        name = f"test-last-{uuid.uuid4().hex[:8]}"
+        # Keyed: /last echoes the full "<name>@<base>" key in its "session" field.
+        name = f"test-last-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -175,7 +201,9 @@ class TestLastReadback:
     def test_last_after_clear_does_not_return_precleared_answer(self, cleanup):
         """/clear respawns the session; /last must not surface the pre-clear answer."""
         print(f"\n[{_ts()}] TEST: /last after /clear → no stale pre-clear answer", flush=True)
-        name = f"test-lastclr-{uuid.uuid4().hex[:8]}"
+        # Keyed: chat()/last() leave an already-@based name alone, and the direct
+        # /clear URL below must hit the SAME key.
+        name = f"test-lastclr-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -206,7 +234,8 @@ class TestClear:
 
     def test_clear_forgets_context(self, cleanup):
         print(f"\n[{_ts()}] TEST: Clear — does /clear wipe conversation context?", flush=True)
-        name = f"test-clear-{uuid.uuid4().hex[:8]}"
+        # Keyed: the direct /clear URL below must address the same key chat() uses.
+        name = f"test-clear-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
         token = _unique()
 
@@ -244,7 +273,8 @@ class TestReset:
 
     def test_reset_returns_200_and_resets_turn_count(self, cleanup):
         print(f"\n[{_ts()}] TEST: Reset — does /reset kill and restart with fresh turn count?", flush=True)
-        name = f"test-reset-{uuid.uuid4().hex[:8]}"
+        # Keyed: the direct /reset URL below must address the same key chat() uses.
+        name = f"test-reset-{uuid.uuid4().hex[:8]}@main"
         cleanup.append(name)
 
         # Build up some turns
@@ -326,7 +356,9 @@ class TestDelete:
 
     def test_delete_removes_from_health(self):
         print(f"\n[{_ts()}] TEST: Delete — does DELETE remove session from /health?", flush=True)
-        name = f"test-delete-{uuid.uuid4().hex[:8]}"
+        # Key the name to its base: /health, the chat() URL and the DELETE URL
+        # must all reference the SAME "<name>@<base>" key.
+        name = f"test-delete-{uuid.uuid4().hex[:8]}@main"
 
         # Create session
         print(f"  [{_ts()}] Step 1/3: Creating session...", flush=True)
@@ -365,8 +397,9 @@ class TestStop:
 
         # Create two sessions
         suffix = uuid.uuid4().hex[:8]
-        stop_a = f"test-stop-a-{suffix}"
-        stop_b = f"test-stop-b-{suffix}"
+        # Keyed to their base so they spawn under the worktree gate.
+        stop_a = f"test-stop-a-{suffix}@main"
+        stop_b = f"test-stop-b-{suffix}@main"
         print(f"  [{_ts()}] Step 1/3: Creating two sessions...", flush=True)
         chat(stop_a, "hello")
         chat(stop_b, "hello")
@@ -512,4 +545,291 @@ class TestSpecialCharacters:
             f"Expected token '{token}' in response: {resp['response']!r}"
         )
         print(f"  [{_ts()}] PASS: Very long single line handled correctly", flush=True)
+
+
+# ===========================================================================
+# Worktree integration (UNIT tests) — no server / agy / tmux / git / network
+# ===========================================================================
+#
+# These pin the per-session detached-worktree feature: a READ-ONLY agent must
+# run inside its own git worktree of WORKTREE_REPO pinned to a caller-named
+# branch ("<name>@<base>"), so many callers can ask about many branches at once
+# without colliding. They drive the in-process `server` module directly, in the
+# style of test_last.py / test_collect_response.py: worktree.resolve_base/add/
+# remove/prune_stale are replaced with AsyncMock so NO real git ever runs, tmux
+# is stubbed out, and the FastAPI handler is exercised with a TestClient.
+
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+import server
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+@pytest.fixture()
+def mock_worktree(monkeypatch):
+    """Replace every worktree side-effect with an AsyncMock (no real git).
+
+    resolve_base echoes a deterministic 'origin/<base>' ref so add() receives a
+    predictable value to assert on. Returns the mock namespace for inspection.
+    """
+    resolve = AsyncMock(side_effect=lambda base: f"origin/{base}")
+    add = AsyncMock()
+    remove = AsyncMock()
+    prune = AsyncMock()
+    monkeypatch.setattr(server.worktree, "resolve_base", resolve)
+    monkeypatch.setattr(server.worktree, "add", add)
+    monkeypatch.setattr(server.worktree, "remove", remove)
+    monkeypatch.setattr(server.worktree, "prune_stale", prune)
+    # The FastAPI lifespan also boots a real tmux server; stub it so a
+    # TestClient(server.app) under these tests never spawns one.
+    monkeypatch.setattr(server, "_ensure_tmux_server", AsyncMock())
+    return type("WT", (), {"resolve_base": resolve, "add": add,
+                           "remove": remove, "prune_stale": prune})
+
+
+def _stub_tmux_spawn(monkeypatch, session: "server.AgySession") -> None:
+    """Stub the tmux/agy mechanics of _spawn so only the worktree path is live.
+
+    _build_command runs unchanged (we want its --add-dir grant), but tmux calls
+    and the ready-wait become no-ops, and the conversation stays unresolved (as
+    it really is until the first send).
+    """
+    monkeypatch.setattr(server, "_tmux", AsyncMock(return_value=(0, "")))
+
+    async def _ready():
+        return None
+
+    monkeypatch.setattr(session, "_wait_ready", _ready)
+
+
+# --- (b) spawn cuts a worktree pinned to the resolved base ------------------
+
+class TestSpawnWorktree:
+    def test_spawn_resolves_base_then_adds_worktree(self, mock_worktree, monkeypatch):
+        """POST-equivalent first spawn of 'svc@dev' resolves 'dev' then adds the
+        worktree at the safe_name cwd; tmux session also uses safe_name."""
+        sess = server.AgySession(name="svc@dev")
+        _stub_tmux_spawn(monkeypatch, sess)
+
+        _run(sess._spawn())
+
+        # resolve_base called with the parsed base, NOT the whole key.
+        mock_worktree.resolve_base.assert_awaited_once_with("dev")
+        # add() pinned the cwd to the ref resolve_base returned.
+        expected_cwd = sess.cwd
+        mock_worktree.add.assert_awaited_once_with(expected_cwd, "origin/dev")
+
+        # The cwd path and tmux session are both derived via safe_name(self.name)
+        # — the raw '@' key would be unsafe in a path component / tmux name.
+        safe = server.worktree.safe_name("svc@dev")
+        assert safe in str(sess.cwd)
+        assert "svc@dev" not in str(sess.cwd)  # raw key never leaks into the path
+        assert sess.tmux_session == f"agy-{safe}"
+
+    def test_build_command_grants_the_worktree_dir(self, mock_worktree):
+        """_build_command appends '--add-dir <cwd>' so the read-only agent may
+        read THIS session's worktree (the static env grant points elsewhere)."""
+        sess = server.AgySession(name="svc@dev")
+        cmd = sess._build_command()
+        assert "--add-dir" in cmd
+        assert str(sess.cwd) in cmd
+
+    def test_spawn_without_base_raises_defensive_guard(self, mock_worktree, monkeypatch):
+        """_spawn is gated at /chat, but defends itself: a baseless key raises
+        before any worktree is cut."""
+        sess = server.AgySession(name="nobase")
+        _stub_tmux_spawn(monkeypatch, sess)
+        with pytest.raises(RuntimeError, match="no base branch"):
+            _run(sess._spawn())
+        mock_worktree.resolve_base.assert_not_awaited()
+        mock_worktree.add.assert_not_awaited()
+
+
+# --- (a) branchless POST /chat -> 200, message, NOTHING spawned ------------
+# --- (d) invalid branch -> conversational message --------------------------
+
+class TestChatBranchGating:
+    def test_branchless_chat_returns_needs_branch_and_spawns_nothing(
+        self, mock_worktree, monkeypatch
+    ):
+        """POST /chat/<name> with no @base returns 200 carrying NEEDS_BRANCH_MSG
+        and never touches get_or_create / worktree.add — nothing is spawned."""
+        got_or_create = AsyncMock()
+        monkeypatch.setattr(server.manager, "get_or_create", got_or_create)
+
+        with TestClient(server.app) as client:
+            r = client.post("/chat/plainname", json={"prompt": "hi"})
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["response"] == server.worktree.NEEDS_BRANCH_MSG.format(name="plainname")
+        assert body["session"] == "plainname"
+        assert body["turn"] == 0
+        # The whole point: no session machinery ran.
+        got_or_create.assert_not_awaited()
+        mock_worktree.add.assert_not_awaited()
+        mock_worktree.resolve_base.assert_not_awaited()
+
+    def test_invalid_branch_surfaces_as_conversational_200(
+        self, mock_worktree, monkeypatch
+    ):
+        """A bad branch (resolve_base raising RuntimeError, surfaced through
+        get_or_create) comes back as a 200 carrying the message, NOT a 5xx, so
+        the calling agent can self-correct."""
+        msg = "Base branch 'nope' not found in /app/slitled-platform. Name an existing branch."
+        monkeypatch.setattr(
+            server.manager, "get_or_create",
+            AsyncMock(side_effect=RuntimeError(msg)),
+        )
+
+        with TestClient(server.app) as client:
+            r = client.post("/chat/svc@nope", json={"prompt": "hi"})
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["response"] == msg
+        assert body["session"] == "svc@nope"
+        assert body["turn"] == 0
+
+    def test_slash_base_key_routes_with_full_key(self, mock_worktree, monkeypatch):
+        """A key whose base carries a '/' ("q@origin/dev") must ROUTE (200, not
+        404) thanks to {name:path}, and the handler must receive the WHOLE key —
+        the '/' is part of the base, not a path boundary. Guards the {name:path}
+        route fix."""
+        sess = server.AgySession(name="q@origin/dev")
+        monkeypatch.setattr(sess, "send", AsyncMock(return_value="pong"))
+        got_or_create = AsyncMock(return_value=sess)
+        monkeypatch.setattr(server.manager, "get_or_create", got_or_create)
+
+        with TestClient(server.app) as client:
+            r = client.post("/chat/q@origin/dev", json={"prompt": "hi"})
+
+        assert r.status_code == 200, r.text  # NOT 404 — slash-base key routed
+        # The handler got the full key, slash and all — not a truncated prefix.
+        got_or_create.assert_awaited_once_with("q@origin/dev")
+        assert r.json()["session"] == "q@origin/dev"
+
+    def test_genuine_startup_failure_still_5xx(self, mock_worktree, monkeypatch):
+        """A non-branch RuntimeError (e.g. tmux spawn failure) keeps its 503 —
+        only branch/worktree/repo errors are softened to a conversational 200."""
+        monkeypatch.setattr(
+            server.manager, "get_or_create",
+            AsyncMock(side_effect=RuntimeError("tmux new-session failed: boom")),
+        )
+        with TestClient(server.app) as client:
+            r = client.post("/chat/svc@dev", json={"prompt": "hi"})
+        assert r.status_code == 503, r.text
+
+    def test_send_branch_error_also_conversational(self, mock_worktree, monkeypatch):
+        """The first send can trigger a respawn whose resolve_base fails; that
+        branch error is conversational too, not a 502."""
+        sess = server.AgySession(name="svc@gone")
+        msg = "Base branch 'gone' not found in worktree repo."
+        monkeypatch.setattr(server.manager, "get_or_create", AsyncMock(return_value=sess))
+        monkeypatch.setattr(sess, "send", AsyncMock(side_effect=RuntimeError(msg)))
+
+        with TestClient(server.app) as client:
+            r = client.post("/chat/svc@gone", json={"prompt": "hi"})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["response"] == msg
+
+
+# --- (c) reset and DELETE both tear down the worktree ----------------------
+
+class TestWorktreeTeardown:
+    def test_reset_removes_then_respawns(self, mock_worktree, monkeypatch):
+        """reset() drops the current generation's worktree (between _kill and
+        _spawn) before cutting a fresh one."""
+        sess = server.AgySession(name="svc@dev")
+        monkeypatch.setattr(sess, "_kill", AsyncMock())
+        monkeypatch.setattr(sess, "_spawn", AsyncMock())
+
+        cwd_at_reset = sess.cwd
+        _run(sess.reset())
+
+        mock_worktree.remove.assert_awaited_once_with(cwd_at_reset)
+
+    def test_clear_removes_then_respawns(self, mock_worktree, monkeypatch):
+        """clear() also tears down the worktree before respawning."""
+        sess = server.AgySession(name="svc@dev")
+        monkeypatch.setattr(sess, "is_alive", AsyncMock(return_value=True))
+        monkeypatch.setattr(sess, "_kill", AsyncMock())
+        monkeypatch.setattr(sess, "_spawn", AsyncMock())
+
+        cwd_at_clear = sess.cwd
+        _run(sess.clear())
+
+        mock_worktree.remove.assert_awaited_once_with(cwd_at_clear)
+
+    def test_delete_removes_session_worktree(self, mock_worktree, monkeypatch):
+        """DELETE /chat/{name} (ChatManager.remove) removes the worktree after
+        stopping the session."""
+        mgr = server.ChatManager()
+        sess = server.AgySession(name="svc@dev")
+        mgr._sessions["svc@dev"] = sess
+        monkeypatch.setattr(sess, "stop", AsyncMock())
+
+        assert _run(mgr.remove("svc@dev")) is True
+        mock_worktree.remove.assert_awaited_once_with(sess.cwd)
+
+    def test_stop_all_removes_each_worktree(self, mock_worktree, monkeypatch):
+        """stop_all removes EVERY session's worktree, one per session."""
+        mgr = server.ChatManager()
+        s1 = server.AgySession(name="a@dev")
+        s2 = server.AgySession(name="b@main")
+        mgr._sessions.update({"a@dev": s1, "b@main": s2})
+        monkeypatch.setattr(s1, "stop", AsyncMock())
+        monkeypatch.setattr(s2, "stop", AsyncMock())
+
+        assert _run(mgr.stop_all()) == 2
+        removed = {c.args[0] for c in mock_worktree.remove.await_args_list}
+        assert removed == {s1.cwd, s2.cwd}
+
+
+# --- (e) _NAME regex accepts plain and '@base' keys, rejects junk ----------
+
+class TestNameRegex:
+    @staticmethod
+    def _matches(name: str) -> bool:
+        import re
+        # Mirror the validator's anchored full-string match.
+        return re.fullmatch(r"^[A-Za-z0-9_-]+(@[A-Za-z0-9._/-]+)?$", name) is not None
+
+    def test_accepts_plain_name(self):
+        assert self._matches("name")
+
+    def test_accepts_name_with_remote_base(self):
+        assert self._matches("name@origin/dev")
+
+    def test_accepts_name_with_simple_base(self):
+        assert self._matches("svc@dev")
+
+    def test_rejects_space_and_bang(self):
+        assert not self._matches("bad name!")
+
+    def test_endpoint_accepts_at_base_key_over_http(self, mock_worktree, monkeypatch):
+        """The relaxed regex lets a '<name>@<base>' key through the path
+        validator. Uses a slash-free base ('svc@dev'): the '@' alone would 422
+        under the old alnum-only pattern (a '/' is a URL path separator and so
+        is a routing concern, not a validator one)."""
+        # A recognized branch error so the handler softens it to a conversational
+        # 200; the point of THIS test is only that '@base' passed path validation
+        # (not 422), which a 200 here proves.
+        msg = "Base branch 'dev' not found in /app/slitled-platform."
+        monkeypatch.setattr(
+            server.manager, "get_or_create",
+            AsyncMock(side_effect=RuntimeError(msg)),
+        )
+        with TestClient(server.app) as client:
+            r = client.post("/chat/svc@dev", json={"prompt": "hi"})
+        # 200 (conversational), NOT 422 — the '@base' key passed path validation.
+        assert r.status_code == 200, r.text
 

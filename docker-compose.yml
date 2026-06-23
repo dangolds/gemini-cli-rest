@@ -41,6 +41,10 @@ services:
       - LOG_DIR=/app/logs                  # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
       - GIT_SSH_COMMAND=ssh -F /dev/null
+      # Repo each session cuts its per-session DETACHED worktree from. Matches the
+      # clone mounted above; a session named e.g. q@dev reads a worktree pinned to
+      # origin/dev. Defaults to this path in code too; set explicit for clarity.
+      - WORKTREE_REPO=/app/slitled-platform
       # Grant both CLIs read/write access to the clone (agy already trusts /app
       # via entrypoint.sh; codex needs the explicit --add-dir since sessions run
       # in their own per-session cwd):
