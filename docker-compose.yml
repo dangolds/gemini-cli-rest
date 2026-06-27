@@ -7,8 +7,8 @@ services:
     restart: unless-stopped
     init: true                       # tini as PID 1: reaps zombies (agy's tmux daemon reparents here)
     ports:
-      - "8000:8000"   # agy / Gemini
-      - "8001:8001"   # codex / gpt-5.5
+      - "8002:8000"   # agy / Gemini   — host 8002 (rental-dash bridge; internal port unchanged)
+      - "8003:8001"   # codex / gpt-5.5 — host 8003 (rental-dash bridge; internal port unchanged)
     volumes:
       - agy-config:/root/.gemini    # agy auth + settings persist
       # codex gets its OWN independent login in this volume — run `codex login`
@@ -19,14 +19,14 @@ services:
       - codex-config:/root/.codex   # codex auth + config + sessions (container-only)
       - ~/.ssh:/root/.ssh:ro
       - ./logs:/app/logs            # bridge logs + per-incident timeout dumps (host-readable)
-      # The slitled-platform clone lives at /app/slitled-platform INSIDE the
-      # container. Without this volume that path is in the image's ephemeral
-      # layer, so every rebuild/recreate wipes it and forces a re-clone. A
-      # Docker-managed named volume mounted there makes the clone persist across
-      # rebuilds — fully SEPARATE from the host filesystem (nothing on the
-      # laptop). Clone into it ONCE from inside the container:
-      #   docker compose exec bridges git clone <url> /app/slitled-platform
-      - slitled-platform:/app/slitled-platform   # container-only clone, persists across rebuilds
+      # The rental-dash clone lives at /app/rental-dash INSIDE the container.
+      # Without this volume that path is in the image's ephemeral layer, so every
+      # rebuild/recreate wipes it and forces a re-clone. A Docker-managed named
+      # volume mounted there makes the clone persist across rebuilds — fully
+      # SEPARATE from the host filesystem (nothing on the laptop). Clone the repo
+      # into it ONCE from inside the container:
+      #   docker compose exec bridges git clone <url> /app/rental-dash
+      - rental-dash:/app/rental-dash   # container-only clone, persists across rebuilds
     environment:
       # Both bridges: a turn ends on inactivity (stall) OR the hard cap,
       # whichever first. Hard cap is 3 minutes — a request never blocks longer.
@@ -44,14 +44,14 @@ services:
       # Repo each session cuts its per-session DETACHED worktree from. Matches the
       # clone mounted above; a session named e.g. q@dev reads a worktree pinned to
       # origin/dev. Defaults to this path in code too; set explicit for clarity.
-      - WORKTREE_REPO=/app/slitled-platform
+      - WORKTREE_REPO=/app/rental-dash
       # Grant both CLIs read/write access to the clone (agy already trusts /app
       # via entrypoint.sh; codex needs the explicit --add-dir since sessions run
       # in their own per-session cwd):
-      - AGY_EXTRA_ARGS=--add-dir /app/slitled-platform
-      - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
+      - AGY_EXTRA_ARGS=--add-dir /app/rental-dash
+      - CODEX_EXTRA_ARGS=--add-dir /app/rental-dash
 
 volumes:
   agy-config:
   codex-config:   # container's OWN codex login + config + sessions (independent; never seeded from host)
-  slitled-platform:   # container-only clone at /app/slitled-platform; persists across rebuilds, never on the host
+  rental-dash:   # container-only clone at /app/rental-dash; persists across rebuilds, never on the host
