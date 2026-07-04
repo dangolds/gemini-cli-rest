@@ -105,6 +105,10 @@ class TestParsing:
 def fastpoll(monkeypatch):
     monkeypatch.setattr(codex_server, "RESPONSE_POLL_INTERVAL", 0.02)
     monkeypatch.setattr(codex_server, "RESPONSE_MIN_WAIT", 0.0)
+    # These tests pin the legacy fallback path: wake fast and run the full
+    # check on every wake, so the notify cadence knobs can't starve it.
+    monkeypatch.setattr(codex_server, "RESPONSE_FAST_POLL", 0.02)
+    monkeypatch.setattr(codex_server, "RESPONSE_FULL_CHECK_EVERY", 1)
 
 
 def _collect_session(monkeypatch, *, events, screen="idle  Context 0% used", mtime=0.0):
