@@ -125,9 +125,14 @@ CODEX_NOTIFY = os.getenv("CODEX_NOTIFY", "1").strip().lower() not in ("0", "fals
 NOTIFY_DIR = FsPath(os.getenv("CODEX_NOTIFY_DIR", "/tmp/codex-rest-notify"))
 NOTIFY_LOG = NOTIFY_DIR / "events.jsonl"
 NOTIFY_HOOK = NOTIFY_DIR / "notify-hook.sh"
-# Wake-up cadence for the cheap notify glance. The expensive work (full rollout
-# re-parse + tmux liveness capture) keeps RESPONSE_POLL_INTERVAL's cadence.
-RESPONSE_FAST_POLL = float(os.getenv("CODEX_RESPONSE_FAST_POLL", "0.1"))
+# Wake-up cadence for the cheap notify glance, and how many of those wakes pass
+# between expensive checks (full rollout re-parse + tmux liveness capture:
+# 0.3s x 10 = every ~3s). The notify push carries the real-time signal, so the
+# lazier fallback costs a few seconds only when the push is missed, and buys
+# ~6x fewer rollout parses and captures. With CODEX_NOTIFY off the loop keeps
+# the legacy RESPONSE_POLL_INTERVAL cadence and these two knobs are unused.
+RESPONSE_FAST_POLL = float(os.getenv("CODEX_RESPONSE_FAST_POLL", "0.3"))
+RESPONSE_FULL_CHECK_EVERY = int(os.getenv("CODEX_RESPONSE_FULL_CHECK_EVERY", "10"))
 
 # Rendered-screen markers (read from tmux's emulated screen, never from the raw
 # escape stream, so these are stable plain-text strings). Correctness rides on
@@ -936,11 +941,11 @@ class CodexSession:
         last_progress = start
         last_mtime = self._rollout_mtime()
         last_starts = baseline_starts
-        # The notify fast path wakes the loop more often, but the expensive
-        # work (full rollout re-parse + a liveness _capture) keeps its
-        # RESPONSE_POLL_INTERVAL cadence — a dead process is detected exactly
-        # as quickly as before, with no faster-spinning tmux traffic.
-        last_full_check = start
+        # The notify fast path wakes the loop on its own cadence; the expensive
+        # work (full rollout re-parse + a liveness _capture) runs only every
+        # RESPONSE_FULL_CHECK_EVERY-th wake — the push carries the real-time
+        # signal, so the fallback can afford to be lazy.
+        wakes = 0
         last_seen_notifies = self._last_notify_baseline
 
         while True:
@@ -964,12 +969,10 @@ class CodexSession:
                 )
                 break
 
-            # min() defensively: a fast poll misconfigured slower than the base
-            # interval must never drop the loop below today's cadence.
             await asyncio.sleep(
-                min(RESPONSE_FAST_POLL, RESPONSE_POLL_INTERVAL) if CODEX_NOTIFY
-                else RESPONSE_POLL_INTERVAL
+                RESPONSE_FAST_POLL if CODEX_NOTIFY else RESPONSE_POLL_INTERVAL
             )
+            wakes += 1
 
             # Fast path: codex pushed its end-of-turn signal, so check the
             # rollout NOW instead of waiting out the poll interval. The push
@@ -998,12 +1001,11 @@ class CodexSession:
                         exit_reason = "notify"
                         break
 
-            # The expensive block below runs on the ORIGINAL poll cadence even
-            # when the fast path wakes the loop more often.
-            full_now = time.monotonic()
-            if full_now - last_full_check < RESPONSE_POLL_INTERVAL:
+            # The expensive block below (and the only liveness check — _capture
+            # raises if the process died) runs every RESPONSE_FULL_CHECK_EVERY-th
+            # wake when the push drives the cadence, every wake (legacy) otherwise.
+            if CODEX_NOTIFY and wakes % RESPONSE_FULL_CHECK_EVERY != 0:
                 continue
-            last_full_check = full_now
 
             events = _read_rollout(self._rollout_path)
             cur_completes = _count_task_completes(events)

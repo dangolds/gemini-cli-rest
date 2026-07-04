@@ -37,6 +37,10 @@ def _answer(idx, content="the answer"):
 def fastpoll(monkeypatch):
     monkeypatch.setattr(server, "RESPONSE_POLL_INTERVAL", 0.02)
     monkeypatch.setattr(server, "RESPONSE_MIN_WAIT", 0.0)
+    # These tests pin the legacy fallback path: wake fast and run the full
+    # check on every wake, so the bell cadence knobs can't starve it.
+    monkeypatch.setattr(server, "RESPONSE_FAST_POLL", 0.02)
+    monkeypatch.setattr(server, "RESPONSE_FULL_CHECK_EVERY", 1)
 
 
 def _session(monkeypatch, *, transcript, screen):

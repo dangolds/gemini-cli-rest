@@ -92,8 +92,14 @@ AGY_BELL = os.getenv("AGY_BELL", "1").strip().lower() not in ("", "0", "false", 
 # near-simultaneous rings, and needs no attached client).
 BELL_DIR = FsPath(os.getenv("AGY_BELL_DIR", "/tmp/agy-rest-bells"))
 # Cadence of the cheap bell-file check between full (transcript + screen)
-# polls; the expensive fallback keeps its RESPONSE_POLL_INTERVAL cadence.
-RESPONSE_FAST_POLL = float(os.getenv("RESPONSE_FAST_POLL", "0.1"))
+# polls, and how many of those wakes pass between expensive fallback checks
+# (0.3s x 10 = one full transcript+screen poll every ~3s). With the bell
+# carrying the real-time signal, a lazier fallback costs a few seconds of
+# worst-case latency only when the bell is missed, and buys ~6x fewer
+# transcript parses and pane captures. With AGY_BELL off the loop keeps the
+# legacy RESPONSE_POLL_INTERVAL cadence and these two knobs are unused.
+RESPONSE_FAST_POLL = float(os.getenv("RESPONSE_FAST_POLL", "0.3"))
+RESPONSE_FULL_CHECK_EVERY = int(os.getenv("RESPONSE_FULL_CHECK_EVERY", "10"))
 # After submitting, how long to wait for agy to *acknowledge* the turn (a new
 # transcript step appears, or the screen goes busy) before concluding the
 # submit Enter was dropped and re-pressing it. Kept deliberately generous: a
@@ -754,7 +760,7 @@ class AgySession:
         last_progress = start
         last_max_step = baseline
         last_mtime = self._transcript_mtime()
-        last_full_check = start
+        wakes = 0
         last_seen_bells = self._last_bell_baseline
 
         while True:
@@ -783,9 +789,10 @@ class AgySession:
             # is defensive: never wake SLOWER than the configured poll); with
             # it off, keep exactly the legacy cadence.
             if AGY_BELL:
-                await asyncio.sleep(min(RESPONSE_FAST_POLL, RESPONSE_POLL_INTERVAL))
+                await asyncio.sleep(RESPONSE_FAST_POLL)
             else:
                 await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+            wakes += 1
 
             if AGY_BELL:
                 cur_bells = self._bell_count()
@@ -820,11 +827,11 @@ class AgySession:
                             break
 
             # The expensive fallback (transcript + screen capture, and the
-            # only liveness check — _capture raises if the process died) keeps
-            # its own RESPONSE_POLL_INTERVAL cadence under the faster wakeups.
-            if time.monotonic() - last_full_check < RESPONSE_POLL_INTERVAL:
+            # only liveness check — _capture raises if the process died) runs
+            # every RESPONSE_FULL_CHECK_EVERY-th wake when the bell drives the
+            # cadence, and on every wake (legacy) with the bell off.
+            if AGY_BELL and wakes % RESPONSE_FULL_CHECK_EVERY != 0:
                 continue
-            last_full_check = time.monotonic()
 
             steps = _read_transcript(self._conversation_id)
             responses = _new_responses(steps, baseline)

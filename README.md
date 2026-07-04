@@ -249,7 +249,8 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `RESPONSE_POLL_INTERVAL` | `0.5` | Seconds between completion-detection polls (fallback path) |
 | `AGY_BELL` | `1` | Use agy's end-of-turn terminal bell as the fast done-signal; set to `0` to disable and revert to pure polling |
 | `AGY_BELL_DIR` | `/tmp/agy-rest-bells` | Directory where the tmux `alert-bell` hook records bells (one file per tmux session) |
-| `RESPONSE_FAST_POLL` | `0.1` | Seconds between checks of the bell file while a turn is in flight |
+| `RESPONSE_FAST_POLL` | `0.3` | Seconds between checks of the bell file while a turn is in flight |
+| `RESPONSE_FULL_CHECK_EVERY` | `10` | Run the full fallback poll (transcript + screen) every Nth bell-check wake (~3s) |
 | `RESPONSE_STALL_TIMEOUT` | `90` | Give up if agy makes no progress (idle, transcript not growing) for this long |
 | `RESPONSE_HARD_TIMEOUT` | `180` | Absolute hard cap on a turn (3 min), regardless of progress |
 | `RESPONSE_SLOW_DUMP_SECS` | `90` | Write a diagnostic dump for any turn slower than this (even successful ones) |
@@ -257,7 +258,7 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `LOG_DIR` | `/app/logs` | Rolling logs + per-incident dumps written here (mounted to `./logs`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
-The codex bridge (port 8001) shares this tmux architecture and has matching, `CODEX_`-prefixed knobs — `CODEX_RESPONSE_HARD_TIMEOUT` (`180`), `CODEX_RESPONSE_STALL_TIMEOUT` (`90`), `CODEX_STARTUP_TIMEOUT` (`60`), `CODEX_SLOW_DUMP_SECS` (`90`), `CODEX_TMUX_SOCKET` (`codex-rest`) — and shares `LOG_DIR` / `LOG_LEVEL`. Its completion-push equivalent is codex's `notify` hook rather than a bell: `CODEX_NOTIFY` (`1`, set `0` to revert to pure polling), `CODEX_NOTIFY_DIR` (`/tmp/codex-rest-notify`), `CODEX_RESPONSE_FAST_POLL` (`0.1`). See [CODEX.md](CODEX.md) and [Logs & diagnostics](#logs--diagnostics).
+The codex bridge (port 8001) shares this tmux architecture and has matching, `CODEX_`-prefixed knobs — `CODEX_RESPONSE_HARD_TIMEOUT` (`180`), `CODEX_RESPONSE_STALL_TIMEOUT` (`90`), `CODEX_STARTUP_TIMEOUT` (`60`), `CODEX_SLOW_DUMP_SECS` (`90`), `CODEX_TMUX_SOCKET` (`codex-rest`) — and shares `LOG_DIR` / `LOG_LEVEL`. Its completion-push equivalent is codex's `notify` hook rather than a bell: `CODEX_NOTIFY` (`1`, set `0` to revert to pure polling), `CODEX_NOTIFY_DIR` (`/tmp/codex-rest-notify`), `CODEX_RESPONSE_FAST_POLL` (`0.3`), `CODEX_RESPONSE_FULL_CHECK_EVERY` (`10`). See [CODEX.md](CODEX.md) and [Logs & diagnostics](#logs--diagnostics).
 
 The model is **not** selected per-request — set `"model"` in agy's `settings.json` (`~/.gemini/antigravity-cli/settings.json`).
 
@@ -289,7 +290,7 @@ Each named session owns a live `agy` process hosted in a detached **tmux** sessi
 
 1. **Input** — prompts are injected with `tmux load-buffer` + `paste-buffer -p` (bracketed paste), so newlines and TUI shortcut characters (`!`, `@`, `/`, backticks) always arrive as literal text.
 2. **Response content** — read from agy's structured per-conversation transcript (`brain/<conversation>/.system_generated/logs/transcript.jsonl`), not scraped off the screen. The bridge takes the completed (`DONE`) model steps that appeared after the prompt was sent.
-3. **Completion push (bell)** — the primary done-signal. With `"notifications": true` in agy's `settings.json` (the entrypoint seeds it; the server also ensures it at startup), agy rings a terminal **bell** at end of turn, 0–43ms *after* the answer is flushed to the transcript. A server-global tmux `alert-bell` hook appends a timestamped line to `AGY_BELL_DIR/<tmux-session>`; the bridge checks that file every `RESPONSE_FAST_POLL` (0.1s) and, on a new bell past the turn's baseline, reads the transcript immediately, with a single busy-glance at the pane confirming the ring wasn't a stray mid-turn bell — no idle-marker match, no debounce. `/last` also accepts bell-evidence in place of the idle-screen check.
+3. **Completion push (bell)** — the primary done-signal. With `"notifications": true` in agy's `settings.json` (the entrypoint seeds it; the server also ensures it at startup), agy rings a terminal **bell** at end of turn, 0–43ms *after* the answer is flushed to the transcript. A server-global tmux `alert-bell` hook appends a timestamped line to `AGY_BELL_DIR/<tmux-session>`; the bridge checks that file every `RESPONSE_FAST_POLL` (0.3s) and, on a new bell past the turn's baseline, reads the transcript immediately, with a single busy-glance at the pane confirming the ring wasn't a stray mid-turn bell — no idle-marker match, no debounce. `/last` also accepts bell-evidence in place of the idle-screen check.
 4. **Busy/idle detection (fallback)** — `tmux capture-pane` returns the *rendered* screen (no ANSI escapes); if the bell is missed (or `AGY_BELL=0`), a turn is complete when a new model step exists in the transcript **and** the screen shows the idle status bar (`? for shortcuts`) with no `Generating...` indicator. A missed bell degrades to this slower path, never to a hung request.
 
 You can watch any session live while the bridge drives it:

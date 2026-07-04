@@ -37,7 +37,7 @@ mistaken for a stall.
 `-c 'notify=["<hook>"]'`; codex runs the hook on `agent-turn-complete` with a
 JSON payload (thread-id, turn-id, cwd, last-assistant-message), and the hook
 appends it to `CODEX_NOTIFY_DIR/events.jsonl`. The bridge checks that small
-file every `CODEX_RESPONSE_FAST_POLL` (0.1s) and, on a matching new event,
+file every `CODEX_RESPONSE_FAST_POLL` (0.3s) and, on a matching new event,
 reads the rollout once and returns — the rollout stays the single source of
 truth for the answer text. The `task_complete` polling above is retained as
 fallback: a missed notification degrades to slower, never to hung. (`[tui]`
@@ -133,7 +133,8 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_RESPONSE_STALL_TIMEOUT` | `90` | Give up after this long with no progress (idle, rollout not growing) |
 | `CODEX_NOTIFY` | `1` | Use codex's `notify` hook as the fast done-signal; set to `0` to disable and revert to pure rollout polling |
 | `CODEX_NOTIFY_DIR` | `/tmp/codex-rest-notify` | Directory where the notify hook appends `events.jsonl` |
-| `CODEX_RESPONSE_FAST_POLL` | `0.1` | Seconds between checks of the notify events file while a turn is in flight |
+| `CODEX_RESPONSE_FAST_POLL` | `0.3` | Seconds between checks of the notify events file while a turn is in flight |
+| `CODEX_RESPONSE_FULL_CHECK_EVERY` | `10` | Run the full fallback poll (rollout + liveness) every Nth notify-check wake (~3s) |
 | `CODEX_STARTUP_TIMEOUT` | `60` | Max wait for the TUI to reach its idle prompt |
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
 | `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |
