@@ -20,6 +20,13 @@ turn boundaries. A turn is `event_msg/task_started{turn_id}` ... a sequence of
 arrival of a NEW task_complete is a definitive done-signal (no screen-scrape
 debounce), and `last_agent_message` is the final answer text.
 
+Completion detection is polling-first with a push fast path: when enabled,
+codex's `notify` hook appends an end-of-turn event to a shared file the moment
+a turn finishes, telling the bridge to check the rollout NOW instead of waiting
+out a poll interval. The rollout stays the sole authority on completion and
+answer text; with the fast path off (CODEX_NOTIFY=0) the polling behaves
+exactly as before.
+
 The REST contract is identical to the agy bridge (server.py).
 """
 
@@ -27,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import time
 import uuid
@@ -105,6 +113,21 @@ SESSION_DETECT_TIMEOUT = float(os.getenv("CODEX_SESSION_DETECT_TIMEOUT", "20"))
 # /last read-back: cap how long a single /last?wait=N call may block, so it
 # never holds the client longer than a /chat would (same hard ceiling).
 LAST_MAX_WAIT = float(os.getenv("CODEX_LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
+
+# Push-based end-of-turn signal (fast path). codex's `notify` hook runs a
+# program the moment a turn completes, passing the turn's summary JSON as
+# argv[1]; a tiny shell hook appends that payload to NOTIFY_LOG, which tells
+# _collect_response to check the rollout the instant codex finishes instead of
+# waiting out a full poll interval. Strictly an accelerator: the rollout stays
+# the single source of truth for completion AND answer text, and with
+# CODEX_NOTIFY off the collect loop is exactly today's polling.
+CODEX_NOTIFY = os.getenv("CODEX_NOTIFY", "1").strip().lower() not in ("0", "false", "no", "")
+NOTIFY_DIR = FsPath(os.getenv("CODEX_NOTIFY_DIR", "/tmp/codex-rest-notify"))
+NOTIFY_LOG = NOTIFY_DIR / "events.jsonl"
+NOTIFY_HOOK = NOTIFY_DIR / "notify-hook.sh"
+# Wake-up cadence for the cheap notify glance. The expensive work (full rollout
+# re-parse + tmux liveness capture) keeps RESPONSE_POLL_INTERVAL's cadence.
+RESPONSE_FAST_POLL = float(os.getenv("CODEX_RESPONSE_FAST_POLL", "0.1"))
 
 # Rendered-screen markers (read from tmux's emulated screen, never from the raw
 # escape stream, so these are stable plain-text strings). Correctness rides on
@@ -225,6 +248,55 @@ async def _ensure_tmux_server() -> None:
         stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Notify fast-path wiring
+# ---------------------------------------------------------------------------
+
+def _notify_hook_safe() -> bool:
+    """Whether NOTIFY_HOOK's path may be wired into codex at all.
+
+    The path is interpolated VERBATIM into the `-c notify=["<path>"]` TOML
+    override — there is no TOML escaping — so a quote or backslash from a
+    creative CODEX_NOTIFY_DIR would make codex reject its whole config and
+    exit, burning the startup timeout and turning every /chat into a 503.
+    Refuse anything outside a conservative charset; both the lifespan hook
+    install and _build_command consult this, so an unsafe path degrades to
+    pure polling, the documented fallback.
+    """
+    if re.fullmatch(r"[A-Za-z0-9_./-]+", str(NOTIFY_HOOK)):
+        return True
+    logger.warning(
+        "Notify fast path disabled (CODEX_NOTIFY_DIR yields hook path %r with "
+        "characters unsafe for the TOML notify override) — polling fallback only",
+        str(NOTIFY_HOOK),
+    )
+    return False
+
+
+def _install_notify_hook() -> None:
+    """Install the hook codex runs at end of turn (lifespan, best-effort).
+
+    Stale events are dropped: sessions live only in this process's memory, so
+    a previous run's events can never match a current turn — they are pure
+    noise. Failure is non-fatal: without the hook the fast path simply never
+    fires and the polling fallback carries every turn, exactly as before.
+    """
+    if not _notify_hook_safe():
+        return
+    try:
+        NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+        NOTIFY_LOG.unlink(missing_ok=True)
+        NOTIFY_HOOK.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$1\" >> {shlex.quote(str(NOTIFY_LOG))}\n",
+            encoding="utf-8",
+        )
+        NOTIFY_HOOK.chmod(0o755)
+        logger.info("Notify fast path enabled (hook=%s)", NOTIFY_HOOK)
+    except OSError as exc:
+        logger.warning("Could not install notify hook: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +471,20 @@ class CodexSession:
     # /last uses it to tell THIS turn's answer apart from a previous one: a new
     # task_complete beyond this baseline means your submitted turn has finished.
     _last_baseline_completes: int = field(default=0, init=False)
+    # Notify-event count captured when the most recent turn was submitted — the
+    # push-signal twin of _last_baseline_completes: a NOTIFY_LOG count beyond it
+    # means codex has signaled end-of-turn for THIS turn, not an earlier one.
+    _last_notify_baseline: int = field(default=0, init=False)
+    # Incremental cursor into the shared NOTIFY_LOG: byte offset of the first
+    # unconsumed byte, and the running count of events matched up to it. The
+    # log grows for the whole server run (each event embeds the turn's full
+    # input messages), so a glance must read only the newly appended bytes —
+    # never re-parse the whole file at every fast-poll wake.
+    _notify_pos: int = field(default=0, init=False)
+    _notify_matched: int = field(default=0, init=False)
+    # How the most recent turn's collection ended (exit_reason); /chat surfaces
+    # it as `via`, so fast-path health is visible per response.
+    _last_exit_reason: str | None = field(default=None, init=False)
     # Every spawn gets a fresh generation directory (and a brand-new codex
     # session), which is what makes clear/reset a true context wipe.
     _generation: int = field(default=0, init=False)
@@ -447,6 +533,13 @@ class CodexSession:
         # codex's flag is --add-dir <DIR> ("Additional directories that should be
         # writable alongside the primary workspace") — same name as agy's.
         parts.extend(["--add-dir", str(self.cwd)])
+        if CODEX_NOTIFY and _notify_hook_safe():
+            # End-of-turn push signal: codex runs NOTIFY_HOOK with the turn's
+            # summary JSON as argv[1] the moment a turn completes. -c takes a
+            # TOML value, so the inline array must stay ONE argv part —
+            # shlex.join() below quotes it for the shell. ('[tui] notifications'
+            # would be useless here: its OSC 9 emits nothing in a detached pane.)
+            parts.extend(["-c", f'notify=["{NOTIFY_HOOK}"]'])
         return shlex.join(parts)
 
     async def start(self) -> None:
@@ -587,6 +680,13 @@ class CodexSession:
         self._session_id = None
         self._turn_count = 0
         self._last_baseline_completes = 0
+        self._last_notify_baseline = 0
+        # Notify matching is evaluated at parse time, against the generation
+        # that was live when the bytes were consumed — so a respawn restarts
+        # the scan: the next send() re-baselines fresh, and the dead
+        # generation's events (old cwd, unbound session id) no longer match.
+        self._notify_pos = 0
+        self._notify_matched = 0
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -652,6 +752,10 @@ class CodexSession:
                 # First message: codex creates the rollout when it receives the
                 # turn. Submit under the spawn lock so the new file is
                 # attributable to this session, then resolve it.
+                # The notify baseline publishes BEFORE the submit (mirroring
+                # _last_baseline_completes): only events appended after this
+                # point may fast-path the turn.
+                self._last_notify_baseline = self._notify_count()
                 async with _SPAWN_LOCK:
                     before = {str(p) for p in _rollout_files()}
                     await self._submit(prompt)
@@ -671,9 +775,11 @@ class CodexSession:
                 events = _read_rollout(self._rollout_path)
                 baseline_completes = _count_task_completes(events)
                 baseline_starts = _count_task_starts(events)
-                # Publish the baseline BEFORE submitting, so a /last arriving
-                # while this turn runs reads the right turn boundary.
+                # Publish the baselines BEFORE submitting, so a /last arriving
+                # while this turn runs reads the right turn boundary — and a
+                # notify event from an earlier turn can never fast-path this one.
                 self._last_baseline_completes = baseline_completes
+                self._last_notify_baseline = self._notify_count()
                 await self._submit_confirmed(prompt, baseline_starts)
 
             response = await self._collect_response(baseline_completes, baseline_starts)
@@ -747,6 +853,62 @@ class CodexSession:
         except (OSError, AttributeError):
             return 0.0
 
+    def _notify_count(self) -> int:
+        """Count end-of-turn notify events that belong to THIS session.
+
+        NOTIFY_LOG is shared by every session and only ever grows during a
+        server run (each event embeds the turn's full input messages), so the
+        count is kept INCREMENTALLY: a glance reads only the bytes appended
+        past _notify_pos and folds new matches into _notify_matched — never a
+        full re-parse at every fast-poll wake. Events are matched to us by cwd
+        (the per-generation dir is unique, so it works before the first turn
+        binds a session id) or by thread-id (codex's session id, matched once
+        bound). A missing file means no events yet (cursor resets); a shrunken
+        file was truncated/rotated, so the scan restarts from the top; a
+        partially-written trailing line is left unconsumed — the next glance
+        gets it whole.
+        """
+        try:
+            size = NOTIFY_LOG.stat().st_size
+        except OSError:
+            self._notify_pos = 0
+            self._notify_matched = 0
+            return 0
+        if size < self._notify_pos:  # truncated/rotated underneath us
+            self._notify_pos = 0
+            self._notify_matched = 0
+        if size == self._notify_pos:
+            return self._notify_matched
+        try:
+            with open(NOTIFY_LOG, "rb") as f:
+                f.seek(self._notify_pos)
+                chunk = f.read(size - self._notify_pos)
+        except OSError:
+            return self._notify_matched
+        # Consume only complete lines: the hook's appends are line-atomic, so
+        # anything past the last newline is a write still in flight.
+        consumed = chunk.rfind(b"\n") + 1
+        if consumed == 0:
+            return self._notify_matched
+        self._notify_pos += consumed
+        want_cwd = str(self.cwd)
+        for raw in chunk[:consumed].splitlines():
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict) or ev.get("type") != "agent-turn-complete":
+                continue
+            if ev.get("cwd") == want_cwd or (
+                self._session_id is not None
+                and ev.get("thread-id") == self._session_id
+            ):
+                self._notify_matched += 1
+        return self._notify_matched
+
     async def _collect_response(self, baseline_completes: int, baseline_starts: int) -> str:
         """Poll until the turn completes, then return the new model text.
 
@@ -760,6 +922,13 @@ class CodexSession:
         for ~90s — is never mistaken for a stall. We give up only after
         RESPONSE_STALL_TIMEOUT of genuine no-progress, or RESPONSE_HARD_TIMEOUT
         absolute.
+
+        With CODEX_NOTIFY on, codex's notify hook pushes an end-of-turn event
+        the moment a turn finishes, so the loop wakes at RESPONSE_FAST_POLL and
+        confirms against the rollout immediately instead of waiting out a full
+        poll interval. The push is an accelerator only: completion still
+        requires the new task_complete in the rollout, and with the feature off
+        (or the signal never arriving) the loop is exactly the polling above.
         """
         start = time.monotonic()
         response = ""
@@ -767,6 +936,12 @@ class CodexSession:
         last_progress = start
         last_mtime = self._rollout_mtime()
         last_starts = baseline_starts
+        # The notify fast path wakes the loop more often, but the expensive
+        # work (full rollout re-parse + a liveness _capture) keeps its
+        # RESPONSE_POLL_INTERVAL cadence — a dead process is detected exactly
+        # as quickly as before, with no faster-spinning tmux traffic.
+        last_full_check = start
+        last_seen_notifies = self._last_notify_baseline
 
         while True:
             now = time.monotonic()
@@ -789,7 +964,46 @@ class CodexSession:
                 )
                 break
 
-            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+            # min() defensively: a fast poll misconfigured slower than the base
+            # interval must never drop the loop below today's cadence.
+            await asyncio.sleep(
+                min(RESPONSE_FAST_POLL, RESPONSE_POLL_INTERVAL) if CODEX_NOTIFY
+                else RESPONSE_POLL_INTERVAL
+            )
+
+            # Fast path: codex pushed its end-of-turn signal, so check the
+            # rollout NOW instead of waiting out the poll interval. The push
+            # never completes the turn by itself — the answer must already be
+            # durable in the rollout, exactly like the polling path below.
+            if CODEX_NOTIFY:
+                cur_notifies = self._notify_count()
+                # Progress crediting is EDGE-triggered (a NEW event since the
+                # last look): the log is append-only and the baseline fixed,
+                # so crediting on "any event past baseline" would stay true
+                # for the rest of the turn — one stray event would disable
+                # the stall detector and leave only the hard cap. The push can
+                # beat the task_complete flush by a hair (or arrive inside
+                # RESPONSE_MIN_WAIT): an event with no task_complete yet IS
+                # progress — one event buys one stall window, no more.
+                if cur_notifies > last_seen_notifies:
+                    last_progress = now
+                    last_seen_notifies = cur_notifies
+                # Completion stays LEVEL-triggered: any event past the submit
+                # baseline belongs to this turn, however long ago it landed.
+                if cur_notifies > self._last_notify_baseline:
+                    events = _read_rollout(self._rollout_path)
+                    if _count_task_completes(events) > baseline_completes \
+                            and elapsed >= RESPONSE_MIN_WAIT:
+                        response = _answer_for_new_turn(events, baseline_completes)
+                        exit_reason = "notify"
+                        break
+
+            # The expensive block below runs on the ORIGINAL poll cadence even
+            # when the fast path wakes the loop more often.
+            full_now = time.monotonic()
+            if full_now - last_full_check < RESPONSE_POLL_INTERVAL:
+                continue
+            last_full_check = full_now
 
             events = _read_rollout(self._rollout_path)
             cur_completes = _count_task_completes(events)
@@ -811,15 +1025,20 @@ class CodexSession:
                 break
 
         total = time.monotonic() - start
+        self._last_exit_reason = exit_reason
         logger.info(
             "Session '%s': response complete via %s (%.1fs, %d chars)",
             self.name, exit_reason, total, len(response),
         )
-        if exit_reason != "rollout_done" or total > RESPONSE_SLOW_DUMP_SECS:
+        # Both "rollout_done" and "notify" are clean completions ("notify" is
+        # just the faster route to the same rollout evidence) — dump only on a
+        # timeout, or on a slow-but-successful turn.
+        if exit_reason not in ("rollout_done", "notify") or total > RESPONSE_SLOW_DUMP_SECS:
             # Snapshot screen + rollout tail for later investigation — on any
             # timeout, and on a slow-but-successful turn so we can see WHERE the
             # time went (the rollout events are timestamped).
-            dump_reason = exit_reason if exit_reason != "rollout_done" else "slow_success"
+            dump_reason = exit_reason if exit_reason not in ("rollout_done", "notify") \
+                else "slow_success"
             await self._dump_diagnostic(dump_reason, baseline_completes, total, response)
         return response
 
@@ -859,6 +1078,10 @@ class CodexSession:
                 f"rollout={self._rollout_path}",
                 f"baseline_completes={baseline} elapsed={elapsed:.1f}s "
                 f"response_len={len(response)} total_events={len(events)}",
+                # Fast-path state: a count stuck AT the baseline on a timed-out
+                # turn means codex never pushed its end-of-turn signal.
+                f"notify_count={self._notify_count()} "
+                f"notify_baseline={self._last_notify_baseline}",
                 f"\n=== last {len(tail)} of {len(signal)} events "
                 f"(token_count filtered; {len(events)} total) ===",
             ]
@@ -1042,6 +1265,8 @@ async def lifespan(app: FastAPI):
     # container restart while the repo's worktree registry survives in the named
     # volume, so drop registry entries whose checkouts vanished.
     await worktree.prune_stale()
+    if CODEX_NOTIFY:
+        _install_notify_hook()
     logger.info("Server starting (sessions will be created on demand)")
     yield
     logger.info("Shutting down — stopping all sessions...")
@@ -1115,6 +1340,10 @@ class ChatResponse(BaseModel):
     session: str
     turn: int
     elapsed_ms: int
+    # How the turn's completion was detected ("notify" push vs "rollout_done"
+    # poll, or a timeout reason) — observability only; null when no turn ran
+    # (branchless guard / branch errors answer conversationally without one).
+    via: str | None = None
 
 class LastResponse(BaseModel):
     done: bool          # True only if the most recent turn has FINISHED
@@ -1201,6 +1430,7 @@ async def chat(req: ChatRequest, name: str = _NAME):
         session=name,
         turn=session.turn_count,
         elapsed_ms=elapsed,
+        via=session._last_exit_reason,
     )
 
 

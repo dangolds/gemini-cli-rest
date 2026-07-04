@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import time
 import uuid
@@ -79,6 +80,20 @@ RESPONSE_HARD_TIMEOUT = float(
 # slow-but-fine turn's transcript (timestamped steps — where the time went) is
 # captured, not just outright timeouts.
 RESPONSE_SLOW_DUMP_SECS = float(os.getenv("RESPONSE_SLOW_DUMP_SECS", "90"))
+# End-of-turn bell fast path. agy (with "notifications" enabled in its
+# settings.json) rings the terminal BEL exactly once per turn, 0-43ms AFTER the
+# final answer is flushed to the transcript — so a recorded bell is a cheap
+# "the answer is durable now" signal. It only ACCELERATES detection: completion
+# still requires the answer in the transcript past the submit baseline, and
+# with this switch off the collection loop runs exactly as it did before.
+AGY_BELL = os.getenv("AGY_BELL", "1").strip().lower() not in ("", "0", "false", "no")
+# Where tmux's alert-bell hook appends one timestamp line per ring, in a file
+# named after the ringing tmux session (attribution is per-session even for
+# near-simultaneous rings, and needs no attached client).
+BELL_DIR = FsPath(os.getenv("AGY_BELL_DIR", "/tmp/agy-rest-bells"))
+# Cadence of the cheap bell-file check between full (transcript + screen)
+# polls; the expensive fallback keeps its RESPONSE_POLL_INTERVAL cadence.
+RESPONSE_FAST_POLL = float(os.getenv("RESPONSE_FAST_POLL", "0.1"))
 # After submitting, how long to wait for agy to *acknowledge* the turn (a new
 # transcript step appears, or the screen goes busy) before concluding the
 # submit Enter was dropped and re-pressing it. Kept deliberately generous: a
@@ -197,6 +212,10 @@ async def _ensure_tmux_server() -> None:
     Under uvloop, a pipe inherited by that daemon is never seen as closed,
     which would hang the first session spawn — so the daemon is started here
     with DEVNULL stdio. "exit-empty off" keeps it alive with zero sessions.
+
+    With AGY_BELL on, this also arms the bell fast path: agy rings BEL at end
+    of turn, and a tmux alert-bell hook records each ring as one line in a
+    per-session file under BELL_DIR.
     """
     proc = await asyncio.create_subprocess_exec(
         TMUX_BIN, "-L", TMUX_SOCKET,
@@ -206,6 +225,39 @@ async def _ensure_tmux_server() -> None:
         stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
+
+    if not AGY_BELL:
+        return
+    # BELL_DIR reaches the hook UNQUOTED through two shell layers (tmux
+    # run-shell, then sh): a space silently breaks the append (arming still
+    # "succeeds", no line is ever written) and $()/backticks would execute on
+    # every ring. Refuse anything outside a conservative charset — unarmed
+    # means the polling fallback carries every turn, the documented degrade.
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", str(BELL_DIR)):
+        logger.warning(
+            "Bell fast path not armed (AGY_BELL_DIR %r contains characters "
+            "unsafe for the tmux run-shell hook) — polling fallback only",
+            str(BELL_DIR),
+        )
+        return
+    # The hook is server-global (-g), so it survives the kill-session /
+    # new-session cycles of clear/reset and needs arming only once. '#{...}'
+    # must reach tmux LITERALLY: tmux expands it per ring, which is what
+    # attributes each bell to the session that rang it. Best-effort — without
+    # the hook every turn still completes via the polling fallback.
+    try:
+        BELL_DIR.mkdir(parents=True, exist_ok=True)
+        hook = f'run-shell "date +%s.%N >> {BELL_DIR}/#{{session_name}}"'
+        for args in (
+            ("set", "-g", "bell-action", "any"),
+            ("set", "-wg", "monitor-bell", "on"),
+            ("set-hook", "-g", "alert-bell", hook),
+        ):
+            rc, out = await _tmux(*args)
+            if rc != 0:
+                raise RuntimeError(f"tmux {' '.join(args[:2])} failed: {out.strip()}")
+    except (OSError, RuntimeError) as exc:
+        logger.warning("Bell fast path not armed (%s) — polling fallback only", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +365,14 @@ class AgySession:
     # submitted. /last uses it to tell THIS turn's answer apart from a previous
     # one: a new completed PLANNER_RESPONSE beyond this step is your turn's.
     _last_baseline_step: int = field(default=-1, init=False)
+    # Bell count when the most recent turn was submitted, mirroring
+    # _last_baseline_step's role: only a bell BEYOND it belongs to this turn,
+    # so a previous turn's ring can never complete the current one.
+    _last_bell_baseline: int = field(default=0, init=False)
+    # How the most recent turn's collection loop ended ("bell",
+    # "transcript_done", "stalled", "hard_timeout"); surfaced to callers as
+    # ChatResponse.via. None until the first turn has run.
+    _last_exit_reason: str | None = field(default=None, init=False)
     # agy keeps cross-conversation memory per project (working directory):
     # new conversations receive summaries of previous ones and the agent can
     # read their transcripts. Every spawn therefore gets a fresh generation
@@ -386,6 +446,11 @@ class AgySession:
         logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
         await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
+        # A fresh process must not inherit a previous run's end-of-turn bells.
+        try:
+            self.bell_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         rc, out = await _tmux(
             "new-session", "-d",
             "-s", self.tmux_session,
@@ -409,6 +474,7 @@ class AgySession:
         self._conversation_id = None
         self._turn_count = 0
         self._last_baseline_step = -1
+        self._last_bell_baseline = 0
         logger.info("Session '%s' ready", self.name)
 
     async def _wait_ready(self) -> None:
@@ -466,9 +532,14 @@ class AgySession:
         rc, _ = await _tmux("kill-session", "-t", self._target)
         if rc == 0:
             logger.info("Killed tmux session %s", self.tmux_session)
+        try:
+            self.bell_file.unlink(missing_ok=True)  # a dead process's bells are stale
+        except OSError:
+            pass
         self._conversation_id = None
         self._turn_count = 0
         self._last_baseline_step = -1
+        self._last_bell_baseline = 0
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -510,6 +581,27 @@ class AgySession:
     def _is_busy(screen: str) -> bool:
         return any(m in screen for m in BUSY_MARKERS)
 
+    # --- Bell access ---------------------------------------------------------
+
+    @property
+    def bell_file(self) -> FsPath:
+        # The tmux hook keys its files by TMUX session name; tmux_session is
+        # already safe_name()-sanitized, so this is a single path component.
+        return BELL_DIR / self.tmux_session
+
+    def _bell_count(self) -> int:
+        """Number of end-of-turn bells recorded for this tmux session.
+
+        Counts complete lines only — the hook appends one line per ring, so a
+        half-written line is a ring still being recorded. A missing file or
+        read error is simply "no bells yet": the polling fallback owns
+        correctness, the bell only accelerates it.
+        """
+        try:
+            return self.bell_file.read_bytes().count(b"\n")
+        except OSError:
+            return 0
+
     # --- Chat ----------------------------------------------------------------
 
     async def send(self, prompt: str) -> str:
@@ -537,6 +629,9 @@ class AgySession:
                 # attributable to this session, then resolve the id.
                 async with _SPAWN_LOCK:
                     before = set(_brain_dirs())
+                    # Publish the bell baseline BEFORE submitting, for the same
+                    # reason as _last_baseline_step: /last may race this turn.
+                    self._last_bell_baseline = self._bell_count()
                     await self._submit(prompt)
                     self._conversation_id = await self._detect_new_conversation(before)
                 logger.info(
@@ -549,9 +644,10 @@ class AgySession:
                 self._last_baseline_step = baseline
             else:
                 baseline = _max_step(_read_transcript(self._conversation_id))
-                # Publish the baseline BEFORE submitting, so a /last arriving
+                # Publish the baselines BEFORE submitting, so a /last arriving
                 # while this turn runs reads the right turn boundary.
                 self._last_baseline_step = baseline
+                self._last_bell_baseline = self._bell_count()
                 await self._submit_confirmed(prompt, baseline)
 
             response = await self._collect_response(baseline)
@@ -636,6 +732,15 @@ class AgySession:
         transcript AND the rendered screen is idle (covers multi-step turns
         with tool calls), for two consecutive polls (debounce).
 
+        With AGY_BELL on, a cheap check runs between those full polls: agy
+        rings BEL exactly once per turn, only AFTER the final answer is flushed
+        to the transcript, and the tmux hook records the ring in the bell file.
+        A new ring past the submit baseline plus the answer past the baseline,
+        confirmed by a single not-busy glance at the screen, end the turn with
+        no READY_MARKER match and no debounce. The bell never completes a turn
+        by itself, and with AGY_BELL off the loop runs exactly as it did
+        without it.
+
         We do NOT cut a turn off on a flat wall-clock: agy can legitimately
         work for minutes (reading files, running commands, streaming a long
         answer). Instead we track progress — a busy screen, or the transcript
@@ -649,6 +754,8 @@ class AgySession:
         last_progress = start
         last_max_step = baseline
         last_mtime = self._transcript_mtime()
+        last_full_check = start
+        last_seen_bells = self._last_bell_baseline
 
         while True:
             now = time.monotonic()
@@ -672,7 +779,52 @@ class AgySession:
                 )
                 break
 
-            await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+            # With the bell armed, wake often for the cheap file check (min()
+            # is defensive: never wake SLOWER than the configured poll); with
+            # it off, keep exactly the legacy cadence.
+            if AGY_BELL:
+                await asyncio.sleep(min(RESPONSE_FAST_POLL, RESPONSE_POLL_INTERVAL))
+            else:
+                await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
+            if AGY_BELL:
+                cur_bells = self._bell_count()
+                # Progress crediting is EDGE-triggered (a NEW ring since the
+                # last look): the file is append-only and the baseline fixed,
+                # so crediting on "any ring past baseline" would stay true for
+                # the rest of the turn — one stray bell would disable the
+                # stall detector and leave only the hard cap. One ring buys
+                # one stall window, no more.
+                if cur_bells > last_seen_bells:
+                    # The bell can beat the final transcript flush by a few
+                    # tens of ms. A ring with no answer yet IS progress — keep
+                    # looping; the next fast poll picks the flushed answer up.
+                    last_progress = now
+                    last_seen_bells = cur_bells
+                # Completion stays LEVEL-triggered: any ring past the submit
+                # baseline belongs to this turn, however long ago it landed.
+                if cur_bells > self._last_bell_baseline:
+                    responses = _new_responses(
+                        _read_transcript(self._conversation_id), baseline
+                    )
+                    if responses and elapsed >= RESPONSE_MIN_WAIT:
+                        # One busy-glance confirms the ring: tmux records ANY
+                        # pane bell, so a stray mid-turn BEL plus an
+                        # intermediate DONE step must not end a multi-step
+                        # turn early with a partial answer. No READY_MARKER
+                        # match (the bell must not depend on the idle marker
+                        # string) and no debounce; busy means keep looping.
+                        screen = await self._capture()  # raises if process died
+                        if not self._is_busy(screen):
+                            exit_reason = "bell"
+                            break
+
+            # The expensive fallback (transcript + screen capture, and the
+            # only liveness check — _capture raises if the process died) keeps
+            # its own RESPONSE_POLL_INTERVAL cadence under the faster wakeups.
+            if time.monotonic() - last_full_check < RESPONSE_POLL_INTERVAL:
+                continue
+            last_full_check = time.monotonic()
 
             steps = _read_transcript(self._conversation_id)
             responses = _new_responses(steps, baseline)
@@ -698,15 +850,16 @@ class AgySession:
                 confirm = 0
 
         total = time.monotonic() - start
+        self._last_exit_reason = exit_reason  # surfaced as ChatResponse.via
         logger.info(
             "Session '%s': response complete via %s (%.1fs, %d message(s))",
             self.name, exit_reason, total, len(responses),
         )
-        if exit_reason != "transcript_done" or total > RESPONSE_SLOW_DUMP_SECS:
+        if exit_reason not in ("transcript_done", "bell") or total > RESPONSE_SLOW_DUMP_SECS:
             # Snapshot screen + transcript tail for later investigation — on any
             # timeout, and on a slow-but-successful turn so we can see WHERE the
             # time went (the transcript steps are timestamped).
-            dump_reason = exit_reason if exit_reason != "transcript_done" else "slow_success"
+            dump_reason = exit_reason if exit_reason not in ("transcript_done", "bell") else "slow_success"
             await self._dump_timeout_diagnostic(dump_reason, baseline, total, responses)
         return "\n\n".join(responses).strip()
 
@@ -741,6 +894,10 @@ class AgySession:
                 f"transcript={_transcript_path(self._conversation_id)}",
                 f"baseline={baseline} elapsed={elapsed:.1f}s "
                 f"collected_messages={len(responses)} total_steps={len(steps)}",
+                # bell_count vs baseline shows whether the fast path's signal
+                # ever arrived — a missed/failed bell is diagnosable from here.
+                f"bell_enabled={AGY_BELL} bell_count={self._bell_count()} "
+                f"bell_baseline={self._last_bell_baseline}",
                 f"\n=== last {len(tail)} of {len(signal)} steps "
                 f"(EPHEMERAL_MESSAGE filtered; {len(steps)} total) ===",
             ]
@@ -772,18 +929,27 @@ class AgySession:
     async def last(self, wait: float) -> tuple[bool, str, int]:
         """Re-read the most recent turn's answer — only once it is done.
 
-        Read-only and LOCK-FREE: it reads the transcript for the answer and only
-        GLANCES at the rendered screen to confirm agy has stopped working — so
+        Read-only and LOCK-FREE: it GLANCES at the rendered screen to confirm
+        agy has stopped working, then reads the transcript for the answer — so
         it can recover an answer a /chat call never received (a 3-min hard cap,
         or a connectivity blip) while the turn keeps running in the warm process.
 
         Unlike codex, agy's transcript carries NO in-flight marker — every step
         is written already-DONE — so "finished" cannot be read from the file
-        alone; it is decided by the idle screen, exactly as _collect_response
-        does. done=True therefore needs BOTH a new completed answer past the
-        submit baseline AND an idle (or gone) process. Otherwise done=False with
-        no text, so a still-working turn never yields a partial, and a previous
-        turn's answer is never returned in place of one that has not landed.
+        alone. Two signals can decide it: the end-of-turn bell (agy rings once
+        per turn, only after the final answer is flushed; the tmux hook makes
+        the ring durable in the bell file, so it still counts long after the
+        turn ended), or — bell disabled or never recorded — the idle screen,
+        exactly as _collect_response falls back to. done=True therefore needs
+        BOTH a new completed answer past the submit baseline AND one of those
+        end-of-turn signals. Otherwise done=False with no text, so a
+        still-working turn never yields a partial, and a previous turn's answer
+        is never returned in place of one that has not landed.
+
+        Ordering constraint: the evidence is established FIRST, the transcript
+        is read for the answer SECOND. The other way around, a final flush +
+        ring landing between the two reads would validate a stale partial
+        transcript read as done=True.
 
         Returns (done, answer, turn). With wait>0 it polls up to `wait` seconds.
         """
@@ -791,20 +957,26 @@ class AgySession:
         while True:
             cid = self._conversation_id
             baseline = self._last_baseline_step
-            if cid is not None:
+            if cid is not None and await self._turn_over_evidence():
                 responses = _new_responses(_read_transcript(cid), baseline)
-                if responses and await self._idle_or_gone():
+                if responses:
                     return True, "\n\n".join(responses).strip(), self._turn_count
             if time.monotonic() >= deadline:
                 return False, "", self._turn_count
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
 
-    async def _idle_or_gone(self) -> bool:
-        """True if agy is at its idle prompt, or the process is gone.
+    async def _turn_over_evidence(self) -> bool:
+        """True once agy can no longer be mid-turn: the process is gone, a
+        recorded bell past the turn's baseline is confirmed by a not-busy
+        screen, or the screen shows the plain idle prompt.
 
         A content-bearing DONE planner response is itself complete, so a dead
         process still has a final answer; only a *live* process that is still
-        generating means "not done yet".
+        generating means "not done yet". A single capture serves both live
+        signals — the bell needs only "not busy" (never the idle marker
+        string; tmux records ANY pane bell, so a busy screen means the ring
+        was stray/mid-turn), while the bell-less fallback needs READY_MARKER
+        exactly as _collect_response does.
         """
         if not await self.is_alive():
             return True
@@ -812,7 +984,11 @@ class AgySession:
             screen = await self._capture()
         except RuntimeError:
             return True  # died between the check and the capture
-        return READY_MARKER in screen and not self._is_busy(screen)
+        if self._is_busy(screen):
+            return False
+        if AGY_BELL and self._bell_count() > self._last_bell_baseline:
+            return True
+        return READY_MARKER in screen
 
     def next_attempt(self) -> int:
         """Increment and return this turn's /last poll count (observability)."""
@@ -935,10 +1111,44 @@ manager = ChatManager()
 # ---------------------------------------------------------------------------
 
 
+def _ensure_agy_notifications() -> None:
+    """Flip agy's settings to emit the end-of-turn bell the fast path rides on.
+
+    Only edits an EXISTING, parseable settings.json: seeding is the
+    entrypoint's job, and creating a partial file here would suppress that
+    seed. The write is atomic (tmp file + os.replace) so agy can never observe
+    a half-written settings file. Best-effort — on failure no bell ever rings
+    and the polling fallback carries every turn.
+    """
+    path = AGY_STATE_DIR / "settings.json"
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("agy notifications not ensured (%s: %s)", path, exc)
+        return
+    if not isinstance(settings, dict):
+        logger.warning("agy notifications not ensured (%s is not a JSON object)", path)
+        return
+    if settings.get("notifications") is True:
+        return
+    settings["notifications"] = True
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        logger.info("Enabled agy end-of-turn notifications in %s", path)
+    except OSError as exc:
+        logger.warning("Could not enable agy notifications in %s: %s", path, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Sessions are created lazily. On shutdown, stop all."""
     await _ensure_tmux_server()
+    if AGY_BELL:
+        # Before any session spawns: a session started against a bell-less
+        # settings.json would never ring for its whole lifetime.
+        _ensure_agy_notifications()
     # Startup hygiene: the ephemeral SESSIONS_ROOT under /tmp is wiped on
     # container restart while the repo's worktree registry survives in the named
     # volume, so drop registry entries whose checkouts vanished.
@@ -1014,6 +1224,9 @@ class ChatResponse(BaseModel):
     session: str
     turn: int
     elapsed_ms: int
+    # How completion was detected ("bell", "transcript_done", "stalled",
+    # "hard_timeout"); null for conversational replies that never ran a turn.
+    via: str | None = None
 
 class LastResponse(BaseModel):
     done: bool          # True only if the most recent turn has FINISHED
@@ -1098,6 +1311,7 @@ async def chat(req: ChatRequest, name: str = _NAME):
         session=name,
         turn=session.turn_count,
         elapsed_ms=elapsed,
+        via=session._last_exit_reason,
     )
 
 

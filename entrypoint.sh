@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Seed agy settings on first run: auto-approve tool permissions and trust the
-# session workspaces so the TUI never blocks on an interactive prompt.
+# Seed agy settings on first run: auto-approve tool permissions, trust the
+# session workspaces so the TUI never blocks on an interactive prompt, and
+# enable notifications — the end-of-turn BEL the bridge's bell fast path rides.
 AGY_DIR=/root/.gemini/antigravity-cli
 SETTINGS="$AGY_DIR/settings.json"
 mkdir -p "$AGY_DIR"
@@ -11,7 +12,7 @@ if [ ! -f "$SETTINGS" ]; then
 {
   "toolPermission": "always-proceed",
   "enableTelemetry": false,
-  "notifications": false,
+  "notifications": true,
   "trustedWorkspaces": ["/app", "/repos", "/tmp/agy-rest-sessions"]
 }
 EOF

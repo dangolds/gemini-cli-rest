@@ -20,7 +20,8 @@ the CLI's own on-disk transcript — never by scraping the raw escape stream.
 | Process model | one **live** `agy` per session, hosted in tmux | one **live** `codex` per session, hosted in tmux |
 | Continuity | the warm process holds context in memory | the warm process holds context in memory |
 | Transcript read | `brain/<id>/.../transcript.jsonl` | `~/.codex/sessions/.../rollout-*.jsonl` |
-| "Done" detection | new DONE model step + idle screen (debounced) | a new `task_complete` event (definitive) |
+| Completion push (fast path) | terminal bell via tmux `alert-bell` hook | codex `notify` hook → `events.jsonl` |
+| "Done" detection (fallback) | new DONE model step + idle screen (debounced) | a new `task_complete` event (definitive) |
 | Context wipe (`/clear`) | respawn in a fresh project dir | respawn in a fresh working dir |
 | On crash/restart | next turn starts fresh | next turn starts fresh |
 
@@ -31,6 +32,19 @@ end-of-turn signal (no screen-scrape debounce), and `last_agent_message` is the
 final answer. A turn that has *started* but not yet *completed* counts as
 in-flight, so a long pure-reasoning turn that writes nothing for ~90s is never
 mistaken for a stall.
+
+**Completion push (fast path).** The bridge launches codex with
+`-c 'notify=["<hook>"]'`; codex runs the hook on `agent-turn-complete` with a
+JSON payload (thread-id, turn-id, cwd, last-assistant-message), and the hook
+appends it to `CODEX_NOTIFY_DIR/events.jsonl`. The bridge checks that small
+file every `CODEX_RESPONSE_FAST_POLL` (0.1s) and, on a matching new event,
+reads the rollout once and returns — the rollout stays the single source of
+truth for the answer text. The `task_complete` polling above is retained as
+fallback: a missed notification degrades to slower, never to hung. (`[tui]`
+notifications / OSC 9 is *not* used — it emits nothing in a detached tmux
+pane.) `/chat` responses report the path taken in an optional `"via"` field:
+`"notify"` on the fast path, otherwise the legacy exit reasons
+(`"rollout_done"`, `"stalled"`, `"hard_timeout"`).
 
 **Why a warm process** (rather than the simpler `codex exec` per turn): it keeps
 conversation context in-process across turns and mirrors the agy bridge
@@ -117,6 +131,9 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_CMD` | `codex` | Path to the codex binary |
 | `CODEX_RESPONSE_HARD_TIMEOUT` | `180` | Absolute max per turn — a request never blocks longer (3 min) |
 | `CODEX_RESPONSE_STALL_TIMEOUT` | `90` | Give up after this long with no progress (idle, rollout not growing) |
+| `CODEX_NOTIFY` | `1` | Use codex's `notify` hook as the fast done-signal; set to `0` to disable and revert to pure rollout polling |
+| `CODEX_NOTIFY_DIR` | `/tmp/codex-rest-notify` | Directory where the notify hook appends `events.jsonl` |
+| `CODEX_RESPONSE_FAST_POLL` | `0.1` | Seconds between checks of the notify events file while a turn is in flight |
 | `CODEX_STARTUP_TIMEOUT` | `60` | Max wait for the TUI to reach its idle prompt |
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
 | `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |

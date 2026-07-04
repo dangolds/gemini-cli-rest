@@ -692,6 +692,9 @@ class TestWorktreeBranching:
         sess = AsyncMock()
         sess.send = AsyncMock(return_value="ok")
         sess.turn_count = 1
+        # Real sessions carry str|None here; a bare Mock attribute would fail
+        # the response model's `via` validation and turn the 200 into a 500.
+        sess._last_exit_reason = "notify"
         goc = AsyncMock(return_value=sess)
         monkeypatch.setattr(codex_server.manager, "get_or_create", goc)
 

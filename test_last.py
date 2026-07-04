@@ -259,7 +259,7 @@ class TestAgyLast:
     def test_capture_error_mid_check_counts_as_done(self, agy_fastpoll, monkeypatch):
         # The pane vanishes right as we glance at it (process died between the
         # is_alive check and the capture). A DONE answer is already complete, so
-        # _idle_or_gone treats the dead pane as "not working" and returns it.
+        # _turn_over_evidence treats the dead pane as "not working" and returns it.
         def boom():
             raise RuntimeError("pane gone")
 
