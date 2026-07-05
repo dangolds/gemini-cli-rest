@@ -22,7 +22,7 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 BASE = "http://127.0.0.1:8001"
-# codex can be slow — first turn spawns the TUI in tmux, plus xhigh reasoning +
+# codex can be slow — first turn spawns the TUI in tmux, plus high reasoning +
 # model response time per turn.
 TIMEOUT = 300.0
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Seed codex config on first run: full-access auto-approve + xhigh reasoning so
+# Seed codex config on first run: full-access auto-approve + high reasoning so
 # the interactive TUI never blocks on an approval/sandbox prompt. Only seed if
 # absent — the codex-config volume persists auth.json + config.toml (and the
 # one-time `codex login`) across container restarts.
@@ -11,7 +11,7 @@ mkdir -p "$CODEX_DIR"
 if [ ! -f "$CONFIG" ]; then
     cat > "$CONFIG" <<'EOF'
 model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 EOF

@@ -50,14 +50,14 @@ pane.) `/chat` responses report the path taken in an optional `"via"` field:
 conversation context in-process across turns and mirrors the agy bridge
 one-to-one, so a single skill drives both bridges identically.
 
-## Configuration (auto-approve + xhigh)
+## Configuration (auto-approve + high reasoning)
 
 `entrypoint-codex.sh` seeds `/root/.codex/config.toml` on first run (only if
 absent) so the interactive TUI never blocks on an approval or sandbox prompt:
 
 ```toml
 model = "gpt-5.5"
-model_reasoning_effort = "xhigh"   # maximum reasoning
+model_reasoning_effort = "high"    # high (not xhigh: ~5x slower for consults)
 approval_policy = "never"          # never pause for approval
 sandbox_mode = "danger-full-access" # the container is the sandbox
 ```
