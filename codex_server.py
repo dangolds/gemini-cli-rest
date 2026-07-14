@@ -58,6 +58,11 @@ CODEX_CMD = os.getenv("CODEX_CMD", "codex")
 # Space-separated extra args appended to every codex invocation, e.g.
 # "--add-dir /repos" to grant read/write access to mounted repositories.
 CODEX_EXTRA_ARGS = os.getenv("CODEX_EXTRA_ARGS", "")
+# Reasoning effort. Passed per launch rather than left to config.toml: that file
+# lives in the persistent codex-config volume, the TUI rewrites it whenever the
+# model/effort is switched, and entrypoint-codex.sh only seeds it when absent —
+# so the file drifts and the seed never re-runs. The flag wins over it every time.
+CODEX_EFFORT = os.getenv("CODEX_EFFORT", "")
 
 TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
 # Dedicated tmux server socket, distinct from the agy bridge's ("agy-rest"), so
@@ -530,6 +535,10 @@ class CodexSession:
         #   sandbox; mirrors agy's "always-proceed"). Belt-and-suspenders with
         #   approval_policy=never + sandbox_mode=danger-full-access in config.toml.
         parts = [CODEX_CMD, "--dangerously-bypass-approvals-and-sandbox"]
+        if CODEX_EFFORT:
+            # -c takes a TOML value, so the string needs its own quotes inside
+            # the single argv part (same shape as the notify hook below).
+            parts.extend(["-c", f'model_reasoning_effort="{CODEX_EFFORT}"'])
         if CODEX_EXTRA_ARGS:
             parts.extend(shlex.split(CODEX_EXTRA_ARGS))
         # Grant codex read access to THIS session's per-run worktree. The static

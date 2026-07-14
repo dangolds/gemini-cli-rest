@@ -5,7 +5,7 @@ exposing named multi-session chat with conversation continuity. It is a sibling
 of the agy/Gemini bridge (`server.py`, see [README.md](README.md)) and exposes
 the **identical REST contract**, just on port **8001** instead of 8000.
 
-Use it to get a second opinion from `gpt-5.5` alongside Gemini.
+Use it to get a second opinion from codex's current flagship model alongside Gemini.
 
 ## How it works (same architecture as the agy bridge)
 
@@ -50,17 +50,25 @@ pane.) `/chat` responses report the path taken in an optional `"via"` field:
 conversation context in-process across turns and mirrors the agy bridge
 one-to-one, so a single skill drives both bridges identically.
 
-## Configuration (auto-approve + high reasoning)
+## Configuration (auto-approve + ultra reasoning)
 
 `entrypoint-codex.sh` seeds `/root/.codex/config.toml` on first run (only if
 absent) so the interactive TUI never blocks on an approval or sandbox prompt:
 
 ```toml
-model = "gpt-5.5"
-model_reasoning_effort = "high"    # high (not xhigh: ~5x slower for consults)
+# no `model` pin: codex uses its own default, which tracks the current
+# flagship (gpt-5.6-sol as of 2026-07). Pinning freezes you on an old model.
+model_reasoning_effort = "ultra"   # 4 parallel agents: ~4x token burn, faster time-to-result
 approval_policy = "never"          # never pause for approval
 sandbox_mode = "danger-full-access" # the container is the sandbox
 ```
+
+Do not rely on that seed for the effort. It only runs when `config.toml` is
+absent, and the file lives in the persistent `codex-config` volume — so once
+the volume exists the seed never runs again, while the TUI keeps rewriting the
+file whenever the model or effort is switched (it had silently drifted to
+`medium`). `CODEX_EFFORT` is therefore passed as `-c model_reasoning_effort=…`
+on every launch, which beats the file every time.
 
 Every `codex` process is also launched with
 `--dangerously-bypass-approvals-and-sandbox` as belt-and-suspenders — this also
@@ -139,6 +147,7 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
 | `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |
 | `CODEX_EXTRA_ARGS` | _(empty)_ | Extra flags for every `codex` process, e.g. `--add-dir /repos` |
+| `CODEX_EFFORT` | `ultra` | Reasoning effort, passed as `-c model_reasoning_effort=…` on every launch. Set here rather than in `config.toml`, which drifts (see [Configuration](#configuration-auto-approve--ultra-reasoning)) |
 | `CODEX_TMUX_SOCKET` | `codex-rest` | Dedicated tmux socket (distinct from agy's `agy-rest`) |
 | `SESSIONS_ROOT` | `/tmp/codex-rest-sessions` | Per-session working dirs |
 | `CODEX_HOME` | `~/.codex` | Where codex stores auth + sessions (rollouts are read from here) |

@@ -40,6 +40,11 @@ AGY_CMD = os.getenv("AGY_CMD", "agy")
 # Docker entrypoint seeds it); this flag is the per-process equivalent.
 AGY_SKIP_PERMISSIONS = os.getenv("AGY_SKIP_PERMISSIONS", "false").lower() == "true"
 AGY_EXTRA_ARGS = os.getenv("AGY_EXTRA_ARGS", "")  # space-separated extras
+# Reasoning effort is part of the model name in agy ("Gemini 3.1 Pro (High)" vs
+# "(Low)"; see `agy models`). Passed per session so it wins over whatever the
+# persisted settings.json happens to hold. Its own var, not AGY_EXTRA_ARGS:
+# the name has spaces and would not survive that var's whitespace split.
+AGY_MODEL = os.getenv("AGY_MODEL", "")
 
 TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
 # Dedicated tmux server socket so we never collide with a user's tmux.
@@ -430,6 +435,8 @@ class AgySession:
         parts = [AGY_CMD]
         if AGY_SKIP_PERMISSIONS:
             parts.append("--dangerously-skip-permissions")
+        if AGY_MODEL:
+            parts.extend(["--model", AGY_MODEL])
         if AGY_EXTRA_ARGS:
             parts.extend(AGY_EXTRA_ARGS.split())
         # Grant the read-only agent access to THIS session's worktree. The

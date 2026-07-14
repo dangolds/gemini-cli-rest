@@ -1,5 +1,5 @@
 services:
-  # Both bridges in ONE container: agy (Gemini) on :8000 and codex (gpt-5.5) on
+  # Both bridges in ONE container: agy (Gemini) on :8000 and codex (GPT) on
   # :8001, launched by entrypoint-all.sh (the image default). If either bridge
   # process dies, the container exits and is restarted, bringing both back.
   bridges:
@@ -8,7 +8,7 @@ services:
     init: true                       # tini as PID 1: reaps zombies (agy's tmux daemon reparents here)
     ports:
       - "8000:8000"   # agy / Gemini
-      - "8001:8001"   # codex / gpt-5.5
+      - "8001:8001"   # codex / GPT
     volumes:
       - agy-config:/root/.gemini    # agy auth + settings persist
       # codex gets its OWN independent login in this volume — run `codex login`
@@ -49,7 +49,15 @@ services:
       # via entrypoint.sh; codex needs the explicit --add-dir since sessions run
       # in their own per-session cwd):
       - AGY_EXTRA_ARGS=--add-dir /app/slitled-platform
+      # agy encodes reasoning effort in the model name (`agy models`): High, not
+      # the Low the persisted settings.json defaults to. Slower turns, better answers.
+      - AGY_MODEL=Gemini 3.1 Pro (High)
       - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
+      # Highest reasoning tier. Set here, not in config.toml: that file is in the
+      # persistent volume, the TUI rewrites it (it had drifted to "medium"), and
+      # the entrypoint only seeds it when absent — so the flag is the only thing
+      # that reliably sticks.
+      - CODEX_EFFORT=ultra
 
 volumes:
   agy-config:

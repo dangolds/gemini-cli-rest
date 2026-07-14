@@ -243,6 +243,7 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `AGY_CMD` | `agy` | Path to the agy CLI binary |
 | `AGY_SKIP_PERMISSIONS` | `false` | Pass `--dangerously-skip-permissions` to agy. Prefer `"toolPermission": "always-proceed"` in agy's `settings.json` (the Docker image seeds this) |
 | `AGY_EXTRA_ARGS` | | Additional CLI args (space-separated) |
+| `AGY_MODEL` | `Gemini 3.1 Pro (High)` | Passed as `--model` to every session. Reasoning effort is part of the model name in agy (`agy models` lists Low and High as separate entries), so this is how effort is set. Its own variable, not `AGY_EXTRA_ARGS`: the name contains spaces. Wins over the `model` in `settings.json`, which agy rewrites itself |
 | `AGY_STATE_DIR` | `~/.gemini/antigravity-cli` | agy's state directory (conversation transcripts live here) |
 | `SESSIONS_ROOT` | `/tmp/agy-rest-sessions` | Per-session working directories |
 | `TMUX_SOCKET` | `agy-rest` | Dedicated tmux server socket name |
