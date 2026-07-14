@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 
 import worktree
+import transcript_repair
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -87,6 +88,15 @@ RESPONSE_SLOW_DUMP_SECS = float(os.getenv("RESPONSE_SLOW_DUMP_SECS", "90"))
 # still requires the answer in the transcript past the submit baseline, and
 # with this switch off the collection loop runs exactly as it did before.
 AGY_BELL = os.getenv("AGY_BELL", "1").strip().lower() not in ("", "0", "false", "no")
+# agy's transcript.jsonl truncates any field over 4096 chars (2048 head + a
+# "<truncated N bytes>" marker + 2048 tail), and the answer is read from that
+# transcript — so a >4KB answer otherwise reaches the caller with a hole in the
+# MIDDLE. With this on, a truncated answer is re-read whole from agy's own
+# conversation DB and accepted only when it verifies byte-exactly; off, or on a
+# failed verify, the answer is delivered exactly as before (holed). See
+# transcript_repair.py. Purely a recovery layer — never blocks or alters a
+# healthy (untruncated) answer.
+AGY_REPAIR = os.getenv("AGY_REPAIR", "1").strip().lower() not in ("", "0", "false", "no")
 # Where tmux's alert-bell hook appends one timestamp line per ring, in a file
 # named after the ringing tmux session (attribution is per-session even for
 # near-simultaneous rings, and needs no attached client).
@@ -868,6 +878,8 @@ class AgySession:
             # time went (the transcript steps are timestamped).
             dump_reason = exit_reason if exit_reason not in ("transcript_done", "bell") else "slow_success"
             await self._dump_timeout_diagnostic(dump_reason, baseline, total, responses)
+        # Repair AFTER the diagnostic dump so the dump keeps the raw transcript view.
+        responses = self._repair_responses(responses)
         return "\n\n".join(responses).strip()
 
     async def _dump_timeout_diagnostic(
@@ -931,6 +943,42 @@ class AgySession:
                 "Session '%s': could not write timeout diagnostic: %s", self.name, exc
             )
 
+    def _repair_responses(self, responses: list[str]) -> list[str]:
+        """Restore any answer agy truncated in its transcript, from its own DB.
+
+        Called at delivery time, once per turn, ONLY on the elements that carry
+        agy's "<truncated N bytes>" marker — the healthy path pays just a regex
+        and never opens sqlite. Each element is repaired INDIVIDUALLY, before
+        any joining: a multi-step turn can yield several answers, and joining
+        first could put two markers in one string, which repair() refuses to
+        split. rep.text is always the best available text (verified-repaired or
+        the original), so it is safe to use unconditionally.
+        """
+        if not AGY_REPAIR or not self._conversation_id:
+            return responses
+        out: list[str] = []
+        for content in responses:
+            if not transcript_repair.TRUNCATION_MARKER.search(content):
+                out.append(content)
+                continue
+            rep = transcript_repair.repair(
+                content, self._conversation_id, AGY_STATE_DIR
+            )
+            if rep.repaired:
+                logger.warning(
+                    "Session '%s': transcript truncation detected (%d bytes "
+                    "elided) — repaired from conversation DB (%d -> %d chars)",
+                    self.name, rep.elided, rep.original_len, len(rep.text),
+                )
+            elif rep.holed:
+                logger.error(
+                    "Session '%s': transcript truncation (%d bytes elided) could "
+                    "NOT be repaired — response delivered with a hole",
+                    self.name, rep.elided,
+                )
+            out.append(rep.text)
+        return out
+
     # --- Read-back -----------------------------------------------------------
 
     async def last(self, wait: float) -> tuple[bool, str, int]:
@@ -967,6 +1015,7 @@ class AgySession:
             if cid is not None and await self._turn_over_evidence():
                 responses = _new_responses(_read_transcript(cid), baseline)
                 if responses:
+                    responses = self._repair_responses(responses)
                     return True, "\n\n".join(responses).strip(), self._turn_count
             if time.monotonic() >= deadline:
                 return False, "", self._turn_count

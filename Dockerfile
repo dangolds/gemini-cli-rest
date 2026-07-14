@@ -30,6 +30,7 @@ RUN python -m venv /app/.venv && \
 # each session with a detached, branch-pinned git worktree. Must be copied in or
 # the servers crash on `import worktree` at startup.
 COPY worktree.py .
+COPY transcript_repair.py .
 COPY server.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
