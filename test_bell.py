@@ -248,7 +248,7 @@ class TestSendCapturesBellBaseline:
             # the baseline must already be published when the prompt goes in
             seen["baseline_at_submit"] = sess._last_bell_baseline
 
-        async def detect(before):
+        async def detect(before, timeout=None, *, watch_verify=False):
             return "conv"
 
         monkeypatch.setattr(sess, "_submit", submit)

@@ -256,6 +256,8 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `RESPONSE_HARD_TIMEOUT` | `180` | Absolute hard cap on a turn (3 min), regardless of progress |
 | `RESPONSE_SLOW_DUMP_SECS` | `90` | Write a diagnostic dump for any turn slower than this (even successful ones) |
 | `STARTUP_TIMEOUT` | `60` | Max seconds to wait for CLI startup |
+| `VERIFY_RESUBMIT_MAX` | `3` | How many times a session's first prompt is re-pasted when agy's per-launch account-verification gate eats it (`⚠ Verifying your account...`); set to `0` to disable the recovery |
+| `VERIFY_RESUBMIT_DELAY` | `3.0` | Seconds to let the screen settle before a re-paste — and the grace a fresh submit gets before the (permanently displayed) notice may count as another drop |
 | `LOG_DIR` | `/app/logs` | Rolling logs + per-incident dumps written here (mounted to `./logs`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 

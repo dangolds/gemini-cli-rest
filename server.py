@@ -126,6 +126,16 @@ SUBMIT_MAX_RETRIES = int(os.getenv("SUBMIT_MAX_RETRIES", "2"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
+# agy verifies account eligibility once per process launch and, for a few
+# seconds after spawn, CONSUMES a prompt submitted during that window — it
+# answers with VERIFY_REJECT_MARKER instead of starting a turn, so no
+# transcript ever appears. How many times a session's first prompt may be
+# re-pasted when that happens, and how long to let the screen settle first —
+# the same delay is the grace a fresh submit gets before the (permanently
+# displayed) notice may count as another drop. VERIFY_RESUBMIT_MAX=0 disables
+# the recovery entirely.
+VERIFY_RESUBMIT_MAX = int(os.getenv("VERIFY_RESUBMIT_MAX", "3"))
+VERIFY_RESUBMIT_DELAY = float(os.getenv("VERIFY_RESUBMIT_DELAY", "3.0"))
 
 # /last read-back: cap how long a single /last?wait=N call may block, so it
 # never holds the client longer than a /chat would (same hard ceiling).
@@ -135,6 +145,7 @@ LAST_MAX_WAIT = float(os.getenv("LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 # raw escape stream, so these are stable plain-text strings).
 READY_MARKER = "? for shortcuts"          # idle status bar
 BUSY_MARKERS = ("Generating...", "esc to cancel")
+VERIFY_REJECT_MARKER = "Verifying your account"   # account-eligibility gate
 
 # tmux client commands are sub-second; anything longer means a stuck client.
 TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
@@ -519,7 +530,13 @@ class AgySession:
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
         raise RuntimeError(f"agy startup timed out after {STARTUP_TIMEOUT:.0f}s")
 
-    async def _detect_new_conversation(self, before: set[str]) -> str:
+    async def _detect_new_conversation(
+        self,
+        before: set[str],
+        timeout: float | None = None,
+        *,
+        watch_verify: bool = False,
+    ) -> str | None:
         """Wait for the new brain dir agy populates with this turn's transcript.
 
         agy also creates *empty* placeholder brain dirs that never receive a
@@ -529,9 +546,14 @@ class AgySession:
         "0 message(s)" while the TUI showed the reply within seconds. Keying on
         the transcript file — the artifact we actually poll — sidesteps the
         trap; if several real conversations appear, the newest transcript wins.
+
+        With *watch_verify* on, returns None as soon as the account-verification
+        gate has visibly eaten the prompt (see _submit_first) instead of waiting
+        out the whole window, so the caller can re-submit.
         """
         start = time.monotonic()
-        while time.monotonic() - start < CONVERSATION_DETECT_TIMEOUT:
+        window = CONVERSATION_DETECT_TIMEOUT if timeout is None else timeout
+        while time.monotonic() - start < window:
             candidates: dict[str, float] = {}
             for cid in _brain_dirs():
                 if cid in before:
@@ -542,6 +564,15 @@ class AgySession:
                     continue  # dir exists but no transcript yet — keep waiting
             if candidates:
                 return max(candidates, key=candidates.get)  # newest transcript wins
+            # The notice STAYS on screen once printed, so on its own it proves
+            # nothing: only an idle screen with no candidate transcript means
+            # the prompt was dropped rather than running. The settle grace keeps
+            # a just-submitted prompt agy has not started rendering yet from
+            # reading as a fresh drop — a re-paste then would duplicate a turn.
+            if watch_verify and time.monotonic() - start >= VERIFY_RESUBMIT_DELAY:
+                screen = await self._capture()
+                if VERIFY_REJECT_MARKER in screen and not self._is_busy(screen):
+                    return None
             await asyncio.sleep(0.5)
         raise RuntimeError(
             "Could not determine agy conversation id (no new transcript appeared)"
@@ -655,8 +686,7 @@ class AgySession:
                     # Publish the bell baseline BEFORE submitting, for the same
                     # reason as _last_baseline_step: /last may race this turn.
                     self._last_bell_baseline = self._bell_count()
-                    await self._submit(prompt)
-                    self._conversation_id = await self._detect_new_conversation(before)
+                    self._conversation_id = await self._submit_first(prompt, before)
                 logger.info(
                     "Session '%s': resolved conversation id %s",
                     self.name, self._conversation_id,
@@ -695,6 +725,47 @@ class AgySession:
             raise RuntimeError(f"tmux paste-buffer failed: {out.strip()}")
         await asyncio.sleep(0.15)
         await _tmux("send-keys", "-t", self._target, "Enter")
+
+    async def _submit_first(self, prompt: str, before: set[str]) -> str:
+        """Submit a session's first prompt and resolve its conversation id.
+
+        agy's per-launch account-verification gate CONSUMES a prompt submitted
+        too soon after spawn: it prints VERIFY_REJECT_MARKER, returns to an
+        empty input box and never starts a turn, so detection would just burn
+        its window and 502. Re-pressing Enter (what _submit_confirmed does for
+        a dropped Enter) cannot help here — the text is gone — so we re-paste
+        the whole prompt. A re-paste only ever happens while the screen is idle
+        and no candidate transcript exists, after a settle grace, so an
+        accepted turn can never be duplicated.
+        """
+        await self._submit(prompt)
+        watch = VERIFY_RESUBMIT_MAX > 0  # 0 = kill switch: plain old behavior
+        resubmits = 0
+        timeout = None
+        while True:
+            cid = await self._detect_new_conversation(
+                before, timeout, watch_verify=watch
+            )
+            if cid is not None:
+                return cid
+            if resubmits >= VERIFY_RESUBMIT_MAX:
+                raise RuntimeError(
+                    "Could not determine agy conversation id (agy account-"
+                    "verification gate dropped the prompt; resubmitted "
+                    f"{resubmits} times)"
+                )
+            resubmits += 1
+            logger.warning(
+                "Session '%s': agy verification gate dropped the prompt — "
+                "re-submitting [retry %d/%d]",
+                self.name, resubmits, VERIFY_RESUBMIT_MAX,
+            )
+            await asyncio.sleep(VERIFY_RESUBMIT_DELAY)
+            await self._submit(prompt)
+            # Half window per retry: keeps the worst case (initial window +
+            # VERIFY_RESUBMIT_MAX x (delay + this)) well inside the request's
+            # latency budget. A re-paste that lands is detected in ~1-2s.
+            timeout = CONVERSATION_DETECT_TIMEOUT / 2
 
     async def _submit_confirmed(self, prompt: str, baseline: int) -> None:
         """Submit *prompt* and make sure agy actually ingested it.
