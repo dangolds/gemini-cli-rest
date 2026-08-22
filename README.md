@@ -78,13 +78,15 @@ curl -s "http://localhost:8000/last/research?wait=30"
 
 Response when the turn has finished:
 ```json
-{ "done": true, "response": "…the answer…", "turn": 2, "session": "research", "elapsed_ms": 12 }
+{ "done": true, "response": "…the answer…", "turn": 2, "session": "research", "elapsed_ms": 12, "status": "done" }
 ```
 
-While the turn is still running (or was never ingested) — poll again:
+While the turn is still running — poll again:
 ```json
-{ "done": false, "response": null, "turn": 2, "session": "research", "elapsed_ms": 30001 }
+{ "done": false, "response": null, "turn": 2, "session": "research", "elapsed_ms": 30001, "status": "pending" }
 ```
+
+`status` tells the two not-done cases apart: `"pending"` = still working, keep polling; `"never_started"` = the CLI dropped the prompt and no answer is coming — re-send it.
 
 `wait` is capped at `LAST_MAX_WAIT` (default 180s) so `/last` never blocks longer than a `/chat` would. Recovery works while the **server is up** (the warm process holds the session); it does not survive a full server restart.
 
@@ -258,6 +260,8 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `STARTUP_TIMEOUT` | `60` | Max seconds to wait for CLI startup |
 | `VERIFY_RESUBMIT_MAX` | `3` | How many times a session's first prompt is re-pasted when agy's per-launch account-verification gate eats it (`⚠ Verifying your account...`); set to `0` to disable the recovery |
 | `VERIFY_RESUBMIT_DELAY` | `3.0` | Seconds to let the screen settle before a re-paste — and the grace a fresh submit gets before the (permanently displayed) notice may count as another drop |
+| `SUBMIT_REPASTE_MAX` | `2` | How many times a submit may be re-pasted when agy consumed the paste itself (input box empty, transcript frozen — Enter re-press can't help). Re-checked against the transcript at the last instant so an accepted turn can never duplicate; `0` disables |
+| `SUBMIT_REPASTE_DELAY` | `3.0` | Seconds to let the screen settle before each re-paste |
 | `LOG_DIR` | `/app/logs` | Rolling logs + per-incident dumps written here (mounted to `./logs`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 

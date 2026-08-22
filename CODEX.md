@@ -144,6 +144,10 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_RESPONSE_FAST_POLL` | `0.3` | Seconds between checks of the notify events file while a turn is in flight |
 | `CODEX_RESPONSE_FULL_CHECK_EVERY` | `10` | Run the full fallback poll (rollout + liveness) every Nth notify-check wake (~3s) |
 | `CODEX_STARTUP_TIMEOUT` | `60` | Max wait for the TUI to reach its idle prompt |
+| `CODEX_SUBMIT_REPASTE_MAX` | `2` | Re-pastes allowed when codex consumed the paste (composer empty, nothing ingested); duplicate-guarded against the rollout; `0` disables |
+| `CODEX_SUBMIT_REPASTE_DELAY` | `3.0` | Settle time before each re-paste |
+| `CODEX_SUBMIT_GRACE` | `2.0` | Hold a fresh session's first paste this long after the ready marker (which precedes real input readiness); `0` = off |
+| `CODEX_PASTE_VISIBLE_WAIT` | `1.5` | Wait for the paste to render in the composer before pressing Enter; `0` = legacy fixed settle |
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
 | `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |
 | `CODEX_EXTRA_ARGS` | _(empty)_ | Extra flags for every `codex` process, e.g. `--add-dir /repos` |
