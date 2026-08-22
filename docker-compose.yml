@@ -51,7 +51,7 @@ services:
       - AGY_EXTRA_ARGS=--add-dir /app/slitled-platform
       # agy encodes reasoning effort in the model name (`agy models`): High, not
       # the Low the persisted settings.json defaults to. Slower turns, better answers.
-      - AGY_MODEL=Gemini 3.1 Pro (High)
+      - AGY_MODEL=Gemini 3.7 Flash (High)
       - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
       # Highest reasoning tier. Set here, not in config.toml: that file is in the
       # persistent volume, the TUI rewrites it (it had drifted to "medium"), and
