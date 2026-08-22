@@ -111,6 +111,26 @@ RESPONSE_SLOW_DUMP_SECS = float(os.getenv("CODEX_SLOW_DUMP_SECS", "90"))
 # never mistaken for a drop and re-sent — which would duplicate the message.
 SUBMIT_CONFIRM_WAIT = float(os.getenv("CODEX_SUBMIT_CONFIRM_WAIT", "8"))
 SUBMIT_MAX_RETRIES = int(os.getenv("CODEX_SUBMIT_MAX_RETRIES", "2"))
+# A settling TUI can swallow the whole PASTE, not just the submit Enter: the
+# composer comes back EMPTY and no turn ever starts, so the Enter re-press above
+# has nothing left to send and only a re-paste can recover the turn. How many
+# times such a submit may be re-pasted, and how long to let the screen settle
+# first. The rollout and the screen are re-checked in the instant before every
+# re-paste (_repaste_safe), so an accepted turn can never be duplicated.
+# CODEX_SUBMIT_REPASTE_MAX=0 disables the recovery entirely.
+SUBMIT_REPASTE_MAX = int(os.getenv("CODEX_SUBMIT_REPASTE_MAX", "2"))
+SUBMIT_REPASTE_DELAY = float(os.getenv("CODEX_SUBMIT_REPASTE_DELAY", "3.0"))
+# codex renders its ready marker within ~0.5s of spawn — BEFORE the TUI really
+# accepts input, and while a startup notice ("You have 1 usage limit reset
+# available") may still be drawing over the composer, which is exactly when a
+# submit Enter gets eaten. Hold the session's FIRST paste back until this long
+# after the ready marker (0 = off); a session that has been idle for longer
+# already paid the grace and waits for nothing.
+SUBMIT_GRACE = float(os.getenv("CODEX_SUBMIT_GRACE", "2.0"))
+# How long to wait for a paste to become VISIBLE in the composer before pressing
+# Enter, so the submit can't race the paste rendering (0 = off: press after the
+# legacy fixed settle). Not a gate — if the window elapses we press anyway.
+PASTE_VISIBLE_WAIT = float(os.getenv("CODEX_PASTE_VISIBLE_WAIT", "1.5"))
 # How long after startup we wait for codex to register the new session (its
 # rollout file, tagged with our cwd, appears).
 SESSION_DETECT_TIMEOUT = float(os.getenv("CODEX_SESSION_DETECT_TIMEOUT", "20"))
@@ -151,6 +171,13 @@ RESPONSE_FULL_CHECK_EVERY = int(os.getenv("CODEX_RESPONSE_FULL_CHECK_EVERY", "10
 READY_MARKERS = ("/model to change", "OpenAI Codex", "% used")
 # Best-effort busy hints (secondary to the rollout's in-flight detection).
 BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt", "working", "thinking")
+# codex collapses a large bracketed paste to a placeholder in its composer
+# ("» [Pasted Content 6534 chars]"), which is how a paste that landed but was
+# never submitted is recognized on screen. The composer's own line starts with
+# the caret glyph; an EMPTY composer still shows a rotating placeholder hint
+# after it, so "empty" can only be read as "the pasted prompt is not there".
+PASTE_MARKER = "[Pasted Content"
+CARET_CHARS = ("›", "»")
 
 # tmux client commands are sub-second; anything longer means a stuck client.
 TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
@@ -356,6 +383,32 @@ def _rollout_meta(path: FsPath) -> dict | None:
     return None
 
 
+def _find_new_rollout(before: set[str], cwd: FsPath) -> FsPath | None:
+    """Newest rollout tagged with *cwd* that is not in *before* (a single pass).
+
+    codex writes the rollout lazily on the first turn; its session_meta records
+    the cwd, so we key on that — the per-run cwd is unique to a session, so at
+    most one new rollout can match. This one scan IS the binding rule, shared by
+    submit-time detection, the re-paste duplicate guard and /last's late
+    re-binding, so all three agree on what "our rollout" means.
+    """
+    candidates: dict[FsPath, float] = {}
+    want = str(cwd)
+    for path in _rollout_files():
+        if str(path) in before:
+            continue
+        meta = _rollout_meta(path)
+        if not meta or meta.get("cwd") != want:
+            continue  # not ours, or session_meta not written yet
+        try:
+            candidates[path] = path.stat().st_mtime
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=candidates.get)  # newest wins
+
+
 def _read_rollout(path: FsPath | None) -> list[dict]:
     """Parse a rollout JSONL into a list of event dicts (empty if absent)."""
     if path is None or not path.is_file():
@@ -481,6 +534,25 @@ class CodexSession:
     # /last uses it to tell THIS turn's answer apart from a previous one: a new
     # task_complete beyond this baseline means your submitted turn has finished.
     _last_baseline_completes: int = field(default=0, init=False)
+    # Started-turn count captured at the same moment — the "did codex ever take
+    # this prompt?" twin of the completes baseline, kept so never_started() can
+    # re-check ingestion long after the collection loop gave up.
+    _last_baseline_starts: int = field(default=0, init=False)
+    # Rollout files that already existed when this session's first prompt was
+    # submitted. Kept for the whole generation so /last can re-run the binding
+    # scan when submit-time detection came up empty (a rollout that appears late
+    # is still ours, and its answers are still recoverable).
+    _rollout_before: set[str] | None = field(default=None, init=False)
+    # Turn number that gave up having ingested NOTHING (no answer and no new
+    # task_started past the submit baseline) — i.e. codex dropped the prompt and
+    # the turn never started. /last reports it as status="never_started" so a
+    # client stops polling for an answer that can never come. Holding the TURN
+    # NUMBER (not a bool) makes it self-clearing: the next turn no longer matches.
+    _never_started_turn: int = field(default=-1, init=False)
+    # When the TUI last showed its ready marker (monotonic). The marker precedes
+    # real input readiness by a second or so, so the first paste of a freshly
+    # spawned session waits out the remainder of SUBMIT_GRACE from here.
+    _ready_at: float = field(default=0.0, init=False)
     # Notify-event count captured when the most recent turn was submitted — the
     # push-signal twin of _last_baseline_completes: a NOTIFY_LOG count beyond it
     # means codex has signaled end-of-turn for THIS turn, not an earlier one.
@@ -602,6 +674,9 @@ class CodexSession:
         self._session_id = None
         self._turn_count = 0
         self._last_baseline_completes = 0
+        self._last_baseline_starts = 0
+        self._rollout_before = None
+        self._never_started_turn = -1  # turn numbering restarts with the process
         logger.info("Session '%s' ready", self.name)
 
     async def _wait_ready(self) -> None:
@@ -621,6 +696,9 @@ class CodexSession:
                 )
             screen = await self._capture()
             if any(m in screen for m in READY_MARKERS):
+                # The marker can beat real input readiness by a second or so —
+                # _submit_first waits out the remainder of SUBMIT_GRACE from here.
+                self._ready_at = time.monotonic()
                 logger.info(
                     "Session '%s' ready marker after %.1fs",
                     self.name, time.monotonic() - start,
@@ -654,29 +732,22 @@ class CodexSession:
             return True
         return False
 
-    async def _detect_new_session(self, before: set[str]) -> FsPath:
+    async def _detect_new_session(
+        self, before: set[str], timeout: float | None = None
+    ) -> FsPath:
         """Wait for the new rollout file codex tags with this session's cwd.
 
-        codex writes the rollout lazily on the first turn; its session_meta
-        records the cwd, so we key on that — the per-run cwd is unique to this
-        session, so at most one new rollout can match.
+        Polls the shared binding rule (_find_new_rollout) until it matches, or
+        raises once the window elapses — _submit_first catches that and treats
+        it as "the prompt never reached codex", the only interpretation left
+        when nothing was ever written.
         """
         start = time.monotonic()
-        want = str(self.cwd)
-        while time.monotonic() - start < SESSION_DETECT_TIMEOUT:
-            candidates: dict[FsPath, float] = {}
-            for path in _rollout_files():
-                if str(path) in before:
-                    continue
-                meta = _rollout_meta(path)
-                if not meta or meta.get("cwd") != want:
-                    continue  # not ours, or session_meta not written yet
-                try:
-                    candidates[path] = path.stat().st_mtime
-                except OSError:
-                    continue
-            if candidates:
-                return max(candidates, key=candidates.get)  # newest wins
+        window = SESSION_DETECT_TIMEOUT if timeout is None else timeout
+        while time.monotonic() - start < window:
+            path = _find_new_rollout(before, self.cwd)
+            if path is not None:
+                return path
             await asyncio.sleep(0.5)
         raise RuntimeError(
             "Could not determine codex session (no new rollout for this cwd appeared)"
@@ -694,6 +765,9 @@ class CodexSession:
         self._session_id = None
         self._turn_count = 0
         self._last_baseline_completes = 0
+        self._last_baseline_starts = 0
+        self._rollout_before = None
+        self._never_started_turn = -1  # turn numbering restarts with the process
         self._last_notify_baseline = 0
         # Notify matching is evaluated at parse time, against the generation
         # that was live when the bytes were consumed — so a respawn restarts
@@ -741,6 +815,41 @@ class CodexSession:
         low = screen.lower()
         return any(m in low for m in BUSY_MARKERS)
 
+    @staticmethod
+    def _paste_visible(screen: str, prompt: str) -> bool:
+        """Is the pasted prompt showing on *screen*?
+
+        Either as codex's own placeholder for a bracketed paste ("[Pasted
+        Content N chars]") or, for a paste small enough to be shown verbatim,
+        as its first line of text.
+        """
+        if PASTE_MARKER in screen:
+            return True
+        head = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+        return bool(head) and head[:40] in screen
+
+    @classmethod
+    def _composer_empty(cls, screen: str, prompt: str) -> bool:
+        """Is the composer visibly NOT holding *prompt* (so a re-paste is the
+        only way to submit it)?
+
+        An empty composer is not blank — codex draws a rotating placeholder hint
+        after the caret — so emptiness can only be read as "the pasted prompt is
+        not there". The search starts at the LAST caret line so the conversation
+        history above it (which echoes previous prompts) can't answer for the
+        composer. Unreadable screens answer False: the caller turns a True into
+        a re-paste and a False into a harmless Enter re-press.
+        """
+        lines = [ln.rstrip() for ln in screen.splitlines()]
+        caret = next(
+            (i for i in range(len(lines) - 1, -1, -1)
+             if lines[i].strip()[:1] in CARET_CHARS),
+            None,
+        )
+        if caret is None:
+            return False  # composer not on screen (or drawn in a shape we don't know)
+        return not cls._paste_visible("\n".join(lines[caret:]), prompt)
+
     # --- Chat ----------------------------------------------------------------
 
     async def send(self, prompt: str) -> str:
@@ -771,20 +880,21 @@ class CodexSession:
                 # point may fast-path the turn.
                 self._last_notify_baseline = self._notify_count()
                 async with _SPAWN_LOCK:
-                    before = {str(p) for p in _rollout_files()}
-                    await self._submit(prompt)
-                    self._rollout_path = await self._detect_new_session(before)
-                meta = _rollout_meta(self._rollout_path) or {}
-                self._session_id = meta.get("id")
-                logger.info(
-                    "Session '%s': bound to codex session %s (%s)",
-                    self.name, self._session_id, self._rollout_path.name,
-                )
+                    # A previous first-turn attempt that failed to bind keeps
+                    # its scan set: a rollout it did create is still ours, and a
+                    # freshly taken `before` would exclude it forever. Published
+                    # BEFORE the submit, so even if this send() fails /last can
+                    # re-run the same scan and bind a rollout that appears late.
+                    before = self._rollout_before if self._rollout_before is not None \
+                        else {str(p) for p in _rollout_files()}
+                    self._rollout_before = before
+                    self._bind_rollout(await self._submit_first(prompt, before))
                 baseline_completes = 0
                 baseline_starts = _count_task_starts(_read_rollout(self._rollout_path))
                 # Record where this turn began so a later /last can recover its
                 # answer and never mistake a previous turn's for it.
                 self._last_baseline_completes = baseline_completes
+                self._last_baseline_starts = baseline_starts
             else:
                 events = _read_rollout(self._rollout_path)
                 baseline_completes = _count_task_completes(events)
@@ -793,6 +903,7 @@ class CodexSession:
                 # while this turn runs reads the right turn boundary — and a
                 # notify event from an earlier turn can never fast-path this one.
                 self._last_baseline_completes = baseline_completes
+                self._last_baseline_starts = baseline_starts
                 self._last_notify_baseline = self._notify_count()
                 await self._submit_confirmed(prompt, baseline_starts)
 
@@ -804,7 +915,14 @@ class CodexSession:
             return response
 
     async def _submit(self, prompt: str) -> None:
-        """Paste the prompt (bracketed), then submit with Enter."""
+        """Paste the prompt (bracketed), then submit with Enter.
+
+        The Enter waits for the paste to become VISIBLE in the composer (codex
+        collapses a large one to "[Pasted Content N chars]") instead of a fixed
+        settle, so the submit cannot race the paste rendering — the exact shape
+        of the drop we keep seeing: the paste lands, the Enter is eaten, and the
+        prompt sits in the composer unsubmitted.
+        """
         buf = f"codexrest-{self.name}"
         rc, out = await _tmux(
             "load-buffer", "-b", buf, "-", stdin_data=prompt.encode()
@@ -816,32 +934,174 @@ class CodexSession:
         )
         if rc != 0:
             raise RuntimeError(f"tmux paste-buffer failed: {out.strip()}")
-        await asyncio.sleep(0.15)
+        if PASTE_VISIBLE_WAIT > 0:
+            await self._await_paste_visible(prompt)
+        else:
+            await asyncio.sleep(0.15)
         await _tmux("send-keys", "-t", self._target, "Enter")
+
+    async def _await_paste_visible(self, prompt: str) -> bool:
+        """Poll up to PASTE_VISIBLE_WAIT for the paste to render in the composer.
+
+        Returns whether it showed up. Never a gate: when the window elapses we
+        press Enter anyway (the paste may simply render in a shape
+        _paste_visible does not recognize), exactly as the fixed settle did.
+        """
+        deadline = time.monotonic() + PASTE_VISIBLE_WAIT
+        while True:
+            if self._paste_visible(await self._capture(), prompt):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+
+    async def _startup_grace(self) -> None:
+        """Hold a fresh session's first paste back until SUBMIT_GRACE after the
+        ready marker. The marker shows within ~0.5s of spawn, before the TUI is
+        really accepting input and while a startup notice may still be drawing
+        over the composer — where the submit Enter gets eaten. A session that
+        has been ready for longer already paid the grace and waits for nothing.
+        """
+        if SUBMIT_GRACE <= 0:
+            return
+        remaining = SUBMIT_GRACE - (time.monotonic() - self._ready_at)
+        if remaining > 0:
+            logger.info(
+                "Session '%s': holding the first paste %.1fs for the TUI to settle",
+                self.name, remaining,
+            )
+            await asyncio.sleep(remaining)
+
+    async def _submit_first(self, prompt: str, before: set[str]) -> FsPath:
+        """Submit a session's first prompt and resolve its rollout file.
+
+        Turn 1 has no rollout to confirm ingestion against, so DETECTION is the
+        confirmation: a rollout tagged with our cwd appears only once codex has
+        actually taken the turn. When the window elapses with nothing written,
+        the prompt never reached codex — the same drop _submit_confirmed handles
+        for later turns, and recovered the same way: re-press Enter while the
+        pasted content is visibly waiting in the composer, re-paste (bounded,
+        duplicate-guarded) only when the composer is empty. Previously this
+        raised on the first miss, which 502'd the request and left the prompt
+        sitting in the TUI forever.
+        """
+        await self._startup_grace()
+        await self._submit(prompt)
+        enters = repastes = 0
+        timeout: float | None = None
+        while True:
+            try:
+                return await self._detect_new_session(before, timeout)
+            except RuntimeError as exc:
+                detect_error = exc
+            screen = await self._capture()
+            if self._is_busy(screen):
+                raise detect_error  # codex IS working; re-sending would duplicate
+            if repastes < SUBMIT_REPASTE_MAX and self._composer_empty(screen, prompt):
+                repastes += 1
+                logger.warning(
+                    "Session '%s': no rollout after the first prompt and the composer "
+                    "is EMPTY (codex consumed the paste) — re-pasting [retry %d/%d]",
+                    self.name, repastes, SUBMIT_REPASTE_MAX,
+                )
+                await asyncio.sleep(SUBMIT_REPASTE_DELAY)
+                if not await self._repaste_safe(0, before=before):
+                    logger.info(
+                        "Session '%s': re-paste aborted — codex took the prompt "
+                        "after all", self.name,
+                    )
+                else:
+                    await self._submit(prompt)
+            elif enters < SUBMIT_MAX_RETRIES:
+                enters += 1
+                logger.warning(
+                    "Session '%s': no rollout after the first prompt (codex idle, the "
+                    "paste is still in the composer) — re-pressing Enter [retry %d/%d]",
+                    self.name, enters, SUBMIT_MAX_RETRIES,
+                )
+                await _tmux("send-keys", "-t", self._target, "Enter")
+            else:
+                raise detect_error
+            # Half window per retry: keeps the worst case (initial window +
+            # retries x (delay + this)) inside the request's latency budget. A
+            # submit that lands writes its rollout within a second or two.
+            timeout = SESSION_DETECT_TIMEOUT / 2
+
+    def _bind_rollout(self, path: FsPath) -> None:
+        """Adopt *path* as this session's answer source (its codex session)."""
+        self._rollout_path = path
+        meta = _rollout_meta(path) or {}
+        self._session_id = meta.get("id")
+        logger.info(
+            "Session '%s': bound to codex session %s (%s)",
+            self.name, self._session_id, path.name,
+        )
 
     async def _submit_confirmed(self, prompt: str, baseline_starts: int) -> None:
         """Submit *prompt* and make sure codex actually ingested it.
 
         A TUI can swallow the submit Enter when it is still settling after a long
         previous response: the pasted text sits unsubmitted while the screen
-        looks idle, so the turn stalls. We confirm ingestion before trusting the
-        submit, and only re-press Enter when codex is plainly idle and has
-        ingested nothing. We never re-paste and we wait a full SUBMIT_CONFIRM_WAIT
-        before each retry, so a slow-but-accepted submit can't become a duplicate.
+        looks idle, so the turn stalls. The same settling TUI can swallow the
+        PASTE ITSELF — identical symptoms, but the composer comes back EMPTY, so
+        re-pressing Enter sends nothing and only re-pasting recovers the turn.
+
+        We confirm ingestion before trusting the submit, then correct it the only
+        way the screen supports: Enter while the pasted content is still sitting
+        there (never a re-paste — that would duplicate a slow-but-accepted
+        submit), a bounded re-paste only when the composer is demonstrably empty.
+        Both wait a full SUBMIT_CONFIRM_WAIT first, and every re-paste re-checks
+        the rollout and the screen at the last moment (_repaste_safe).
         """
         await self._submit(prompt)
-        for attempt in range(1, SUBMIT_MAX_RETRIES + 1):
+        enters = repastes = 0
+        while True:
             if await self._await_ingest(baseline_starts):
                 return
+            if repastes < SUBMIT_REPASTE_MAX and \
+                    self._composer_empty(await self._capture(), prompt):
+                repastes += 1
+                logger.warning(
+                    "Session '%s': submit unacknowledged after %.0fs and the composer "
+                    "is EMPTY (codex consumed the paste) — re-pasting the prompt "
+                    "[retry %d/%d]",
+                    self.name, SUBMIT_CONFIRM_WAIT, repastes, SUBMIT_REPASTE_MAX,
+                )
+                await asyncio.sleep(SUBMIT_REPASTE_DELAY)
+                if not await self._repaste_safe(baseline_starts):
+                    logger.info(
+                        "Session '%s': re-paste aborted — codex ingested the prompt "
+                        "after all", self.name,
+                    )
+                    return
+                await self._submit(prompt)
+                continue
+            if enters >= SUBMIT_MAX_RETRIES:
+                break
+            enters += 1
             logger.warning(
                 "Session '%s': submit unacknowledged after %.0fs (codex idle, "
                 "nothing ingested) — re-pressing Enter [retry %d/%d]",
-                self.name, SUBMIT_CONFIRM_WAIT, attempt, SUBMIT_MAX_RETRIES,
+                self.name, SUBMIT_CONFIRM_WAIT, enters, SUBMIT_MAX_RETRIES,
             )
             await _tmux("send-keys", "-t", self._target, "Enter")
         # Final grace wait. If codex still took nothing, fall through and let
         # _collect_response run its course (it times out exactly as today).
         await self._await_ingest(baseline_starts)
+
+    async def _repaste_safe(self, baseline_starts: int, before: set[str] | None = None) -> bool:
+        """Duplicate guard, re-checked in the instant before EVERY re-paste.
+
+        The decision to re-paste was made a whole SUBMIT_REPASTE_DELAY ago; if
+        codex has taken the prompt since — a rollout appeared (turn 1), a new
+        task_started (later turns), or the screen went busy — pasting again
+        would submit the same turn twice. Any sign of life aborts.
+        """
+        if before is not None and _find_new_rollout(before, self.cwd) is not None:
+            return False
+        if _count_task_starts(_read_rollout(self._rollout_path)) > baseline_starts:
+            return False
+        return not self._is_busy(await self._capture())
 
     async def _await_ingest(self, baseline_starts: int) -> bool:
         """Wait up to SUBMIT_CONFIRM_WAIT for codex to ingest the submitted turn.
@@ -1037,6 +1297,19 @@ class CodexSession:
 
         total = time.monotonic() - start
         self._last_exit_reason = exit_reason
+        # A give-up with no answer AND no new task_started past the submit
+        # baseline means codex never took the prompt — the turn did not start,
+        # so no amount of polling will produce an answer. Record it for /last
+        # (status="never_started") instead of leaving the client to poll a turn
+        # that does not exist.
+        if exit_reason in ("stalled", "hard_timeout") and not response and \
+                _count_task_starts(_read_rollout(self._rollout_path)) <= baseline_starts:
+            self._never_started_turn = self._turn_count
+            logger.warning(
+                "Session '%s' ref=%s: turn %d was NEVER INGESTED (no task_started past "
+                "baseline %d) — /last will report it as never_started",
+                self.name, self._session_id or "-", self._turn_count, baseline_starts,
+            )
         logger.info(
             "Session '%s': response complete via %s (%.1fs, %d chars)",
             self.name, exit_reason, total, len(response),
@@ -1134,10 +1407,15 @@ class CodexSession:
         then done=False with no text, so a still-running or never-ingested turn
         never yields a partial answer or a stale previous one. With wait>0 it
         polls up to `wait` seconds for an in-flight turn to finish.
+
+        A session whose rollout never bound at submit time (its ref logs as '-',
+        and every poll would be answerless forever) re-runs the binding scan on
+        each poll, so a rollout that appears late is still adopted and its
+        answers are still recoverable.
         """
         deadline = time.monotonic() + max(0.0, wait)
         while True:
-            path = self._rollout_path
+            path = self._rollout_path or self._rebind_rollout()
             baseline = self._last_baseline_completes
             if path is not None:
                 events = _read_rollout(path)
@@ -1146,6 +1424,41 @@ class CodexSession:
             if time.monotonic() >= deadline:
                 return False, "", self._turn_count
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+
+    def _rebind_rollout(self) -> FsPath | None:
+        """Re-attempt the submit-time binding for a session that never bound one.
+
+        Cheap and only reached while the ref is unresolved: one _find_new_rollout
+        pass over the same `before` set the first submit captured. Binding here
+        is idempotent — a concurrent send() resolving the same rollout lands on
+        the same file — and does nothing when there is no `before` set (no first
+        submit has run yet) or nothing new has appeared.
+        """
+        if self._rollout_before is None:
+            return None
+        path = _find_new_rollout(self._rollout_before, self.cwd)
+        if path is not None:
+            self._bind_rollout(path)
+        return path
+
+    async def never_started(self) -> bool:
+        """Was the most recent turn dropped before it ever started?
+
+        True only when the collection loop gave up having ingested nothing AND
+        that is still the case now: no task_started past the submit baseline (a
+        late ingest would have started the turn after all) and codex is not
+        busy. A dead process counts — nothing more is coming either way. /last
+        turns this into status="never_started" so the client re-sends the prompt
+        instead of polling forever for an answer that was never going to exist.
+        """
+        if self._never_started_turn != self._turn_count:
+            return False
+        if _count_task_starts(_read_rollout(self._rollout_path)) > self._last_baseline_starts:
+            return False  # it ingested late after all — the turn is running
+        try:
+            return not self._is_busy(await self._capture())
+        except RuntimeError:
+            return True  # process gone: the dropped prompt can never run now
 
     def next_attempt(self) -> int:
         """Increment and return this turn's /last poll count (observability)."""
@@ -1362,6 +1675,11 @@ class LastResponse(BaseModel):
     turn: int
     session: str
     elapsed_ms: int
+    # "done" | "pending" | "never_started" — an ADDITIVE field: `done` keeps its
+    # exact old meaning, so old clients are unaffected, while a new client can
+    # tell "still working" (pending, keep polling) from "codex dropped the
+    # prompt, the turn never started" (never_started, re-send it).
+    status: str | None = None
 
 class SessionStatus(BaseModel):
     name: str
@@ -1462,7 +1780,10 @@ async def get_last(
     the rollout even when the HTTP response never arrived. Returns
     {done:true, response} only once the most recent turn has finished;
     {done:false, response:null} while it is still running or was never
-    ingested — never a partial answer or a stale previous one.
+    ingested — never a partial answer or a stale previous one. The additive
+    `status` field ("done" / "pending" / "never_started") tells those two
+    not-done cases apart: never_started means codex dropped the prompt and no
+    answer is coming, so the caller should re-send rather than keep polling.
 
     /last is the recovery path, so it leaves a full audit trail in the log:
     WHO/WHY (caller host + user-agent + the wait they asked for) on entry, and
@@ -1491,6 +1812,7 @@ async def get_last(
     t0 = time.monotonic()
     done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
     elapsed = int((time.monotonic() - t0) * 1000)
+    never = False if done else await session.never_started()
     if done:
         # Pull the turn's real timing from the rollout: model_turn = how long the
         # agent actually worked; waited_for_poll = how long the finished answer
@@ -1515,10 +1837,17 @@ async def get_last(
             rid, name, session.ref, turn, attempt, len(response), elapsed, timing,
             _preview(response),
         )
+    elif never:
+        logger.warning(
+            "[%s] /last NEVER_STARTED session '%s' ref=%s turn=%d attempt=%d — codex "
+            "dropped the prompt (nothing ingested, screen idle); the turn will never "
+            "answer, re-send it. Answered in %dms",
+            rid, name, session.ref, turn, attempt, elapsed,
+        )
     else:
         logger.info(
             "[%s] /last PENDING session '%s' ref=%s turn=%d attempt=%d — no completed "
-            "answer yet (still running or never ingested) after %dms",
+            "answer yet (still running) after %dms",
             rid, name, session.ref, turn, attempt, elapsed,
         )
     return LastResponse(
@@ -1527,6 +1856,7 @@ async def get_last(
         turn=turn,
         session=name,
         elapsed_ms=elapsed,
+        status="done" if done else ("never_started" if never else "pending"),
     )
 
 

@@ -470,7 +470,7 @@ class TestSendBaselines:
         async def submit(prompt):
             pass
 
-        async def detect(before):
+        async def detect(before, timeout=None):
             return rollout
 
         monkeypatch.setattr(sess, "_submit", submit)

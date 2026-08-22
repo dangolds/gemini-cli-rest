@@ -123,6 +123,15 @@ RESPONSE_FULL_CHECK_EVERY = int(os.getenv("RESPONSE_FULL_CHECK_EVERY", "10"))
 # which is what would otherwise produce a duplicate message.
 SUBMIT_CONFIRM_WAIT = float(os.getenv("SUBMIT_CONFIRM_WAIT", "8"))
 SUBMIT_MAX_RETRIES = int(os.getenv("SUBMIT_MAX_RETRIES", "2"))
+# A settling TUI can swallow the whole PASTE, not just the submit Enter: the
+# input box comes back EMPTY and the transcript never moves, so the Enter
+# re-press above has nothing left to send and only a re-paste can recover the
+# turn. How many times such a submit may be re-pasted, and how long to let the
+# screen settle first. The transcript baseline and the screen are re-checked in
+# the instant before every re-paste (_repaste_safe), so an accepted turn can
+# never be duplicated. SUBMIT_REPASTE_MAX=0 disables the recovery entirely.
+SUBMIT_REPASTE_MAX = int(os.getenv("SUBMIT_REPASTE_MAX", "2"))
+SUBMIT_REPASTE_DELAY = float(os.getenv("SUBMIT_REPASTE_DELAY", "3.0"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
@@ -146,6 +155,12 @@ LAST_MAX_WAIT = float(os.getenv("LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 READY_MARKER = "? for shortcuts"          # idle status bar
 BUSY_MARKERS = ("Generating...", "esc to cancel")
 VERIFY_REJECT_MARKER = "Verifying your account"   # account-eligibility gate
+# agy frames its input box between two horizontal rules and renders the box's
+# first line as ">" plus whatever is waiting to be submitted, so an EMPTY box is
+# a bare ">" line. The box is located by that rule pair and never by the caret
+# alone: the conversation history above it echoes submitted prompts with the
+# very same "> " prefix.
+BOX_RULE_RE = re.compile(r"[─━═]{10,}")
 
 # tmux client commands are sub-second; anything longer means a stuck client.
 TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
@@ -405,6 +420,13 @@ class AgySession:
     # "transcript_done", "stalled", "hard_timeout"); surfaced to callers as
     # ChatResponse.via. None until the first turn has run.
     _last_exit_reason: str | None = field(default=None, init=False)
+    # Turn number that gave up having ingested NOTHING (no message collected and
+    # the transcript never moved past its submit baseline) — i.e. agy dropped
+    # the prompt and the turn never started. /last reports it as
+    # status="never_started" so a client stops polling for an answer that can
+    # never come. Holding the TURN NUMBER (not a bool) makes it self-clearing:
+    # the next turn's number no longer matches.
+    _never_started_turn: int = field(default=-1, init=False)
     # agy keeps cross-conversation memory per project (working directory):
     # new conversations receive summaries of previous ones and the agent can
     # read their transcripts. Every spawn therefore gets a fresh generation
@@ -509,6 +531,7 @@ class AgySession:
         self._turn_count = 0
         self._last_baseline_step = -1
         self._last_bell_baseline = 0
+        self._never_started_turn = -1  # turn numbering restarts with the process
         logger.info("Session '%s' ready", self.name)
 
     async def _wait_ready(self) -> None:
@@ -594,6 +617,7 @@ class AgySession:
         self._turn_count = 0
         self._last_baseline_step = -1
         self._last_bell_baseline = 0
+        self._never_started_turn = -1  # turn numbering restarts with the process
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -634,6 +658,24 @@ class AgySession:
     @staticmethod
     def _is_busy(screen: str) -> bool:
         return any(m in screen for m in BUSY_MARKERS)
+
+    @staticmethod
+    def _input_box_empty(screen: str) -> bool:
+        """Is agy's input box visibly EMPTY (nothing waiting to be submitted)?
+
+        True only when the box is located AND holds no text. Anything we cannot
+        read confidently — an interstitial covering the box, a paste tall enough
+        to push its top rule off-screen — answers False, because the caller
+        turns a True into a re-paste and a False into a harmless Enter re-press.
+        """
+        lines = [ln.rstrip() for ln in screen.splitlines()]
+        rules = [i for i, ln in enumerate(lines) if BOX_RULE_RE.fullmatch(ln.strip())]
+        if len(rules) < 2:
+            return False
+        box = [ln.strip() for ln in lines[rules[-2] + 1:rules[-1]]]
+        if not box or not box[0].startswith(">"):
+            return False  # not the input box (or something is drawn over it)
+        return not box[0][1:].strip() and not any(box[1:])
 
     # --- Bell access ---------------------------------------------------------
 
@@ -774,25 +816,65 @@ class AgySession:
         settling after rendering the previous (often long) response: the pasted
         text sits in the input box unsubmitted while the screen still looks
         idle, so the turn stalls until the max timeout and the bridge reports
-        "0 message(s)" even though agy was free the whole time. We confirm
-        ingestion before trusting the submit, and only re-press Enter when agy
-        is plainly idle and has ingested nothing. We never re-paste and we wait
-        a full SUBMIT_CONFIRM_WAIT before each retry, so a slow-but-accepted
-        submit can never be turned into a duplicate message.
+        "0 message(s)" even though agy was free the whole time. The same
+        settling TUI can also swallow the PASTE ITSELF — identical symptoms, but
+        the input box comes back EMPTY, so re-pressing Enter sends nothing and
+        only re-pasting the prompt recovers the turn.
+
+        We confirm ingestion before trusting the submit, then correct it the
+        only way the screen supports: Enter while the text is still in the box
+        (never a re-paste — that would duplicate a slow-but-accepted submit), a
+        bounded re-paste only when the box is demonstrably empty. Both wait a
+        full SUBMIT_CONFIRM_WAIT first, and every re-paste re-checks the
+        transcript and the screen at the last moment (_repaste_safe).
         """
         await self._submit(prompt)
-        for attempt in range(1, SUBMIT_MAX_RETRIES + 1):
+        enters = repastes = 0
+        while True:
             if await self._await_ingest(baseline):
                 return
+            if repastes < SUBMIT_REPASTE_MAX and self._input_box_empty(await self._capture()):
+                repastes += 1
+                logger.warning(
+                    "Session '%s': submit unacknowledged after %.0fs and the input "
+                    "box is EMPTY (agy consumed the paste) — re-pasting the prompt "
+                    "[retry %d/%d]",
+                    self.name, SUBMIT_CONFIRM_WAIT, repastes, SUBMIT_REPASTE_MAX,
+                )
+                await asyncio.sleep(SUBMIT_REPASTE_DELAY)
+                if not await self._repaste_safe(baseline):
+                    logger.info(
+                        "Session '%s': re-paste aborted — agy ingested the prompt "
+                        "after all", self.name,
+                    )
+                    return
+                await self._submit(prompt)
+                continue
+            if enters >= SUBMIT_MAX_RETRIES:
+                break
+            enters += 1
             logger.warning(
                 "Session '%s': submit unacknowledged after %.0fs (agy idle, "
                 "nothing ingested) — re-pressing Enter [retry %d/%d]",
-                self.name, SUBMIT_CONFIRM_WAIT, attempt, SUBMIT_MAX_RETRIES,
+                self.name, SUBMIT_CONFIRM_WAIT, enters, SUBMIT_MAX_RETRIES,
             )
             await _tmux("send-keys", "-t", self._target, "Enter")
         # Final grace wait. If agy still took nothing, fall through and let
         # _collect_response run its course (it times out exactly as today).
         await self._await_ingest(baseline)
+
+    async def _repaste_safe(self, baseline: int) -> bool:
+        """Duplicate guard, re-checked in the instant before EVERY re-paste.
+
+        The decision to re-paste was made a whole SUBMIT_REPASTE_DELAY ago; if
+        agy has taken the prompt since — ANY new transcript step, or a busy
+        screen — pasting again would submit the same turn twice. Any sign of
+        life aborts; only a still-frozen transcript and a still-idle screen
+        allow the paste.
+        """
+        if _max_step(_read_transcript(self._conversation_id)) > baseline:
+            return False
+        return not self._is_busy(await self._capture())
 
     async def _await_ingest(self, baseline: int) -> bool:
         """Wait up to SUBMIT_CONFIRM_WAIT for agy to ingest the submitted turn.
@@ -946,6 +1028,19 @@ class AgySession:
 
         total = time.monotonic() - start
         self._last_exit_reason = exit_reason  # surfaced as ChatResponse.via
+        # A give-up that collected nothing AND left the transcript exactly where
+        # the submit found it means agy never took the prompt — the turn did not
+        # start, so no amount of polling will produce an answer. Record it for
+        # /last (status="never_started") instead of leaving the client to poll a
+        # turn that does not exist.
+        if exit_reason in ("stalled", "hard_timeout") and not responses and \
+                _max_step(_read_transcript(self._conversation_id)) <= baseline:
+            self._never_started_turn = self._turn_count
+            logger.warning(
+                "Session '%s' ref=%s: turn %d was NEVER INGESTED (transcript still "
+                "at baseline %d) — /last will report it as never_started",
+                self.name, self._conversation_id or "-", self._turn_count, baseline,
+            )
         logger.info(
             "Session '%s': response complete via %s (%.1fs, %d message(s))",
             self.name, exit_reason, total, len(responses),
@@ -1123,6 +1218,25 @@ class AgySession:
         if AGY_BELL and self._bell_count() > self._last_bell_baseline:
             return True
         return READY_MARKER in screen
+
+    async def never_started(self) -> bool:
+        """Was the most recent turn dropped before it ever started?
+
+        True only when the collection loop gave up having ingested nothing AND
+        that is still the case now: no transcript step past the submit baseline
+        (a late ingest would have started the turn after all) and agy is not
+        busy. A dead process counts — nothing more is coming either way. /last
+        turns this into status="never_started" so the client re-sends the prompt
+        instead of polling forever for an answer that was never going to exist.
+        """
+        if self._never_started_turn != self._turn_count:
+            return False
+        if _max_step(_read_transcript(self._conversation_id)) > self._last_baseline_step:
+            return False  # it ingested late after all — the turn is running
+        try:
+            return not self._is_busy(await self._capture())
+        except RuntimeError:
+            return True  # process gone: the dropped prompt can never run now
 
     def next_attempt(self) -> int:
         """Increment and return this turn's /last poll count (observability)."""
@@ -1368,6 +1482,11 @@ class LastResponse(BaseModel):
     turn: int
     session: str
     elapsed_ms: int
+    # "done" | "pending" | "never_started" — an ADDITIVE field: `done` keeps its
+    # exact old meaning, so old clients are unaffected, while a new client can
+    # tell "still working" (pending, keep polling) from "agy dropped the prompt,
+    # the turn never started" (never_started, re-send it).
+    status: str | None = None
 
 class SessionStatus(BaseModel):
     name: str
@@ -1466,7 +1585,10 @@ async def get_last(
     transcript even when the HTTP response never arrived. Returns
     {done:true, response} only once the most recent turn has finished;
     {done:false, response:null} while it is still running or was never
-    ingested — never a partial answer or a stale previous one.
+    ingested — never a partial answer or a stale previous one. The additive
+    `status` field ("done" / "pending" / "never_started") tells those two
+    not-done cases apart: never_started means agy dropped the prompt and no
+    answer is coming, so the caller should re-send rather than keep polling.
 
     /last is the recovery path, so it leaves a full audit trail in the log:
     WHO/WHY (caller host + user-agent + the wait they asked for) on entry, and
@@ -1495,6 +1617,7 @@ async def get_last(
     t0 = time.monotonic()
     done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
     elapsed = int((time.monotonic() - t0) * 1000)
+    never = False if done else await session.never_started()
     if done:
         # Pull the turn's real timing from the transcript: model_turn = how long
         # the agent actually worked; waited_for_poll = how long the finished
@@ -1519,10 +1642,17 @@ async def get_last(
             rid, name, session.ref, turn, attempt, len(response), elapsed, timing,
             _preview(response),
         )
+    elif never:
+        logger.warning(
+            "[%s] /last NEVER_STARTED session '%s' ref=%s turn=%d attempt=%d — agy "
+            "dropped the prompt (nothing ingested, screen idle); the turn will never "
+            "answer, re-send it. Answered in %dms",
+            rid, name, session.ref, turn, attempt, elapsed,
+        )
     else:
         logger.info(
             "[%s] /last PENDING session '%s' ref=%s turn=%d attempt=%d — no completed "
-            "answer yet (still running or never ingested) after %dms",
+            "answer yet (still running) after %dms",
             rid, name, session.ref, turn, attempt, elapsed,
         )
     return LastResponse(
@@ -1531,6 +1661,7 @@ async def get_last(
         turn=turn,
         session=name,
         elapsed_ms=elapsed,
+        status="done" if done else ("never_started" if never else "pending"),
     )
 
 

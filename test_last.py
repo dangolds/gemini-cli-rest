@@ -20,8 +20,10 @@ Run:  ./.venv/bin/python -m pytest test_last.py -v
 """
 
 import asyncio
+import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -421,3 +423,242 @@ class TestRecordRecovery:
             s._last_dump_turn = 4        # dump belongs to a previous turn
             s.record_recovery("2026-06-23T02:05:00Z", 1.0)
             assert dump.read_text() == "snapshot\n"
+
+
+# ===========================================================================
+# never_started: an honest answer for a turn the CLI DROPPED. Both bridges can
+# have a prompt consumed whole (the TUI eats the paste or the submit Enter),
+# and the client then polls /last forever for a turn that never began. The
+# collection loop records that at give-up; /last re-verifies it and says so.
+# ===========================================================================
+
+class TestAgyNeverStarted:
+    def test_dropped_turn_is_reported(self, agy_fastpoll, monkeypatch):
+        sess = _agy_session(
+            monkeypatch,
+            transcript=lambda: [_step(4, "a previous turn's answer")],
+            screen="idle  ? for shortcuts", baseline=4, turn=3,
+        )
+        sess._never_started_turn = 3  # what _collect_response recorded at give-up
+        assert _run(sess.never_started()) is True
+        assert _run(sess.last(0)) == (False, "", 3)  # and still no answer to give
+
+    def test_a_late_transcript_step_means_the_turn_did_start(self, agy_fastpoll, monkeypatch):
+        # agy ingested it after the give-up: the turn IS running, so the client
+        # must keep polling rather than re-send and duplicate it.
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(9)],
+            screen="idle  ? for shortcuts", baseline=4, turn=3,
+        )
+        sess._never_started_turn = 3
+        assert _run(sess.never_started()) is False
+
+    def test_busy_screen_is_still_just_pending(self, agy_fastpoll, monkeypatch):
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(4)],
+            screen="Generating...  esc to cancel", baseline=4, turn=3,
+        )
+        sess._never_started_turn = 3
+        assert _run(sess.never_started()) is False
+
+    def test_a_dead_process_can_never_run_the_dropped_prompt(self, agy_fastpoll, monkeypatch):
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(4)],
+            screen=_boom, baseline=4, turn=3,
+        )
+        sess._never_started_turn = 3
+        assert _run(sess.never_started()) is True
+
+    def test_the_flag_does_not_leak_into_the_next_turn(self, agy_fastpoll, monkeypatch):
+        # The client re-sent, so turn 4 is live: turn 3's verdict no longer applies.
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(4)],
+            screen="idle  ? for shortcuts", baseline=4, turn=4,
+        )
+        sess._never_started_turn = 3
+        assert _run(sess.never_started()) is False
+
+
+class TestCodexNeverStarted:
+    def test_dropped_turn_is_reported(self, codex_fastpoll, monkeypatch):
+        sess = _codex_session(
+            monkeypatch, events=lambda: [_ev_meta(), _ev_start("t1"), _ev_complete("t1")],
+            baseline=1, turn=2,
+        )
+        sess._last_baseline_starts = 1
+        sess._never_started_turn = 2
+        monkeypatch.setattr(sess, "_capture", _idle_capture)
+        assert _run(sess.never_started()) is True
+
+    def test_a_late_task_started_means_the_turn_did_start(self, codex_fastpoll, monkeypatch):
+        sess = _codex_session(
+            monkeypatch,
+            events=lambda: [_ev_meta(), _ev_start("t1"), _ev_complete("t1"), _ev_start("t2")],
+            baseline=1, turn=2,
+        )
+        sess._last_baseline_starts = 1
+        sess._never_started_turn = 2
+        monkeypatch.setattr(sess, "_capture", _idle_capture)
+        assert _run(sess.never_started()) is False
+
+    def test_the_flag_does_not_leak_into_the_next_turn(self, codex_fastpoll, monkeypatch):
+        sess = _codex_session(monkeypatch, events=lambda: [_ev_meta()], baseline=0, turn=3)
+        sess._never_started_turn = 2
+        monkeypatch.setattr(sess, "_capture", _idle_capture)
+        assert _run(sess.never_started()) is False
+
+
+async def _idle_capture():
+    return "idle  Context 0% used"
+
+
+def _boom():
+    raise RuntimeError("pane gone")
+
+
+# --- the endpoint: an ADDITIVE status field, old fields untouched -----------
+
+class _Req:
+    """The parts of a Request that /last's audit trail reads."""
+    headers: dict = {}
+    client = None
+
+    def __init__(self):
+        self.state = SimpleNamespace(rid="test")
+
+
+def _serve_last(mod, sess, monkeypatch):
+    """Call the module's /last endpoint against *sess* (no HTTP, no lifespan)."""
+    async def get(name):
+        return sess
+
+    monkeypatch.setattr(mod.manager, "get", get)
+    return _run(mod.get_last(_Req(), name="unit", wait=0.0))
+
+
+class TestLastEndpointStatus:
+    def test_agy_never_started_keeps_the_old_shape(self, agy_fastpoll, monkeypatch):
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(4, "older answer")],
+            screen="idle  ? for shortcuts", baseline=4, turn=3,
+        )
+        sess._never_started_turn = 3
+        r = _serve_last(server, sess, monkeypatch)
+        # done/response are exactly what an old client already expects...
+        assert r.done is False and r.response is None and r.turn == 3
+        # ...and the new field tells a new client to re-send instead of poll.
+        assert r.status == "never_started"
+
+    def test_agy_still_running_is_pending(self, agy_fastpoll, monkeypatch):
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(4)],
+            screen="Generating...  esc to cancel", baseline=4, turn=3,
+        )
+        r = _serve_last(server, sess, monkeypatch)
+        assert (r.done, r.status) == (False, "pending")
+
+    def test_agy_ingested_turn_clears_the_verdict(self, agy_fastpoll, monkeypatch):
+        # Turn 3 was dropped; the client re-sent and turn 4 answered normally.
+        sess = _agy_session(
+            monkeypatch, transcript=lambda: [_step(9, "the new answer")],
+            screen="idle  ? for shortcuts", baseline=4, turn=4,
+        )
+        sess._never_started_turn = 3
+        r = _serve_last(server, sess, monkeypatch)
+        assert (r.done, r.status, r.response) == (True, "done", "the new answer")
+
+    def test_codex_never_started_keeps_the_old_shape(self, codex_fastpoll, monkeypatch):
+        sess = _codex_session(
+            monkeypatch, events=lambda: [_ev_meta(), _ev_start("t1"), _ev_complete("t1")],
+            baseline=1, turn=2,
+        )
+        sess._last_baseline_starts = 1
+        sess._never_started_turn = 2
+        monkeypatch.setattr(sess, "_capture", _idle_capture)
+        r = _serve_last(codex_server, sess, monkeypatch)
+        assert (r.done, r.response, r.turn, r.status) == (False, None, 2, "never_started")
+
+    def test_codex_done_turn_is_status_done(self, codex_fastpoll, monkeypatch):
+        sess = _codex_session(
+            monkeypatch,
+            events=lambda: [_ev_meta(), _ev_start("t1"), _ev_complete("t1", last="answer one")],
+            baseline=0, turn=1,
+        )
+        r = _serve_last(codex_server, sess, monkeypatch)
+        assert (r.done, r.status, r.response) == (True, "done", "answer one")
+
+
+# ===========================================================================
+# codex /last: bind a rollout that appeared AFTER submit-time discovery failed
+# ===========================================================================
+
+def _late_rollout(sessions_dir, name, *, cwd, events):
+    p = Path(sessions_dir) / f"rollout-{name}.jsonl"
+    p.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    return p
+
+
+@pytest.fixture()
+def sessions_dir(tmp_path, monkeypatch):
+    d = tmp_path / "sessions"
+    d.mkdir()
+    monkeypatch.setattr(codex_server, "CODEX_SESSIONS_DIR", d)
+    return d
+
+
+class TestCodexLateRolloutBinding:
+    """A first turn whose rollout never resolved leaves the session with ref='-'
+    and no answer source at all: every later poll was answerless FOREVER, even
+    once codex's rollout showed up. /last now re-runs the same one-pass binding
+    scan while the ref is unresolved, so the answer is still recoverable."""
+
+    def _session(self, monkeypatch):
+        sess = codex_server.CodexSession(name="unit")
+        sess._turn_count = 1
+        sess._rollout_before = set()  # what the (failed) first submit captured
+        monkeypatch.setattr(codex_server, "RESPONSE_POLL_INTERVAL", 0.02)
+        return sess
+
+    def test_binds_the_late_rollout_and_returns_its_answer(self, sessions_dir, monkeypatch):
+        sess = self._session(monkeypatch)
+        assert sess.ref == "-"
+        _late_rollout(
+            sessions_dir, "late", cwd=str(sess.cwd),
+            events=[{"type": "session_meta", "payload": {"id": "late-1", "cwd": str(sess.cwd)}},
+                    _ev_start("t1"), _ev_complete("t1", last="the recovered answer")],
+        )
+        assert _run(sess.last(0)) == (True, "the recovered answer", 1)
+        assert sess.ref == "late-1", "the session must now be bound for every later poll"
+
+    def test_ignores_a_rollout_belonging_to_another_session(self, sessions_dir, monkeypatch):
+        sess = self._session(monkeypatch)
+        _late_rollout(
+            sessions_dir, "theirs", cwd="/some/other/cwd",
+            events=[{"type": "session_meta", "payload": {"id": "theirs", "cwd": "/some/other/cwd"}},
+                    _ev_start("t1"), _ev_complete("t1", last="not ours")],
+        )
+        assert _run(sess.last(0)) == (False, "", 1)
+        assert sess.ref == "-"
+
+    def test_a_session_that_never_submitted_binds_nothing(self, sessions_dir, monkeypatch):
+        sess = self._session(monkeypatch)
+        sess._rollout_before = None  # no first submit has run
+        _late_rollout(
+            sessions_dir, "late", cwd=str(sess.cwd),
+            events=[{"type": "session_meta", "payload": {"id": "late-1", "cwd": str(sess.cwd)}},
+                    _ev_start("t1"), _ev_complete("t1", last="the recovered answer")],
+        )
+        assert _run(sess.last(0)) == (False, "", 1)
+        assert sess.ref == "-"
+
+    def test_a_rollout_that_existed_before_the_submit_is_not_adopted(self, sessions_dir, monkeypatch):
+        # Pre-existing files are excluded by the same `before` set the submit
+        # used, so a neighbouring session's rollout can never be mistaken for ours.
+        sess = self._session(monkeypatch)
+        p = _late_rollout(
+            sessions_dir, "old", cwd=str(sess.cwd),
+            events=[{"type": "session_meta", "payload": {"id": "old-1", "cwd": str(sess.cwd)}},
+                    _ev_start("t1"), _ev_complete("t1", last="stale answer")],
+        )
+        sess._rollout_before = {str(p)}
+        assert _run(sess.last(0)) == (False, "", 1)
