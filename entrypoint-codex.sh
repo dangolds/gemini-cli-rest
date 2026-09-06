@@ -53,4 +53,5 @@ fi
 # agy bridge), so the uvloop workaround applies here too: --loop asyncio avoids
 # uvloop mishandling the subprocess pipes inherited by the forked tmux daemon.
 # (codex_server's lifespan also pre-starts the tmux server with DEVNULL stdio.)
-exec uvicorn codex_server:app --host 0.0.0.0 --port 8001 --loop asyncio
+# --no-access-log: see entrypoint.sh.
+exec uvicorn codex_server:app --host 0.0.0.0 --port 8001 --loop asyncio --no-access-log

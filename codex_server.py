@@ -185,22 +185,35 @@ CARET_CHARS = ("›", "»")
 # tmux client commands are sub-second; anything longer means a stuck client.
 TMUX_CMD_TIMEOUT = float(os.getenv("TMUX_CMD_TIMEOUT", "15"))
 
-_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+# One process = one bridge, so a fixed tag tells the two bridges' lines apart
+# in the shared container stream (worktree lines included). The bridge's own
+# logger name is implied by the tag; other loggers (worktree) keep theirs.
+LOG_TAG = "codex"
+LOGGER_NAME = "codex-rest"
+
+
+class _BridgeFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        record.src = "" if record.name == LOGGER_NAME else f"{record.name}: "
+        return super().format(record)
+
+
+_LOG_FMT = f"%(asctime)s [{LOG_TAG}] %(levelname)-7s %(src)s%(message)s"
+_stream_handler = logging.StreamHandler()
+# Live tail (docker logs): time of day is enough; the file keeps the full date.
+_stream_handler.setFormatter(_BridgeFormatter(_LOG_FMT, datefmt="%H:%M:%S"))
+_log_handlers: list[logging.Handler] = [_stream_handler]
 try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    _log_handlers.append(
-        RotatingFileHandler(
-            LOG_DIR / "codex-rest.log", maxBytes=10_000_000, backupCount=5
-        )
+    _file_handler = RotatingFileHandler(
+        LOG_DIR / "codex-rest.log", maxBytes=10_000_000, backupCount=5
     )
+    _file_handler.setFormatter(_BridgeFormatter(_LOG_FMT))
+    _log_handlers.append(_file_handler)
 except OSError:
     pass  # file logging is best-effort; never block startup on it
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=_log_handlers,
-)
-logger = logging.getLogger("codex-rest")
+logging.basicConfig(level=LOG_LEVEL, handlers=_log_handlers)
+logger = logging.getLogger(LOGGER_NAME)
 
 
 # --- Audit-trail helpers (used by /last logging) ----------------------------
@@ -1383,7 +1396,16 @@ class CodexSession:
             lines.append("\n=== rendered screen when we gave up ===")
             lines.append(screen)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.warning("Session '%s': wrote diagnostic to %s", self.name, path)
+            if reason == "slow_success":
+                # The turn succeeded; the dump only shows where the time went.
+                logger.info(
+                    "Session '%s': slow turn (%.0fs > %.0fs) — diagnostic saved to %s",
+                    self.name, elapsed, RESPONSE_SLOW_DUMP_SECS, path,
+                )
+            else:
+                logger.warning(
+                    "Session '%s': %s — diagnostic saved to %s", self.name, reason, path
+                )
             if reason in ("hard_timeout", "stalled"):
                 # Mark this turn's dump so /last can append a completion footer
                 # once it recovers the answer the turn produced after give-up.
@@ -1626,7 +1648,7 @@ async def access_log(request: Request, call_next):
                  is a request still hung in its handler (e.g. a wedged turn).
       * break  — an unhandled error logs a full traceback ('!!!') and returns
                  500 instead of vanishing; HTTPExceptions show as their status.
-      * slow   — every completion carries its wall-clock duration in ms.
+      * slow   — every completion carries its wall-clock duration in seconds.
     Health checks log at DEBUG so routine polling never floods the file.
     """
     rid = uuid.uuid4().hex[:8]
@@ -1637,16 +1659,15 @@ async def access_log(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        elapsed = int((time.monotonic() - t0) * 1000)
         logger.exception(
-            "!!! %s %s [%s] unhandled error after %dms",
-            request.method, request.url.path, rid, elapsed,
+            "!!! %s %s [%s] unhandled error after %.1fs",
+            request.method, request.url.path, rid, time.monotonic() - t0,
         )
         raise
-    elapsed = int((time.monotonic() - t0) * 1000)
     logger.log(
-        level, "<-- %s %s [%s] %d in %dms",
-        request.method, request.url.path, rid, response.status_code, elapsed,
+        level, "<-- %s %s [%s] %d in %.1fs",
+        request.method, request.url.path, rid, response.status_code,
+        time.monotonic() - t0,
     )
     return response
 
@@ -1838,22 +1859,22 @@ async def get_last(
             timing = " (" + ", ".join(bits) + ")"
         logger.info(
             "[%s] /last HIT session '%s' ref=%s turn=%d attempt=%d recovered %d "
-            "chars in %dms%s: %r",
-            rid, name, session.ref, turn, attempt, len(response), elapsed, timing,
+            "chars in %.1fs%s: %r",
+            rid, name, session.ref, turn, attempt, len(response), elapsed / 1000, timing,
             _preview(response),
         )
     elif never:
         logger.warning(
             "[%s] /last NEVER_STARTED session '%s' ref=%s turn=%d attempt=%d — codex "
             "dropped the prompt (nothing ingested, screen idle); the turn will never "
-            "answer, re-send it. Answered in %dms",
-            rid, name, session.ref, turn, attempt, elapsed,
+            "answer, re-send it. Answered in %.1fs",
+            rid, name, session.ref, turn, attempt, elapsed / 1000,
         )
     else:
         logger.info(
             "[%s] /last PENDING session '%s' ref=%s turn=%d attempt=%d — no completed "
-            "answer yet (still running) after %dms",
-            rid, name, session.ref, turn, attempt, elapsed,
+            "answer yet (still running) after %.1fs",
+            rid, name, session.ref, turn, attempt, elapsed / 1000,
         )
     return LastResponse(
         done=done,

@@ -25,4 +25,6 @@ echo "[agy] update check (best-effort)..."
 timeout 90 agy update </dev/null 2>&1 || echo "[agy] update skipped/failed (continuing)"
 
 # --loop asyncio: uvloop's subprocess pipes mishandle the forked tmux daemon
-exec uvicorn server:app --host 0.0.0.0 --port 8000 --loop asyncio
+# --no-access-log: the bridge middleware already logs every request with a
+# timestamp, request id and duration; uvicorn's access line duplicated it.
+exec uvicorn server:app --host 0.0.0.0 --port 8000 --loop asyncio --no-access-log
