@@ -53,11 +53,13 @@ services:
       # the Low the persisted settings.json defaults to. Slower turns, better answers.
       - AGY_MODEL=Gemini 3.8 Flash (High)
       - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
-      # Highest reasoning tier. Set here, not in config.toml: that file is in the
+      # Model + effort are set here, not in config.toml: that file is in the
       # persistent volume, the TUI rewrites it (it had drifted to "medium"), and
-      # the entrypoint only seeds it when absent — so the flag is the only thing
-      # that reliably sticks.
-      - CODEX_EFFORT=ultra
+      # the entrypoint only seeds it when absent — so the flags are the only
+      # thing that reliably sticks. gpt-6-astra supports low..ultra; xhigh is the
+      # single-agent ceiling (max/ultra burn more).
+      - CODEX_MODEL=gpt-6-astra
+      - CODEX_EFFORT=xhigh
 
 volumes:
   agy-config:

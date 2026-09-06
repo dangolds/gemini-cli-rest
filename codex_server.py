@@ -63,6 +63,9 @@ CODEX_EXTRA_ARGS = os.getenv("CODEX_EXTRA_ARGS", "")
 # model/effort is switched, and entrypoint-codex.sh only seeds it when absent —
 # so the file drifts and the seed never re-runs. The flag wins over it every time.
 CODEX_EFFORT = os.getenv("CODEX_EFFORT", "")
+# Model slug, passed as `-m` per launch for the same drift reason as the effort.
+# Empty = codex's own default (tracks the current flagship).
+CODEX_MODEL = os.getenv("CODEX_MODEL", "")
 
 TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
 # Dedicated tmux server socket, distinct from the agy bridge's ("agy-rest"), so
@@ -607,6 +610,8 @@ class CodexSession:
         #   sandbox; mirrors agy's "always-proceed"). Belt-and-suspenders with
         #   approval_policy=never + sandbox_mode=danger-full-access in config.toml.
         parts = [CODEX_CMD, "--dangerously-bypass-approvals-and-sandbox"]
+        if CODEX_MODEL:
+            parts.extend(["-m", CODEX_MODEL])
         if CODEX_EFFORT:
             # -c takes a TOML value, so the string needs its own quotes inside
             # the single argv part (same shape as the notify hook below).
