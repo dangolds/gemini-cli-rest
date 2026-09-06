@@ -150,8 +150,8 @@ curl -s -X POST http://localhost:8001/chat/review \
 | `CODEX_SLOW_DUMP_SECS` | `90` | Dump a diagnostic for any turn slower than this, even on success |
 | `CODEX_LAST_MAX_WAIT` | `180` | Cap on `GET /last?wait=N` so it never blocks longer than a `/chat` |
 | `CODEX_EXTRA_ARGS` | _(empty)_ | Extra flags for every `codex` process, e.g. `--add-dir /repos` |
-| `CODEX_MODEL` | `gpt-6-astra` | Model slug, passed as `-m …` on every launch. Empty = codex's own default. Set here rather than in `config.toml`, which drifts (see [Configuration](#configuration-auto-approve--xhigh-reasoning)) |
-| `CODEX_EFFORT` | `xhigh` | Reasoning effort, passed as `-c model_reasoning_effort=…` on every launch. Same drift reason |
+| `CODEX_MODEL` | _(empty)_ | Model slug, passed as `-m …` on every launch; empty = codex's own default. `docker-compose.yml` sets `gpt-6-astra`. Set there rather than in `config.toml`, which drifts (see [Configuration](#configuration-auto-approve--xhigh-reasoning)) |
+| `CODEX_EFFORT` | _(empty)_ | Reasoning effort, passed as `-c model_reasoning_effort=…` on every launch; empty = whatever `config.toml` says. `docker-compose.yml` sets `xhigh`. Same drift reason |
 | `CODEX_TMUX_SOCKET` | `codex-rest` | Dedicated tmux socket (distinct from agy's `agy-rest`) |
 | `SESSIONS_ROOT` | `/tmp/codex-rest-sessions` | Per-session working dirs |
 | `CODEX_HOME` | `~/.codex` | Where codex stores auth + sessions (rollouts are read from here) |

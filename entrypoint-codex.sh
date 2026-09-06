@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Seed codex config on first run: full-access auto-approve + xhigh reasoning so
-# the interactive TUI never blocks on an approval/sandbox prompt. Only seed if
+# Seed codex config on first run: full-access auto-approve, plus the same
+# gpt-6-astra / xhigh pin the launch flags enforce, so the interactive TUI never
+# blocks on an approval/sandbox prompt. Only seed if
 # absent — the codex-config volume persists auth.json + config.toml (and the
 # one-time `codex login`) across container restarts.
 CODEX_DIR=/root/.codex
