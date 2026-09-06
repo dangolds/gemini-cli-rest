@@ -175,21 +175,29 @@ Everything lands under `LOG_DIR` (`/app/logs`), which docker-compose mounts to
     └── codex-<session>-turn<N>-<rollout>.log           # codex
 ```
 
-**Per-request access log.** The rolling `*-rest.log` files carry one line when
-each request **arrives** and one when it **finishes**, sharing a short id:
+**Per-request access log.** Every line is tagged with its bridge (`[gemini]`
+or `[codex]`, worktree lines included) so the shared `docker logs` stream stays
+attributable; the rolling `*-rest.log` files use the same format with a full
+date. Each request logs one line when it **arrives** and one when it
+**finishes**, sharing a short id; `/chat` also records who asked what:
 
 ```
---> POST /chat/foo [a1b2c3d4]          # request arrived
-<-- POST /chat/foo [a1b2c3d4] 200 in 8123ms   # finished: status + duration
-GET  /last/foo [.] /last turn 4 done=True (512 chars recovered, 3ms)
+09:34:25 [gemini] INFO    --> POST /chat/foo@dev [a1b2c3d4] from 172.20.0.1
+09:34:25 [gemini] INFO    [a1b2c3d4] /chat session 'foo@dev' ua='curl/8.18.0' prompt (33 chars): 'Reply with…'
+09:34:38 [gemini] INFO    <-- POST /chat/foo@dev [a1b2c3d4] 200 in 12.8s   # finished: status + duration
+09:34:38 [gemini] INFO    [b5c6d7e8] DELETE /chat/nope@dev failed 404: Session 'nope@dev' not found.
+09:34:38 [gemini] INFO    <-- DELETE /chat/nope@dev [b5c6d7e8] 404 in 0.0s
 ```
 
 This is how you investigate the three failure modes from the file alone:
 a **stuck** request shows a `-->` with no matching `<--` (still hung in its
 handler); a **break** logs a full `!!!` traceback and returns 500; a **slow**
-turn is the one whose `<--` carries a large `in …ms`. `/last` additionally logs
-whether it actually recovered a completed answer (`done=True/False`). Health
-checks log at `DEBUG` so polling never floods the file.
+turn is the one whose `<--` carries a large `in …s`. Any request the bridge
+fails on purpose logs its reason on a `failed NNN:` line just before the `<--`
+(WARNING for 5xx, INFO for 4xx and malformed bodies). `/last` additionally logs
+whether it actually recovered a completed answer. Health checks log at `DEBUG`
+so polling never floods the file, and uvicorn's own access log is off — the
+bridge lines above replace it.
 
 **When does a dump get written?** Whenever a turn hits the hard cap, stalls, or
 simply runs **slower than `*_SLOW_DUMP_SECS` (90s)** — even if it succeeded.
