@@ -45,6 +45,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
 from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.exception_handlers import (
+    http_exception_handler, request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
 import worktree
@@ -1637,6 +1642,32 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(StarletteHTTPException)
+async def _log_http_exception(request: Request, exc: StarletteHTTPException):
+    """Put the failure REASON in the log, not just in the HTTP body — the
+    middleware's '<--' line only shows the status. 5xx = something went wrong
+    in a spawn or turn (WARNING); 4xx = the caller's mistake (INFO)."""
+    rid = getattr(request.state, "rid", "-")
+    level = logging.WARNING if exc.status_code >= 500 else logging.INFO
+    logger.log(
+        level, "[%s] %s %s failed %d: %s",
+        rid, request.method, request.url.path, exc.status_code, exc.detail,
+    )
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_validation_error(request: Request, exc: RequestValidationError):
+    """Same for a malformed body (422) — e.g. a client sending 'message'
+    instead of 'prompt' — so the mistake is visible without the response."""
+    rid = getattr(request.state, "rid", "-")
+    logger.info(
+        "[%s] %s %s failed 422: %s", rid, request.method, request.url.path,
+        "; ".join(f"{'.'.join(map(str, e.get('loc', ())))}: {e.get('msg')}" for e in exc.errors()),
+    )
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     """Log every request to the persisted server log for post-mortem debugging.
@@ -1655,7 +1686,10 @@ async def access_log(request: Request, call_next):
     request.state.rid = rid  # so endpoint-level audit lines share the HTTP id
     level = logging.DEBUG if request.url.path == "/health" else logging.INFO
     t0 = time.monotonic()
-    logger.log(level, "--> %s %s [%s]", request.method, request.url.path, rid)
+    logger.log(
+        level, "--> %s %s [%s] from %s",
+        request.method, request.url.path, rid, _client(request),
+    )
     try:
         response = await call_next(request)
     except Exception:
@@ -1739,8 +1773,15 @@ def _is_branch_error(exc: Exception) -> bool:
 
 
 @app.post("/chat/{name:path}", response_model=ChatResponse)
-async def chat(req: ChatRequest, name: str = _NAME):
+async def chat(req: ChatRequest, request: Request, name: str = _NAME):
     """Send a message to a named session. Creates the session on first use."""
+    # Audit line for the trail: which client asked what. Logged before any
+    # spawn so a failed first turn still records the prompt it was for.
+    logger.info(
+        "[%s] /chat session '%s' ua=%r prompt (%d chars): %r",
+        getattr(request.state, "rid", "-"), name, _ua(request), len(req.prompt),
+        _preview(req.prompt, 120),
+    )
     # Branchless guard: a key with no @<base> never spawns anything — we ask the
     # caller to name a branch and return immediately (turn 0, nothing started).
     session_name, base = worktree.split_base(name)
