@@ -60,6 +60,7 @@ def _make_brain(state_dir, cid):
 def state_dir(tmp_path, monkeypatch):
     """Point the module's AGY_STATE_DIR at an isolated temp tree."""
     monkeypatch.setattr(server, "AGY_STATE_DIR", tmp_path)
+    monkeypatch.setattr(server, "TIMEOUT_LOG_DIR", tmp_path / "timeouts")
     return tmp_path
 
 
@@ -67,6 +68,7 @@ def state_dir(tmp_path, monkeypatch):
 def fast(monkeypatch):
     """Shrink the timing constants so windows elapse in fractions of a second."""
     monkeypatch.setattr(server, "CONVERSATION_DETECT_TIMEOUT", 1.0)
+    monkeypatch.setattr(server, "CONVERSATION_DETECT_MAX", 1.5)
     monkeypatch.setattr(server, "VERIFY_RESUBMIT_DELAY", 0.0)
     monkeypatch.setattr(server, "VERIFY_RESUBMIT_MAX", 2)
 
@@ -135,7 +137,7 @@ def test_send_resolves_the_conversation_after_a_gate_drop(fast, pastes, state_di
     monkeypatch.setattr(server, "_SPAWN_LOCK", asyncio.Lock())  # fresh per loop
     sess = _session(monkeypatch, GATE_SCREEN)
 
-    async def collect(baseline):
+    async def collect(baseline, **kw):
         return "answer"
 
     monkeypatch.setattr(sess, "_collect_response", collect)

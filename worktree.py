@@ -26,6 +26,8 @@ import hashlib
 import logging
 import os
 import re
+import signal
+import time
 from pathlib import Path as FsPath
 
 logger = logging.getLogger("worktree")
@@ -33,6 +35,34 @@ logger = logging.getLogger("worktree")
 # The repo worktrees are cut from. Inside the bridge container this is the
 # persisted slitled-platform clone (docker-compose named volume at /app/...).
 WORKTREE_REPO = FsPath(os.getenv("WORKTREE_REPO", "/app/slitled-platform"))
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Parse a seconds knob from the environment; garbage falls back to the
+    default (with a warning) rather than crashing the bridge at import."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+
+
+# Wall-clock cap on EVERY git call (seconds; <= 0 disables). The fetch is the
+# one that matters: ssh can stall for hours on a sleeping host or dead link,
+# and one hung fetch queued every later spawn on both bridges behind it (a
+# request once sat ~19h). On expiry the child is killed and the call fails
+# with a clear "timed out" instead of hanging.
+GIT_TIMEOUT = _env_seconds("WORKTREE_GIT_TIMEOUT", 60)
+# Coalesce fetches: at most one per this many seconds (success or failure),
+# so concurrent spawns share one fetch instead of racing for .git locks, and
+# a dead remote costs one timeout per interval rather than one per spawn.
+# The counter is per process — agy and codex are separate processes, so the
+# pair may fetch twice per interval, but never concurrently from one bridge.
+FETCH_MIN_INTERVAL = _env_seconds("WORKTREE_FETCH_MIN_INTERVAL", 60)
+_TIMEOUT_RC = 124  # coreutils `timeout` convention for "killed on expiry"
 
 # Returned (after .format(name=...)) to a caller who addresses /chat/<name>
 # with no @<branch>. Phrased as the agent asking the question, because that is
@@ -79,10 +109,36 @@ async def _git(*args: str, check: bool = True) -> tuple[int, str]:
         "git", "-C", str(WORKTREE_REPO), *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,  # own process group: a kill also reaps git's ssh child
     )
-    out, _ = await proc.communicate()
-    text = out.decode("utf-8", "replace")
-    rc = proc.returncode or 0
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=GIT_TIMEOUT if GIT_TIMEOUT > 0 else None
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        # Timeout, or our caller was cancelled: either way don't leave git (or
+        # the ssh it spawned) running. Kill the whole group — SIGKILL to git
+        # alone would orphan the ssh / remote-helper that is actually stuck.
+        for kill in (lambda: os.killpg(proc.pid, signal.SIGKILL), proc.kill):
+            try:
+                kill()
+            except ProcessLookupError:
+                pass
+        # Drain + reap via communicate(), not a bare wait(): wait() only
+        # resolves once every pipe hit EOF, and a reader paused on a full
+        # buffer (its drain task was just cancelled) would never read it.
+        # Bounded so a truly wedged pipe costs seconds, never another hang.
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except Exception:
+            logger.warning("git %s: killed but not reaped within 5s", " ".join(args))
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        logger.warning("git %s timed out after %.0fs — killed", " ".join(args), GIT_TIMEOUT)
+        rc, text = _TIMEOUT_RC, f"timed out after {GIT_TIMEOUT:.0f}s"
+    else:
+        text = out.decode("utf-8", "replace")
+        rc = proc.returncode or 0
     if check and rc != 0:
         raise RuntimeError(f"git {' '.join(args)} failed (rc={rc}): {text.strip()}")
     return rc, text
@@ -91,6 +147,53 @@ async def _git(*args: str, check: bool = True) -> tuple[int, str]:
 async def repo_ok() -> bool:
     rc, _ = await _git("rev-parse", "--git-dir", check=False)
     return rc == 0
+
+
+_fetch_lock: asyncio.Lock | None = None
+_fetch_lock_loop: asyncio.AbstractEventLoop | None = None
+_last_fetch: float = 0.0  # time.monotonic() when the last fetch attempt ENDED; 0 = never
+
+
+def _get_fetch_lock() -> asyncio.Lock:
+    """One lock per event loop (a Lock binds to the loop that first contends
+    it; the bridges run one loop for life, tests spin a new one per case)."""
+    global _fetch_lock, _fetch_lock_loop
+    loop = asyncio.get_running_loop()
+    if _fetch_lock is None or _fetch_lock_loop is not loop:
+        _fetch_lock, _fetch_lock_loop = asyncio.Lock(), loop
+    return _fetch_lock
+
+
+async def _fetch() -> None:
+    """Refresh origin/* — at most once per FETCH_MIN_INTERVAL, never two at
+    once. Callers arriving mid-fetch wait on the lock and then find it fresh;
+    callers within the interval skip. Failure (timeout, offline, auth) is a
+    WARNING, not an error: the caller carries on with whatever origin/<base>
+    the clone already has, and resolve_base's own check reports a truly
+    missing ref."""
+    global _last_fetch
+    async with _get_fetch_lock():
+        now = time.monotonic()
+        if _last_fetch and now - _last_fetch < FETCH_MIN_INTERVAL:
+            logger.debug(
+                "worktree fetch skipped: last attempt %.0fs ago (< %.0fs) repo=%s",
+                now - _last_fetch, FETCH_MIN_INTERVAL, WORKTREE_REPO,
+            )
+            return
+        rc, out = await _git("fetch", "--all", "--prune", "--quiet", check=False)
+        # Stamp at completion (success or not): callers that queued on the lock
+        # during a 60s timeout must reuse this attempt, not start another.
+        _last_fetch = time.monotonic()
+        elapsed = _last_fetch - now
+        if rc != 0:
+            lines = out.strip().splitlines()
+            logger.warning(
+                "worktree fetch failed after %.1fs (rc=%d): %s — continuing with "
+                "the origin/* refs already in %s",
+                elapsed, rc, lines[0] if lines else "(no output)", WORKTREE_REPO,
+            )
+        else:
+            logger.info("worktree fetch %s ok in %.1fs", WORKTREE_REPO, elapsed)
 
 
 async def resolve_base(base: str) -> str:
@@ -107,8 +210,9 @@ async def resolve_base(base: str) -> str:
             f"Worktree repo {WORKTREE_REPO} is not a git clone. Clone the target "
             "repo into it before starting branch sessions."
         )
-    # Refresh so origin/* are current; offline / no-remote is non-fatal.
-    await _git("fetch", "--all", "--prune", "--quiet", check=False)
+    # Refresh so origin/* are current; offline / stalled / no-remote is
+    # non-fatal (logged, then we use what the clone already has).
+    await _fetch()
     candidates: list[str] = []
     if not base.startswith("origin/"):
         candidates.append(f"origin/{base}")

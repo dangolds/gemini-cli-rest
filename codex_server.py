@@ -36,11 +36,12 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as FsPath
 
@@ -71,6 +72,12 @@ CODEX_EFFORT = os.getenv("CODEX_EFFORT", "")
 # Model slug, passed as `-m` per launch for the same drift reason as the effort.
 # Empty = codex's own default (tracks the current flagship).
 CODEX_MODEL = os.getenv("CODEX_MODEL", "")
+# Service tier ("default", "priority"/"fast", "flex"), passed as
+# `-c service_tier=…` per launch for the same drift reason: the TUI had
+# rewritten config.toml to "fast" (priority processing, which burns the ChatGPT
+# usage budget faster) without anything pinning it. Empty = leave it to
+# config.toml.
+CODEX_SERVICE_TIER = os.getenv("CODEX_SERVICE_TIER", "")
 
 TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
 # Dedicated tmux server socket, distinct from the agy bridge's ("agy-rest"), so
@@ -142,22 +149,50 @@ PASTE_VISIBLE_WAIT = float(os.getenv("CODEX_PASTE_VISIBLE_WAIT", "1.5"))
 # How long after startup we wait for codex to register the new session (its
 # rollout file, tagged with our cwd, appears).
 SESSION_DETECT_TIMEOUT = float(os.getenv("CODEX_SESSION_DETECT_TIMEOUT", "20"))
+# Re-pin (see _repin): how long to wait for the killed codex process to exit
+# before `codex resume` may take the thread's lock; SIGKILL past that.
+REPIN_EXIT_TIMEOUT = float(os.getenv("CODEX_REPIN_EXIT_TIMEOUT", "15"))
+
+# Capacity errors ("Selected model is at capacity", codex_error_info
+# server_overloaded): codex ends the turn in seconds and does NOT retry, so the
+# bridge re-submits the same prompt after a backoff (doubling per attempt), up
+# to CODEX_OVERLOAD_RETRIES more times — but only while the /chat call keeps at
+# least CODEX_OVERLOAD_MIN_BUDGET seconds of its RESPONSE_HARD_TIMEOUT. The
+# usage limit and a model drift are NEVER retried (nothing automatic for quota).
+CODEX_OVERLOAD_RETRIES = int(os.getenv("CODEX_OVERLOAD_RETRIES", "2"))
+CODEX_OVERLOAD_BACKOFF = float(os.getenv("CODEX_OVERLOAD_BACKOFF", "5"))
+CODEX_OVERLOAD_MIN_BUDGET = float(os.getenv("CODEX_OVERLOAD_MIN_BUDGET", "45"))
 
 # /last read-back: cap how long a single /last?wait=N call may block, so it
 # never holds the client longer than a /chat would (same hard ceiling).
 LAST_MAX_WAIT = float(os.getenv("CODEX_LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 
-# Push-based end-of-turn signal (fast path). codex's `notify` hook runs a
-# program the moment a turn completes, passing the turn's summary JSON as
-# argv[1]; a tiny shell hook appends that payload to NOTIFY_LOG, which tells
-# _collect_response to check the rollout the instant codex finishes instead of
-# waiting out a full poll interval. Strictly an accelerator: the rollout stays
-# the single source of truth for completion AND answer text, and with
-# CODEX_NOTIFY off the collect loop is exactly today's polling.
+# Push-based end-of-turn signal (fast path). codex runs the bridge's hook the
+# moment a turn completes; the hook appends ONE compact line (ids only, never
+# the answer text) to NOTIFY_LOG, which tells _collect_response to check the
+# rollout the instant codex finishes instead of waiting out a full poll
+# interval. Strictly an accelerator: the rollout stays the single source of
+# truth for completion AND answer text, and with CODEX_NOTIFY off the collect
+# loop is exactly today's polling.
+# The hook is wired as a codex `Stop` lifecycle hook (event JSON on STDIN), not
+# as the legacy `notify` program: `notify` hands the whole payload — the full
+# answer included — to the hook as ONE argv string, and Linux caps a single
+# argv string at 128 KiB (MAX_ARG_STRLEN), so on every big answer codex's own
+# spawn of the hook died with "Argument list too long (os error 7)" (logged only
+# in codex's sqlite log) and the push was silently lost. CODEX_NOTIFY_LEGACY=1
+# restores the argv-based `notify` wiring (same hook script, same log) as an
+# escape hatch should a codex version break the Stop hook.
 CODEX_NOTIFY = os.getenv("CODEX_NOTIFY", "1").strip().lower() not in ("0", "false", "no", "")
-NOTIFY_DIR = FsPath(os.getenv("CODEX_NOTIFY_DIR", "/tmp/codex-rest-notify"))
+CODEX_NOTIFY_LEGACY = os.getenv("CODEX_NOTIFY_LEGACY", "0").strip().lower() in ("1", "true", "yes")
+# Absolute: the hook is written from the bridge's cwd but run from codex's.
+NOTIFY_DIR = FsPath(os.getenv("CODEX_NOTIFY_DIR", "/tmp/codex-rest-notify")).absolute()
 NOTIFY_LOG = NOTIFY_DIR / "events.jsonl"
-NOTIFY_HOOK = NOTIFY_DIR / "notify-hook.sh"
+NOTIFY_HOOK = NOTIFY_DIR / "notify-hook.py"
+# Stop hooks are synchronous by default (the turn waits for them, and their
+# stdout is parsed as a stop/block decision); the bridge's is registered
+# `async` so codex never waits on it and it can never affect the turn. The
+# timeout only bounds a wedged interpreter start.
+NOTIFY_HOOK_TIMEOUT = 10
 # Wake-up cadence for the cheap notify glance, and how many of those wakes pass
 # between expensive checks (full rollout re-parse + tmux liveness capture:
 # 0.3s x 10 = every ~3s). The notify push carries the real-time signal, so the
@@ -290,6 +325,28 @@ async def _tmux(*args: str, stdin_data: bytes | None = None) -> tuple[int, str]:
     return await _exec(TMUX_BIN, "-L", TMUX_SOCKET, *args, stdin_data=stdin_data)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is *pid* a running process? A zombie counts as exited: it has released
+    everything (codex's thread lock included) and only awaits its reaper, so
+    waiting on it — or SIGKILLing it — could never end. /proc's state field is
+    the authority; a kill(0) probe is the fallback when /proc is unreadable."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+            stat = f.read()
+        # "<pid> (<comm>) <state> ..." — comm may hold spaces/parens, so the
+        # state is the field after the LAST ')'.
+        return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists (not ours to signal)
+
+
 async def _ensure_tmux_server() -> None:
     """Start the dedicated tmux server with fully detached stdio.
 
@@ -315,10 +372,11 @@ async def _ensure_tmux_server() -> None:
 def _notify_hook_safe() -> bool:
     """Whether NOTIFY_HOOK's path may be wired into codex at all.
 
-    The path is interpolated VERBATIM into the `-c notify=["<path>"]` TOML
-    override — there is no TOML escaping — so a quote or backslash from a
-    creative CODEX_NOTIFY_DIR would make codex reject its whole config and
-    exit, burning the startup timeout and turning every /chat into a 503.
+    The path is interpolated VERBATIM into the `-c hooks.Stop=[...]` (or
+    legacy `-c notify=["<path>"]`) TOML override — there is no TOML escaping
+    — so a quote or backslash from a creative CODEX_NOTIFY_DIR would make
+    codex reject its whole config and exit, burning the startup timeout and
+    turning every /chat into a 503.
     Refuse anything outside a conservative charset; both the lifespan hook
     install and _build_command consult this, so an unsafe path degrades to
     pure polling, the documented fallback.
@@ -333,6 +391,53 @@ def _notify_hook_safe() -> bool:
     return False
 
 
+# The hook codex runs at end of turn. Python (not sh) because the event has to
+# be PARSED: only the ids go to the log, so a line stays a few hundred bytes
+# however long the answer was — and the whole point is that the payload never
+# has to fit in argv. Contract with codex: exit 0 always, nothing on stdout (a
+# Stop hook's stdout is parsed as a decision), never block. Contract with
+# _notify_count: the line shape is the legacy notify payload's minus the text
+# ({"type": "agent-turn-complete", "thread-id", "turn-id", "cwd"}).
+_NOTIFY_HOOK_SRC = """\
+#!{python}
+# Installed by codex_server.py at startup — do not edit, it is overwritten.
+# codex `Stop` hook: the event JSON arrives on STDIN (legacy `notify` mode:
+# as argv[1]). Appends ONE compact line per event to the bridge's events log
+# — ids only, never the answer text — and always exits 0 with nothing on
+# stdout, so it can never fail, block, or steer a codex turn.
+import json, os, sys, time
+
+LOG = {log!r}
+
+
+def main():
+    raw = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.buffer.read()
+    ev = json.loads(raw)
+    if not isinstance(ev, dict):
+        return
+    name = str(ev.get("hook_event_name") or ev.get("hookEventName") or ev.get("type"))
+    line = json.dumps({{
+        "type": "agent-turn-complete" if name.lower() in ("stop", "agent-turn-complete") else name,
+        "thread-id": ev.get("session_id") or ev.get("sessionId") or ev.get("thread-id"),
+        "turn-id": ev.get("turn_id") or ev.get("turnId") or ev.get("turn-id"),
+        "cwd": ev.get("cwd"),
+        "ts": round(time.time(), 3),
+    }}, separators=(",", ":")) + "\\n"
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+try:
+    main()
+except Exception:
+    pass
+sys.exit(0)
+"""
+
+
 def _install_notify_hook() -> None:
     """Install the hook codex runs at end of turn (lifespan, best-effort).
 
@@ -343,16 +448,23 @@ def _install_notify_hook() -> None:
     """
     if not _notify_hook_safe():
         return
+    # A shebang can't be quoted, so the interpreter path must be plain too;
+    # otherwise fall back to whatever python3 codex's PATH resolves.
+    python = sys.executable
+    if not (python and re.fullmatch(r"[A-Za-z0-9_./-]+", python)):
+        python = "/usr/bin/env python3"
     try:
         NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
         NOTIFY_LOG.unlink(missing_ok=True)
         NOTIFY_HOOK.write_text(
-            "#!/bin/sh\n"
-            f"printf '%s\\n' \"$1\" >> {shlex.quote(str(NOTIFY_LOG))}\n",
+            _NOTIFY_HOOK_SRC.format(python=python, log=str(NOTIFY_LOG)),
             encoding="utf-8",
         )
         NOTIFY_HOOK.chmod(0o755)
-        logger.info("Notify fast path enabled (hook=%s)", NOTIFY_HOOK)
+        logger.info(
+            "Notify fast path enabled (%s hook=%s)",
+            "legacy notify" if CODEX_NOTIFY_LEGACY else "Stop", NOTIFY_HOOK,
+        )
     except OSError as exc:
         logger.warning("Could not install notify hook: %s", exc)
 
@@ -533,6 +645,212 @@ def _turn_bounds(events: list[dict], baseline_completes: int) -> tuple[str | Non
     return start_ts, end_ts
 
 
+# --- Turn outcome: usage-limit errors and model drift ------------------------
+#
+# A turn that dies on the ChatGPT usage limit still ends with a task_complete,
+# but one with a null answer and an `error` naming the cause (codex-cli 0.153):
+#   {"type":"event_msg","payload":{"type":"task_complete","turn_id":"...",
+#      "last_agent_message":null,
+#      "error":{"message":"You've hit your usage limit. ... or try again at 2:12 PM.",
+#               "codex_error_info":"usage_limit_exceeded"}}}
+# Afterwards codex SILENTLY switches the thread to a fallback model: while idle
+# it writes event_msg/thread_settings_applied{thread_settings.model=<fallback>}
+# and the next turn's turn_context{model} shows the fallback — defeating the
+# CODEX_MODEL pin. Nothing in config disables that; the bridge re-pins by
+# resuming the thread with an explicit -m (see CodexSession._repin).
+
+USAGE_LIMIT_INFO = "usage_limit_exceeded"
+# HTTP status /chat answers a failed-but-completed turn with, by verdict status.
+_FAILURE_STATUS = {"usage_limit": 429, "model_drift": 409, "error": 502}
+# The "try again at …" clause of the usage-limit message. Two shapes seen:
+# "try again at 2:12 PM." and "try again at Aug 20th, 2026 7:21 AM." (no tz).
+_RESET_RE = re.compile(r"try again at\s+(.+?)\s*\.?\s*$", re.IGNORECASE)
+
+
+class TurnFailure(Exception):
+    """A turn that COMPLETED without a usable answer: the usage limit, another
+    terminal error, or an answer served by a model other than the pin. Carries
+    the verdict dict (see _turn_verdict) so /chat can shape its status + body,
+    and how many submits of the prompt were made (>1 after capacity retries)."""
+
+    def __init__(self, verdict: dict, attempts: int = 1):
+        super().__init__(verdict.get("error") or verdict.get("status"))
+        self.verdict = verdict
+        self.attempts = attempts
+
+    @property
+    def overloaded(self) -> bool:
+        return _is_overloaded(self.verdict)
+
+
+# Real line (container rollout, 2026-09-06 12:03:52): task_complete with
+#   "error":{"message":"Selected model is at capacity. Please try a different
+#   model.","codex_error_info":"server_overloaded"}
+# — a transient upstream condition, retried by the bridge (see send()).
+RETRYABLE_ERROR_INFO = frozenset({"server_overloaded"})
+_RETRYABLE_MESSAGE_HINTS = ("at capacity", "overloaded")
+
+
+def _is_overloaded(verdict: dict | None) -> bool:
+    """Is this generic-`error` verdict the transient capacity error? Keyed on
+    codex_error_info; the message is the fallback for a build that omits it.
+    Never true for usage_limit / model_drift, whatever their text says."""
+    if not verdict or verdict.get("status") != "error":
+        return False
+    info = verdict.get("error_info")
+    # codex_error_info is a tagged enum: a plain string for unit variants
+    # ("server_overloaded") but an OBJECT for struct variants (e.g.
+    # {"http_connection_failed": {...}}) — never assume a hashable string.
+    if isinstance(info, str) and info in RETRYABLE_ERROR_INFO:
+        return True
+    msg = (verdict.get("error") or "").lower()
+    return any(hint in msg for hint in _RETRYABLE_MESSAGE_HINTS)
+
+
+def _new_turn_window(events: list[dict], baseline_completes: int) -> list[dict]:
+    """Events past the baseline_completes-th task_complete (this turn's)."""
+    completes = 0
+    for i, ev in enumerate(events):
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete":
+            completes += 1
+            if completes == baseline_completes:
+                return events[i + 1:]
+    return events if baseline_completes == 0 else []
+
+
+def _turn_completion(events: list[dict], baseline_completes: int) -> dict | None:
+    """The task_complete event that ended the new turn, if it has ended."""
+    for ev in _new_turn_window(events, baseline_completes):
+        if ev.get("type") == "event_msg" and _payload(ev).get("type") == "task_complete":
+            return ev
+    return None
+
+
+def _turn_error(events: list[dict], baseline_completes: int) -> dict | None:
+    """The `error` of the task_complete that ended the new turn, if any."""
+    done = _turn_completion(events, baseline_completes)
+    err = _payload(done).get("error") if done else None
+    return err if isinstance(err, dict) else None
+
+
+def _is_usage_limit(err: dict | None) -> bool:
+    if not err:
+        return False
+    if err.get("codex_error_info") == USAGE_LIMIT_INFO:
+        return True
+    return "usage limit" in str(err.get("message") or "").lower()
+
+
+def _turn_model(events: list[dict], baseline_completes: int) -> str | None:
+    """The model that actually served the new turn: its turn_context's model
+    (the last one before the turn's task_complete)."""
+    model = None
+    for ev in _new_turn_window(events, baseline_completes):
+        p = _payload(ev)
+        if ev.get("type") == "turn_context":
+            model = p.get("model") or model
+        elif ev.get("type") == "event_msg" and p.get("type") == "task_complete":
+            break
+    return model
+
+
+def _drifted_model(events: list[dict], pin: str, start: int = 0) -> str | None:
+    """Model a thread_settings_applied switched the thread to SINCE its last
+    completed turn (scanning from event index *start*), when it differs from
+    *pin* — i.e. the silent post-quota fallback, read from the rollout so it is
+    caught even across a bridge restart. Settings applied before a task_complete
+    are history: the turn they preceded already answered (and was checked)."""
+    if not pin:
+        return None
+    model = None
+    for ev in events[start:]:
+        if ev.get("type") != "event_msg":
+            continue
+        p = _payload(ev)
+        if p.get("type") == "task_complete":
+            model = None
+        elif p.get("type") == "thread_settings_applied":
+            settings = p.get("thread_settings")
+            if isinstance(settings, dict):
+                model = settings.get("model") or model
+    return model if model and model != pin else None
+
+
+def _parse_reset_time(message: str | None, now: datetime | None = None) -> str | None:
+    """Best-effort ISO-8601 (local zone) for the message's "try again at …".
+
+    Time-only ("2:12 PM") means today — tomorrow if that time has already
+    passed; the dated form ("Aug 20th, 2026 7:21 AM") is taken as written. The
+    text carries no timezone, so the container's local zone is assumed. None
+    when the clause is absent or in a shape we do not recognize.
+
+    *now* anchors the time-only form: the moment the message was produced
+    (the turn's completion), never the wall clock — re-reading the same turn
+    later must not move its reset over to the next day. Without an anchor a
+    time-only reset is unknowable and answers None.
+    """
+    m = _RESET_RE.search(message or "")
+    if not m:
+        return None
+    text = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", m.group(1)).strip()
+    when = None
+    for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+        try:
+            when = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if when is None:
+        try:
+            clock = datetime.strptime(text, "%I:%M %p")
+        except ValueError:
+            return None
+        if now is None:
+            return None
+        when = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+        if when <= now:
+            when += timedelta(days=1)
+    return when.astimezone().isoformat(timespec="seconds")
+
+
+def _turn_verdict(events: list[dict], baseline_completes: int, pin: str) -> dict:
+    """How the completed new turn ended, for /chat and /last alike.
+
+    status: "done" (a normal answer), "usage_limit" (the quota error — always,
+    even if some text was produced), "model_drift" (a turn served by a model
+    other than *pin*, however it ended: the text is withheld and the session
+    re-pinned before its next prompt), "error" (any other task_complete error
+    with NO answer text; an error alongside an answer keeps the answer).
+
+    The reset time is read relative to the task_complete's own timestamp, not
+    the wall clock, so re-reading the same turn later (/last) never rolls a
+    time-only "try again at" over to the next day.
+    """
+    done = _turn_completion(events, baseline_completes)
+    err = _payload(done).get("error") if done else None
+    err = err if isinstance(err, dict) else None
+    model = _turn_model(events, baseline_completes)
+    verdict = {"status": "done", "error": None, "resets_at": None, "model": model}
+    if _is_usage_limit(err):
+        msg = err.get("message") or USAGE_LIMIT_INFO
+        # Anchor: the event's timestamp, else its payload's completed_at
+        # (epoch seconds); neither -> a time-only reset stays null.
+        at = _parse_iso_ts(done.get("timestamp"))
+        if at is None and isinstance(_payload(done).get("completed_at"), (int, float)):
+            at = float(_payload(done)["completed_at"])
+        anchor = datetime.fromtimestamp(at) if at else None
+        verdict.update(status="usage_limit", error=msg,
+                       resets_at=_parse_reset_time(msg, now=anchor))
+    elif pin and model and model != pin:
+        verdict.update(status="model_drift", error=f"model drifted to {model} (pinned {pin})")
+    elif err and not _answer_for_new_turn(events, baseline_completes):
+        # error_info carries codex's own classification of the failure
+        # (e.g. "server_overloaded"); /chat's retry policy keys on it.
+        verdict.update(status="error", error=str(err.get("message") or err),
+                       error_info=err.get("codex_error_info"))
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # Codex Session (one live codex process inside a tmux session)
 # ---------------------------------------------------------------------------
@@ -598,6 +916,18 @@ class CodexSession:
     _last_dump_path: str | None = field(default=None, init=False)
     _last_dump_turn: int = field(default=-1, init=False)
     _last_dump_finished: bool = field(default=False, init=False)
+    # Verdict of the most recent COMPLETED turn (see _turn_verdict); None while
+    # a turn is running or when it timed out. send() turns a non-"done" verdict
+    # into a TurnFailure so /chat answers 429/409/502 instead of an empty 504.
+    _last_verdict: dict | None = field(default=None, init=False)
+    # The thread must be re-pinned (codex resume -m CODEX_MODEL) before its next
+    # prompt: set after a usage-limit turn (codex then silently falls back to
+    # another model) or a turn served by a non-pinned model. The rollout's
+    # thread_settings_applied is checked as well, from _drift_scan_from — the
+    # event index just after the last re-pin, so the fallback settings the
+    # re-pin already undid are never read as a fresh drift.
+    _needs_repin: bool = field(default=False, init=False)
+    _drift_scan_from: int = field(default=0, init=False)
 
     # --- Identity ----------------------------------------------------------
 
@@ -622,18 +952,27 @@ class CodexSession:
 
     # --- Lifecycle ---------------------------------------------------------
 
-    def _build_command(self) -> str:
+    def _build_command(self, resume_id: str | None = None) -> str:
+        parts = [CODEX_CMD]
+        if resume_id:
+            # `codex resume <thread>` continues the whole conversation in the
+            # SAME rollout and takes every flag a fresh launch does — so the
+            # explicit -m below overrides the fallback model the thread was
+            # silently switched to (the re-pin, see _repin).
+            parts.extend(["resume", resume_id])
         # --dangerously-bypass-approvals-and-sandbox: never block on an approval
         #   or the "do you trust this directory?" prompt (the container is the
         #   sandbox; mirrors agy's "always-proceed"). Belt-and-suspenders with
         #   approval_policy=never + sandbox_mode=danger-full-access in config.toml.
-        parts = [CODEX_CMD, "--dangerously-bypass-approvals-and-sandbox"]
+        parts.append("--dangerously-bypass-approvals-and-sandbox")
         if CODEX_MODEL:
             parts.extend(["-m", CODEX_MODEL])
         if CODEX_EFFORT:
             # -c takes a TOML value, so the string needs its own quotes inside
             # the single argv part (same shape as the notify hook below).
             parts.extend(["-c", f'model_reasoning_effort="{CODEX_EFFORT}"'])
+        if CODEX_SERVICE_TIER:
+            parts.extend(["-c", f'service_tier="{CODEX_SERVICE_TIER}"'])
         if CODEX_EXTRA_ARGS:
             parts.extend(shlex.split(CODEX_EXTRA_ARGS))
         # Grant codex read access to THIS session's per-run worktree. The static
@@ -643,12 +982,31 @@ class CodexSession:
         # writable alongside the primary workspace") — same name as agy's.
         parts.extend(["--add-dir", str(self.cwd)])
         if CODEX_NOTIFY and _notify_hook_safe():
-            # End-of-turn push signal: codex runs NOTIFY_HOOK with the turn's
-            # summary JSON as argv[1] the moment a turn completes. -c takes a
-            # TOML value, so the inline array must stay ONE argv part —
-            # shlex.join() below quotes it for the shell. ('[tui] notifications'
-            # would be useless here: its OSC 9 emits nothing in a detached pane.)
-            parts.extend(["-c", f'notify=["{NOTIFY_HOOK}"]'])
+            # End-of-turn push signal. -c takes a TOML value, so each inline
+            # override must stay ONE argv part — shlex.join() below quotes it
+            # for the shell. ('[tui] notifications' would be useless here: its
+            # OSC 9 emits nothing in a detached pane.)
+            if CODEX_NOTIFY_LEGACY:
+                # codex runs NOTIFY_HOOK with the turn's summary JSON as
+                # argv[1] — which is exactly what dies with E2BIG on answers
+                # past 128 KiB (see CODEX_NOTIFY_LEGACY).
+                parts.extend(["-c", f'notify=["{NOTIFY_HOOK}"]'])
+            else:
+                # A `Stop` lifecycle hook: codex pipes the event JSON to the
+                # command's STDIN (no argv size cap). `async` so the turn never
+                # waits on it. A hook defined through session flags has no
+                # persisted trust hash (codex lists it "untrusted" and skips
+                # it; a trusted_hash passed the same way is ignored — verified
+                # on 0.153.4), hence the bypass. It is process-wide: any other
+                # untrusted hook codex discovers (config.toml, the checkout's
+                # .codex/) runs too — acceptable for a process that already
+                # runs with approvals and the sandbox off.
+                parts.extend([
+                    "-c",
+                    f'hooks.Stop=[{{hooks=[{{type="command",command="{NOTIFY_HOOK}",'
+                    f"async=true,timeout={NOTIFY_HOOK_TIMEOUT}}}]}}]",
+                    "--dangerously-bypass-hook-trust",
+                ])
         return shlex.join(parts)
 
     async def start(self) -> None:
@@ -672,23 +1030,12 @@ class CodexSession:
         await worktree.add(self.cwd, ref)
         logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
-        await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
-        rc, out = await _tmux(
-            "new-session", "-d",
-            "-s", self.tmux_session,
-            "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
-            "-c", str(self.cwd),
-            cmd,
-        )
         # The worktree already exists; any spawn failure from here must tear it
         # down, or this generation's checkout leaks until the next prune_stale().
         try:
-            if rc != 0:
-                raise RuntimeError(f"tmux new-session failed: {out.strip()}")
-            await self._wait_ready()
+            await self._launch(cmd)
         except Exception:
-            await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
-            await worktree.remove(self.cwd)                   # tear down half-spawned worktree
+            await worktree.remove(self.cwd)  # tear down half-spawned worktree
             raise
 
         # codex creates its rollout lazily (on the first turn), so the session
@@ -700,15 +1047,48 @@ class CodexSession:
         self._last_baseline_starts = 0
         self._rollout_before = None
         self._never_started_turn = -1  # turn numbering restarts with the process
+        # A fresh process is launched pinned: nothing carried over from a
+        # generation that died without passing through _kill() may re-pin it.
+        self._last_verdict = None
+        self._needs_repin = False
+        self._drift_scan_from = 0
         logger.info("Session '%s' ready", self.name)
 
-    async def _wait_ready(self) -> None:
+    async def _launch(self, cmd: str, resumed: bool = False) -> None:
+        """Start *cmd* in this session's (fresh) tmux session and wait for the
+        TUI's ready state. On failure the tmux session is killed, then raised:
+        the callers decide what else to tear down (a spawn its worktree, a
+        re-pin nothing — the thread lives on in the rollout)."""
+        await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
+        rc, out = await _tmux(
+            "new-session", "-d",
+            "-s", self.tmux_session,
+            "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
+            "-c", str(self.cwd),
+            cmd,
+        )
+        try:
+            if rc != 0:
+                raise RuntimeError(f"tmux new-session failed: {out.strip()}")
+            if resumed:
+                await self._wait_ready(resumed=True)
+            else:
+                await self._wait_ready()
+        except Exception:
+            await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
+            raise
+
+    async def _wait_ready(self, resumed: bool = False) -> None:
         """Poll the rendered screen until codex shows its idle input prompt.
 
         The codex TUI may gate startup behind interstitials that `codex exec`
         never shows — a trust-directory prompt, an "Update available" prompt, a
         model NUX. The bypass flag preempts the trust prompt, but we still
         dismiss any interstitial defensively so a warm spawn never hangs on one.
+
+        A RESUMED thread redraws its history instead of the welcome banner, so
+        the idle composer itself counts as ready there (the banner markers
+        still do, should codex show them).
         """
         start = time.monotonic()
         while time.monotonic() - start < STARTUP_TIMEOUT:
@@ -718,7 +1098,14 @@ class CodexSession:
                     "authenticated (run 'codex login' once)."
                 )
             screen = await self._capture()
-            if any(m in screen for m in READY_MARKERS):
+            if resumed and await self._maybe_dismiss_interstitial(screen):
+                # A modal over the restored history must go first: the
+                # composer check below could otherwise pass through it.
+                await asyncio.sleep(RESPONSE_POLL_INTERVAL)
+                continue
+            if any(m in screen for m in READY_MARKERS) or (
+                resumed and self._composer_idle(screen)
+            ):
                 # The marker can beat real input readiness by a second or so —
                 # _submit_first waits out the remainder of SUBMIT_GRACE from here.
                 self._ready_at = time.monotonic()
@@ -776,6 +1163,113 @@ class CodexSession:
             "Could not determine codex session (no new rollout for this cwd appeared)"
         )
 
+    async def _repin(self, drifted: str | None) -> None:
+        """Put the thread back on CODEX_MODEL before its next prompt.
+
+        codex has no switch for the silent post-quota fallback and the TUI's
+        /model is an interactive picker, so the only lever is a relaunch: kill
+        the codex process (it holds a per-thread lock, so its exit is CONFIRMED
+        first), then `codex resume <thread>` in the same tmux session with the
+        full launch flag set — the explicit -m overrides the thread's persisted
+        fallback model while the whole conversation is kept. resume appends to
+        the SAME rollout, so the bound path/thread id stay and send() re-reads
+        its baselines from the file as it does for any later turn.
+        """
+        thread = self._session_id
+        logger.warning(
+            "re-pinning session %s: model drifted to %s, resuming thread %s with -m %s",
+            self.name, drifted or "(unknown)", thread, CODEX_MODEL,
+        )
+        pids = await self._codex_pids()
+        if not pids:
+            # Nothing to confirm the exit against: leave the thread (and its
+            # worktree) exactly as they are rather than resume into its lock.
+            raise RuntimeError(
+                f"re-pin of thread {thread} aborted: cannot identify the codex "
+                "process to stop (session left as is)"
+            )
+        await _tmux("kill-session", "-t", self._target)  # SIGHUP to codex
+        await self._await_process_exit(pids)
+        # The fallback settings written BEFORE this point are the drift we are
+        # undoing right now; only settings applied from here on can be a new one.
+        self._drift_scan_from = len(_read_rollout(self._rollout_path))
+        try:
+            await self._launch(self._build_command(resume_id=thread), resumed=True)
+        except Exception as exc:
+            # The session is dead: the next /chat spawns a fresh (pinned) one
+            # via start(), so this generation's worktree would only leak.
+            await worktree.remove(self.cwd)
+            raise RuntimeError(f"re-pin of thread {thread} failed: {exc}") from exc
+        self._needs_repin = False
+        screen = await self._capture()
+        logger.info(
+            "Session '%s': resumed thread %s; pinned model %s %s on the status line",
+            self.name, thread, CODEX_MODEL,
+            "visible" if CODEX_MODEL in screen else "NOT visible",
+        )
+        await self._startup_grace()  # same settle a fresh session's first paste gets
+
+    async def _codex_pids(self) -> set[int]:
+        """PIDs of this session's codex process: the pane's own pid (the pane
+        was created with the command, no shell in between) plus any process
+        whose cmdline grants THIS session's cwd (`--add-dir <cwd>`, unique per
+        generation) — two independent lookups, so a pane-pid miss still
+        identifies the process holding the thread lock."""
+        pids: set[int] = set()
+        rc, out = await _tmux("display-message", "-p", "-t", self._target, "#{pane_pid}")
+        try:
+            if rc == 0:
+                pids.add(int(out.strip()))
+        except ValueError:
+            pass
+        pids |= self._proc_pids()
+        return pids
+
+    def _proc_pids(self) -> set[int]:
+        """/proc scan for processes granted this session's cwd (see _codex_pids)."""
+        needle = f"--add-dir\0{self.cwd}\0".encode()
+        found: set[int] = set()
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return found
+        for entry in entries:
+            if not entry.isdigit() or int(entry) == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    if needle in f.read():
+                        found.add(int(entry))
+            except OSError:
+                continue
+        return found
+
+    async def _await_process_exit(self, pids: set[int]) -> None:
+        """Wait (up to REPIN_EXIT_TIMEOUT) for every pid in *pids* to be gone;
+        SIGKILL the stragglers past that. Both codex and the bridge live in one
+        container, so the check is direct. A pid seen gone is dropped for good
+        (a reused pid must never be waited on, let alone killed)."""
+        deadline = time.monotonic() + REPIN_EXIT_TIMEOUT
+        killed = False
+        pids = {pid for pid in pids if _pid_alive(pid)}
+        while pids:
+            if time.monotonic() >= deadline:
+                if killed:
+                    raise RuntimeError(f"codex pid(s) {sorted(pids)} did not exit after SIGKILL")
+                logger.warning(
+                    "Session '%s': codex pid(s) %s still alive %.0fs after kill-session — "
+                    "sending SIGKILL", self.name, sorted(pids), REPIN_EXIT_TIMEOUT,
+                )
+                for pid in pids:
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        continue
+                killed = True
+                deadline = time.monotonic() + 5.0
+            await asyncio.sleep(0.2)
+            pids = {pid for pid in pids if _pid_alive(pid)}
+
     async def stop(self) -> None:
         async with self._lock:
             await self._kill()
@@ -792,6 +1286,9 @@ class CodexSession:
         self._rollout_before = None
         self._never_started_turn = -1  # turn numbering restarts with the process
         self._last_notify_baseline = 0
+        self._last_verdict = None
+        self._needs_repin = False  # a fresh process is launched pinned
+        self._drift_scan_from = 0
         # Notify matching is evaluated at parse time, against the generation
         # that was live when the bytes were consumed — so a respawn restarts
         # the scan: the next send() re-baselines fresh, and the dead
@@ -851,6 +1348,26 @@ class CodexSession:
         head = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
         return bool(head) and head[:40] in screen
 
+    def _composer_idle(self, screen: str) -> bool:
+        """Is the TUI at its idle composer (a resumed thread's ready state)?
+
+        The composer is the LAST caret line on screen — the restored history
+        echoes earlier prompts with the same glyph, so any-caret would fire
+        while the transcript is still being redrawn — and codex draws its
+        status line ("<model> <effort> · <cwd>") beneath it, so this session's
+        cwd must follow the caret; a busy marker anywhere means not yet.
+        """
+        lines = screen.splitlines()
+        caret = next(
+            (i for i in range(len(lines) - 1, -1, -1)
+             if lines[i].strip()[:1] in CARET_CHARS),
+            None,
+        )
+        if caret is None:
+            return False
+        below = "\n".join(lines[caret + 1:])
+        return str(self.cwd) in below and not self._is_busy(screen)
+
     @classmethod
     def _composer_empty(cls, screen: str, prompt: str) -> bool:
         """Is the composer visibly NOT holding *prompt* (so a re-paste is the
@@ -887,6 +1404,7 @@ class CodexSession:
             if not await self.is_alive():
                 raise RuntimeError("codex process is not running")
 
+            t0 = time.monotonic()  # the whole call's budget: RESPONSE_HARD_TIMEOUT
             self._turn_count += 1
             self._last_attempt = 0  # new turn -> fresh recovery-poll count
             logger.info(
@@ -920,6 +1438,36 @@ class CodexSession:
                 self._last_baseline_starts = baseline_starts
             else:
                 events = _read_rollout(self._rollout_path)
+                # Re-pin first when the thread is no longer on CODEX_MODEL — as
+                # recorded after its last turn (usage limit / drifted answer),
+                # as the rollout shows (a fallback applied while idle), or as
+                # the last turn's completion says when it landed only AFTER
+                # /chat had given up on it (a timeout: its verdict never went
+                # through _collect_response). The resumed process appends to
+                # the same rollout, so the baselines are read AFTER it, from
+                # the file as it then stands.
+                if CODEX_MODEL and self._session_id:
+                    drifted = _drifted_model(events, CODEX_MODEL, self._drift_scan_from)
+                    if not drifted and not self._needs_repin and \
+                            _count_task_completes(events) > self._last_baseline_completes:
+                        late = _turn_verdict(events, self._last_baseline_completes, CODEX_MODEL)
+                        if late["status"] in ("usage_limit", "model_drift"):
+                            self._needs_repin = True
+                            drifted = late["model"] if late["status"] == "model_drift" else None
+                    if self._needs_repin or drifted:
+                        # Provisional baselines first: a /last arriving during
+                        # the re-pin (seconds of kill + resume) then reads
+                        # "pending", not the previous turn's verdict.
+                        self._last_baseline_completes = _count_task_completes(events)
+                        self._last_baseline_starts = _count_task_starts(events)
+                        try:
+                            await self._repin(drifted)
+                        except Exception:
+                            # The prompt was never pasted: /last says so
+                            # (never_started) instead of pending forever.
+                            self._never_started_turn = self._turn_count
+                            raise
+                        events = _read_rollout(self._rollout_path)
                 baseline_completes = _count_task_completes(events)
                 baseline_starts = _count_task_starts(events)
                 # Publish the baselines BEFORE submitting, so a /last arriving
@@ -931,6 +1479,55 @@ class CodexSession:
                 await self._submit_confirmed(prompt, baseline_starts)
 
             response = await self._collect_response(baseline_completes, baseline_starts)
+            # Capacity retry: codex gives the "at capacity" task_complete up in
+            # seconds and never retries it itself. Re-submit the SAME prompt as
+            # a new turn on the same thread after a doubling backoff, at most
+            # CODEX_OVERLOAD_RETRIES more times and only while the call keeps
+            # CODEX_OVERLOAD_MIN_BUDGET of its hard timeout (the retry's own
+            # collection is capped at exactly that remainder). Only the
+            # capacity error qualifies — never usage_limit or model_drift.
+            attempts = 1
+            while _is_overloaded(self._last_verdict):
+                backoff = CODEX_OVERLOAD_BACKOFF * (2 ** (attempts - 1))
+                remaining = RESPONSE_HARD_TIMEOUT - (time.monotonic() - t0) - backoff
+                if attempts > CODEX_OVERLOAD_RETRIES or remaining < CODEX_OVERLOAD_MIN_BUDGET:
+                    logger.warning(
+                        "Session '%s' ref=%s: turn %d still at capacity after %d "
+                        "attempt(s) (%s) — giving up (%s)", self.name,
+                        self._session_id or "-", self._turn_count, attempts,
+                        self._last_verdict["error"],
+                        "retries exhausted" if attempts > CODEX_OVERLOAD_RETRIES
+                        else f"only {remaining:.0f}s of budget left after a {backoff:.0f}s backoff",
+                    )
+                    break
+                logger.warning(
+                    "Session '%s' ref=%s: turn %d hit capacity (%s) — retry %d of %d "
+                    "in %.0fs (%.0fs of budget left)", self.name,
+                    self._session_id or "-", self._turn_count, self._last_verdict["error"],
+                    attempts, CODEX_OVERLOAD_RETRIES, backoff, remaining,
+                )
+                await asyncio.sleep(backoff)
+                # The failed turn appended its own task_complete: re-read the
+                # baselines from the rollout as any later turn does, and publish
+                # them BEFORE the re-submit so a concurrent /last reads pending.
+                events = _read_rollout(self._rollout_path)
+                baseline_completes = _count_task_completes(events)
+                baseline_starts = _count_task_starts(events)
+                self._last_baseline_completes = baseline_completes
+                self._last_baseline_starts = baseline_starts
+                self._last_notify_baseline = self._notify_count()
+                attempts += 1
+                await self._submit_confirmed(prompt, baseline_starts)
+                # Cap measured NOW: the backoff and the re-submit (confirm wait,
+                # re-pastes) have already spent part of the call's budget.
+                response = await self._collect_response(
+                    baseline_completes, baseline_starts,
+                    hard_timeout=max(0.0, RESPONSE_HARD_TIMEOUT - (time.monotonic() - t0)),
+                )
+            if self._last_verdict and self._last_verdict["status"] != "done":
+                # Completed, but not with an answer we may hand back: the usage
+                # limit, a terminal error, or a non-pinned model's reply.
+                raise TurnFailure(self._last_verdict, attempts)
             logger.info(
                 "Session '%s' turn %d — response collected (%d chars)",
                 self.name, self._turn_count, len(response),
@@ -1154,8 +1751,8 @@ class CodexSession:
         """Count end-of-turn notify events that belong to THIS session.
 
         NOTIFY_LOG is shared by every session and only ever grows during a
-        server run (each event embeds the turn's full input messages), so the
-        count is kept INCREMENTALLY: a glance reads only the bytes appended
+        server run (the legacy notify payload even embedded the turn's full
+        input messages), so the count is kept INCREMENTALLY: a glance reads only the bytes appended
         past _notify_pos and folds new matches into _notify_matched — never a
         full re-parse at every fast-poll wake. Events are matched to us by cwd
         (the per-generation dir is unique, so it works before the first turn
@@ -1206,8 +1803,15 @@ class CodexSession:
                 self._notify_matched += 1
         return self._notify_matched
 
-    async def _collect_response(self, baseline_completes: int, baseline_starts: int) -> str:
+    async def _collect_response(
+        self, baseline_completes: int, baseline_starts: int,
+        hard_timeout: float | None = None,
+    ) -> str:
         """Poll until the turn completes, then return the new model text.
+
+        *hard_timeout* caps THIS collection (default RESPONSE_HARD_TIMEOUT); a
+        capacity retry passes what is left of the /chat call's budget so the
+        whole request still never outlives the hard timeout.
 
         A turn is complete when a NEW task_complete event appears in the rollout
         (codex's definitive end-of-turn signal).
@@ -1228,8 +1832,10 @@ class CodexSession:
         (or the signal never arriving) the loop is exactly the polling above.
         """
         start = time.monotonic()
+        hard_cap = RESPONSE_HARD_TIMEOUT if hard_timeout is None else hard_timeout
         response = ""
         exit_reason = "unknown"
+        self._last_verdict = None  # no completed turn to judge yet
         last_progress = start
         last_mtime = self._rollout_mtime()
         last_starts = baseline_starts
@@ -1243,12 +1849,12 @@ class CodexSession:
         while True:
             now = time.monotonic()
             elapsed = now - start
-            if elapsed > RESPONSE_HARD_TIMEOUT:
+            if elapsed > hard_cap:
                 exit_reason = "hard_timeout"
                 logger.warning(
                     "Session '%s' ref=%s: hit hard timeout (%.0fs) — returning "
                     "partial (%d chars); turn keeps running, recover via /last",
-                    self.name, self._session_id or "-", RESPONSE_HARD_TIMEOUT,
+                    self.name, self._session_id or "-", hard_cap,
                     len(response),
                 )
                 break
@@ -1320,6 +1926,35 @@ class CodexSession:
 
         total = time.monotonic() - start
         self._last_exit_reason = exit_reason
+        # A completed turn is judged before its text is trusted: the usage-limit
+        # task_complete (null answer + error), any other terminal error, or an
+        # answer served by a model other than the pin. The text is withheld on
+        # every non-"done" verdict; send() raises it as a TurnFailure.
+        failed = None
+        if exit_reason in ("rollout_done", "notify"):
+            verdict = _turn_verdict(events, baseline_completes, CODEX_MODEL)
+            self._last_verdict = verdict
+            if verdict["status"] != "done":
+                failed = verdict["status"]
+                response = ""
+                if CODEX_MODEL and failed in ("usage_limit", "model_drift"):
+                    # After the quota error codex silently switches the thread
+                    # to a fallback model; a drifted answer proves it already
+                    # did. Either way the next prompt must re-pin first.
+                    self._needs_repin = True
+                if failed == "usage_limit":
+                    logger.warning(
+                        "Session '%s' ref=%s: turn %d hit the USAGE LIMIT (resets %s; "
+                        "model %s) — %s", self.name, self._session_id or "-",
+                        self._turn_count, verdict["resets_at"] or "unknown",
+                        verdict["model"] or "?", verdict["error"],
+                    )
+                else:
+                    logger.warning(
+                        "Session '%s' ref=%s: turn %d ended with %s — %s",
+                        self.name, self._session_id or "-", self._turn_count,
+                        failed, verdict["error"],
+                    )
         # A give-up with no answer AND no new task_started past the submit
         # baseline means codex never took the prompt — the turn did not start,
         # so no amount of polling will produce an answer. Record it for /last
@@ -1339,13 +1974,15 @@ class CodexSession:
         )
         # Both "rollout_done" and "notify" are clean completions ("notify" is
         # just the faster route to the same rollout evidence) — dump only on a
-        # timeout, or on a slow-but-successful turn.
-        if exit_reason not in ("rollout_done", "notify") or total > RESPONSE_SLOW_DUMP_SECS:
+        # timeout, a failed verdict, or a slow-but-successful turn.
+        if failed or exit_reason not in ("rollout_done", "notify") \
+                or total > RESPONSE_SLOW_DUMP_SECS:
             # Snapshot screen + rollout tail for later investigation — on any
             # timeout, and on a slow-but-successful turn so we can see WHERE the
             # time went (the rollout events are timestamped).
-            dump_reason = exit_reason if exit_reason not in ("rollout_done", "notify") \
-                else "slow_success"
+            dump_reason = failed or (
+                exit_reason if exit_reason not in ("rollout_done", "notify") else "slow_success"
+            )
             await self._dump_diagnostic(dump_reason, baseline_completes, total, response)
         return response
 
@@ -1425,6 +2062,11 @@ class CodexSession:
     # --- Read-back -----------------------------------------------------------
 
     async def last(self, wait: float) -> tuple[bool, str, int]:
+        """(done, answer, turn) — see last_with_verdict."""
+        done, answer, turn, _ = await self.last_with_verdict(wait)
+        return done, answer, turn
+
+    async def last_with_verdict(self, wait: float) -> tuple[bool, str, int, dict | None]:
         """Re-read the most recent turn's final answer — only once it is done.
 
         Read-only and LOCK-FREE: it inspects the rollout file (never the tmux
@@ -1444,6 +2086,11 @@ class CodexSession:
         and every poll would be answerless forever) re-runs the binding scan on
         each poll, so a rollout that appears late is still adopted and its
         answers are still recoverable.
+
+        The fourth element is the done turn's verdict (see _turn_verdict; None
+        while not done), judged on the SAME events and baseline as the answer —
+        so a /chat slipping in between and moving the baseline can never turn
+        a usage-limit turn into a plain done-with-empty-text.
         """
         deadline = time.monotonic() + max(0.0, wait)
         while True:
@@ -1452,9 +2099,12 @@ class CodexSession:
             if path is not None:
                 events = _read_rollout(path)
                 if _count_task_completes(events) > baseline:
-                    return True, _answer_for_new_turn(events, baseline), self._turn_count
+                    return (
+                        True, _answer_for_new_turn(events, baseline), self._turn_count,
+                        _turn_verdict(events, baseline, CODEX_MODEL),
+                    )
             if time.monotonic() >= deadline:
-                return False, "", self._turn_count
+                return False, "", self._turn_count, None
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
 
     def _rebind_rollout(self) -> FsPath | None:
@@ -1739,7 +2389,14 @@ class LastResponse(BaseModel):
     # exact old meaning, so old clients are unaffected, while a new client can
     # tell "still working" (pending, keep polling) from "codex dropped the
     # prompt, the turn never started" (never_started, re-send it).
+    # Also "usage_limit" / "model_drift" / "error": the turn DID finish (done
+    # stays true) but without an answer we may hand back; `response` is "".
     status: str | None = None
+    # For those failed verdicts only: codex's error message, and the parsed
+    # "try again at …" of a usage-limit turn (ISO-8601, local zone; null when
+    # unsure). Absent (null) on every other answer, so old clients see no change.
+    error: str | None = None
+    resets_at: str | None = None
 
 class SessionStatus(BaseModel):
     name: str
@@ -1806,6 +2463,31 @@ async def chat(req: ChatRequest, request: Request, name: str = _NAME):
     t0 = time.monotonic()
     try:
         response = await session.send(req.prompt)
+    except TurnFailure as e:
+        # The turn finished, but on the usage limit (429: the session stays
+        # alive and re-pins itself on the next prompt — reset the usage, then
+        # simply send again), an answer from a non-pinned model (409, withheld;
+        # re-send after the re-pin), or another terminal codex error (502).
+        v = e.verdict
+        if e.overloaded:
+            # The capacity error survived the bridge's own retries (or there
+            # was no budget left to retry): the upstream is unavailable right
+            # now, not broken — 503, so the caller can simply try again later.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "server_overloaded", "message": v["error"],
+                    "attempts": e.attempts, "session": name,
+                    "model": v["model"], "pin": CODEX_MODEL or None,
+                },
+            )
+        raise HTTPException(
+            status_code=_FAILURE_STATUS.get(v["status"], 502),
+            detail={
+                "error": v["status"], "message": v["error"], "resets_at": v["resets_at"],
+                "model": v["model"], "pin": CODEX_MODEL or None, "session": name,
+            },
+        )
     except RuntimeError as e:
         # The first send can also trip a branch error (a session that spawned
         # lazily). Same conversational treatment.
@@ -1877,9 +2559,19 @@ async def get_last(
         _client(request), _ua(request),
     )
     t0 = time.monotonic()
-    done, response, turn = await session.last(min(wait, LAST_MAX_WAIT))
+    done, response, turn, verdict = await session.last_with_verdict(min(wait, LAST_MAX_WAIT))
     elapsed = int((time.monotonic() - t0) * 1000)
     never = False if done else await session.never_started()
+    # A finished turn is judged the way /chat judges it: a usage-limit turn (or
+    # a drifted / errored one) is reported as such, never as a bare empty answer.
+    failed = verdict["status"] if verdict and verdict["status"] != "done" else None
+    if failed:
+        response = ""
+        logger.warning(
+            "[%s] /last %s session '%s' ref=%s turn=%d attempt=%d — %s (resets %s)",
+            rid, failed.upper(), name, session.ref, turn, attempt, verdict["error"],
+            verdict["resets_at"] or "n/a",
+        )
     if done:
         # Pull the turn's real timing from the rollout: model_turn = how long the
         # agent actually worked; waited_for_poll = how long the finished answer
@@ -1923,7 +2615,9 @@ async def get_last(
         turn=turn,
         session=name,
         elapsed_ms=elapsed,
-        status="done" if done else ("never_started" if never else "pending"),
+        status=(failed or "done") if done else ("never_started" if never else "pending"),
+        error=verdict["error"] if failed else None,
+        resets_at=verdict["resets_at"] if failed else None,
     )
 
 

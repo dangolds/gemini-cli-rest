@@ -12,12 +12,26 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 # runtime). GitHub's "latest release" redirect tracks new versions without a
 # pin, mirroring how agy installs via its vendor script above. The tarball holds
 # a single binary we rename to `codex`.
-RUN curl -fsSL -o /tmp/codex.tar.gz \
-      "https://github.com/openai/codex/releases/latest/download/codex-x86_64-unknown-linux-musl.tar.gz" \
+#
+# codex 0.15x runs its `exec` (shell) tool through a SEPARATE helper binary,
+# `codex-code-mode-host`, shipped as its own tarball in the same release and
+# looked up next to `codex`. Without it every command the model tries to run
+# fails with "failed to spawn code-mode host ... No such file or directory".
+# Both tarballs are taken from ONE resolved release tag (via the /releases/latest
+# redirect, no API call) so the pair can never straddle a release published
+# mid-build.
+RUN TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/openai/codex/releases/latest | sed 's#.*/tag/##') \
+ && test -n "$TAG" && test "${TAG#*/}" = "$TAG" && echo "codex release: $TAG" \
+ && REL="https://github.com/openai/codex/releases/download/$TAG" \
+ && curl -fsSL -o /tmp/codex.tar.gz "$REL/codex-x86_64-unknown-linux-musl.tar.gz" \
+ && curl -fsSL -o /tmp/codex-host.tar.gz "$REL/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz" \
  && tar -xzf /tmp/codex.tar.gz -C /usr/local/bin \
+ && tar -xzf /tmp/codex-host.tar.gz -C /usr/local/bin \
  && mv /usr/local/bin/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
- && chmod +x /usr/local/bin/codex \
- && rm /tmp/codex.tar.gz
+ && mv /usr/local/bin/codex-code-mode-host-x86_64-unknown-linux-musl /usr/local/bin/codex-code-mode-host \
+ && chmod +x /usr/local/bin/codex /usr/local/bin/codex-code-mode-host \
+ && echo "${TAG#rust-v}" > /usr/local/bin/.codex-code-mode-host.version \
+ && rm /tmp/codex.tar.gz /tmp/codex-host.tar.gz
 
 WORKDIR /app
 

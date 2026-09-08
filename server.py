@@ -76,6 +76,19 @@ TIMEOUT_LOG_DIR = LOG_DIR / "timeouts"
 TIMEOUT_DUMP_STEPS = int(os.getenv("TIMEOUT_DUMP_STEPS", "40"))
 
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "60"))
+# A startup that never shows the ready marker is dumped, killed and respawned
+# this many times (in the same worktree + tmux session) before /chat gets the
+# 503. The observed stalls (2026-09-06: agy stuck right after "OAuth:
+# authenticated successfully", or two instances sharing one per-second log
+# file) are one-off; a second launch on a quiet state dir comes up in ~2s.
+AGY_STARTUP_RETRIES = int(os.getenv("AGY_STARTUP_RETRIES", "1"))
+# How long a kill waits for the agy PROCESS to be gone before SIGKILLing its
+# process group. agy's shutdown normally takes 0.1-1.3s, but it waits for
+# "migrations to complete" first and that was seen taking ~5s — so 10s keeps
+# the SIGKILL a genuine last resort.
+AGY_EXIT_WAIT = float(os.getenv("AGY_EXIT_WAIT", "10"))
+# Lines of agy's own process log quoted in a startup-timeout dump.
+STARTUP_DUMP_LOG_LINES = int(os.getenv("STARTUP_DUMP_LOG_LINES", "40"))
 RESPONSE_POLL_INTERVAL = float(os.getenv("RESPONSE_POLL_INTERVAL", "0.5"))
 RESPONSE_MIN_WAIT = float(os.getenv("RESPONSE_MIN_WAIT", "1"))
 # A turn ends when agy STOPS MAKING PROGRESS, not just on a flat wall-clock —
@@ -140,6 +153,15 @@ SUBMIT_REPASTE_DELAY = float(os.getenv("SUBMIT_REPASTE_DELAY", "3.0"))
 # How long after /clear / startup we wait for agy to register the new
 # conversation (brain dir appears).
 CONVERSATION_DETECT_TIMEOUT = float(os.getenv("CONVERSATION_DETECT_TIMEOUT", "20"))
+# Hard bound on that wait when agy is VISIBLY still working past the window
+# (process alive, screen showing a busy or auth/backend spinner): agy 1.1.27
+# can sit 20s+ on a post-login loadCodeAssist call between taking the prompt
+# and writing the transcript, and giving up then 502s a turn it goes on to
+# run. Default = the response stall timeout, so an unresponsive backend never
+# costs more than a stalled turn would.
+CONVERSATION_DETECT_MAX = float(
+    os.getenv("CONVERSATION_DETECT_MAX", str(RESPONSE_STALL_TIMEOUT))
+)
 # agy verifies account eligibility once per process launch and, for a few
 # seconds after spawn, CONSUMES a prompt submitted during that window — it
 # answers with VERIFY_REJECT_MARKER instead of starting a turn, so no
@@ -159,6 +181,11 @@ LAST_MAX_WAIT = float(os.getenv("LAST_MAX_WAIT", str(RESPONSE_HARD_TIMEOUT)))
 # raw escape stream, so these are stable plain-text strings).
 READY_MARKER = "? for shortcuts"          # idle status bar
 BUSY_MARKERS = ("Generating...", "esc to cancel")
+# Status text agy renders while an auth/backend step is in flight — the
+# startup dumps show "⢿  Signing in..." behind a braille spinner (the only
+# such text seen so far). Counts as work in progress for conversation
+# detection only, never as a turn being busy.
+STARTUP_BUSY_MARKERS = ("Signing in",)
 VERIFY_REJECT_MARKER = "Verifying your account"   # account-eligibility gate
 # agy frames its input box between two horizontal rules and renders the box's
 # first line as ">" plus whatever is waiting to be submitted, so an EMPTY box is
@@ -268,6 +295,36 @@ async def _exec(*argv: str, stdin_data: bytes | None = None) -> tuple[int, str]:
 
 async def _tmux(*args: str, stdin_data: bytes | None = None) -> tuple[int, str]:
     return await _exec(TMUX_BIN, "-L", TMUX_SOCKET, *args, stdin_data=stdin_data)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is *pid* a running process? A zombie counts as exited: it has released
+    everything (agy's sqlite stores, presence locks, its per-second log file)
+    and only awaits its reaper, so waiting on it — or SIGKILLing it — could
+    never end. /proc's state field is the authority; a kill(0) probe is the
+    fallback when /proc is unreadable. (Same helper as codex_server's; the two
+    bridges deliberately do not import each other.)"""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+            stat = f.read()
+        # "<pid> (<comm>) <state> ..." — comm may hold spaces/parens, so the
+        # state is the field after the LAST ')'.
+        return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists (not ours to signal)
+
+
+class StartupTimeout(RuntimeError):
+    """_wait_ready gave up: the process is alive but never showed the idle
+    prompt. Distinct from "agy exited during startup" so the spawn retry
+    fires only for the stall it was built for."""
 
 
 async def _ensure_tmux_server() -> None:
@@ -417,6 +474,20 @@ def _new_response_bounds(steps: list[dict], baseline: int) -> tuple[str | None, 
 # attributable to exactly one session.
 _SPAWN_LOCK = asyncio.Lock()
 
+# Serializes the whole agy STARTUP phase (tmux new-session -> ready marker)
+# across every session of this bridge: only one agy process may be
+# initializing at a time. agy keeps shared state under AGY_STATE_DIR that it
+# does not cope with sharing at that instant — its process log is one file
+# per START SECOND (log/cli-YYYYMMDD_HHMMSS.log: two processes spawned 35ms
+# apart on 2026-09-06 12:08:51 wrote into the same file, one of them never
+# reached the prompt), plus its sqlite stores and presence/*.lock. A process
+# started 90ms after two others were killed (12:01:31, both still "Waiting
+# for migrations to complete") stalled right after "OAuth: authenticated
+# successfully" and never issued its loadCodeAssist call. _SPAWN_LOCK keeps
+# its narrower role (brain-dir attribution on the first message); this lock
+# is separate so a first-turn submit is never queued behind a 60s startup.
+_STARTUP_LOCK = asyncio.Lock()
+
 
 @dataclass
 class AgySession:
@@ -457,6 +528,14 @@ class AgySession:
     _last_dump_path: str | None = field(default=None, init=False)
     _last_dump_turn: int = field(default=-1, init=False)
     _last_dump_finished: bool = field(default=False, init=False)
+    # Pid of this session's agy process (the tmux pane pid), remembered from
+    # the spawn / the last kill: once kill-session has destroyed the pane tmux
+    # can no longer name it, and a survivor (or a kill interrupted mid-wait)
+    # must still be re-checked by the next kill rather than assumed gone.
+    _agy_pid: int | None = field(default=None, init=False)
+    # Wall-clock instant of the current process's spawn: names agy's own
+    # per-process log, which a post-startup diagnostic dump tails.
+    _spawned_at: float = field(default=0.0, init=False)
 
     # --- Identity ----------------------------------------------------------
 
@@ -519,28 +598,16 @@ class AgySession:
         await worktree.add(self.cwd, ref)
         logger.info("Spawning '%s' in tmux session %s (cwd=%s)", cmd, self.tmux_session, self.cwd)
 
-        await _tmux("kill-session", "-t", self._target)  # clear leftovers, ignore rc
-        # A fresh process must not inherit a previous run's end-of-turn bells.
-        try:
-            self.bell_file.unlink(missing_ok=True)
-        except OSError:
-            pass
-        rc, out = await _tmux(
-            "new-session", "-d",
-            "-s", self.tmux_session,
-            "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
-            "-c", str(self.cwd),
-            cmd,
-        )
         # The worktree already exists; any spawn failure from here must tear it
         # down, or this generation's checkout leaks until the next prune_stale().
+        # The git work above stays OUTSIDE the startup lock (a fetch can take
+        # up to WORKTREE_GIT_TIMEOUT and touches nothing of agy's); everything
+        # from the leftover kill to the ready marker runs under it.
         try:
-            if rc != 0:
-                raise RuntimeError(f"tmux new-session failed: {out.strip()}")
-            await self._wait_ready()
-        except Exception:
-            await _tmux("kill-session", "-t", self._target)  # don't leave a zombie
-            await worktree.remove(self.cwd)                   # tear down half-spawned worktree
+            async with _STARTUP_LOCK:
+                await self._launch_until_ready(cmd)
+        except BaseException:
+            await worktree.remove(self.cwd)  # tear down half-spawned worktree (cancel too)
             raise
 
         # agy creates its conversation lazily (on the first message or on
@@ -551,6 +618,61 @@ class AgySession:
         self._last_bell_baseline = 0
         self._never_started_turn = -1  # turn numbering restarts with the process
         logger.info("Session '%s' ready", self.name)
+
+    async def _launch_until_ready(self, cmd: str) -> None:
+        """Start agy in this session's tmux session and wait for its prompt,
+        respawning up to AGY_STARTUP_RETRIES times on a startup stall.
+
+        Runs under _STARTUP_LOCK (see there). Each attempt first makes sure no
+        previous agy process of this session is still alive — the kill waits
+        for the pid to be gone — so a start can never overlap a shutdown.
+        Every failed attempt is dumped (screen + agy's own process log) BEFORE
+        its process is killed, which is the evidence the 60s timeout used to
+        throw away.
+        """
+        attempts = 1 + max(0, AGY_STARTUP_RETRIES)
+        try:
+            for attempt in range(1, attempts + 1):
+                if not await self._kill_process():  # clear leftovers, exit confirmed
+                    # Starting on top of a process that survived SIGKILL is
+                    # exactly the overlap this lock exists to prevent.
+                    raise RuntimeError(
+                        "a previous agy process of this session refuses to exit"
+                    )
+                # A fresh process must not inherit a previous run's end-of-turn bells.
+                try:
+                    self.bell_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                spawned_at = time.time()
+                self._spawned_at = spawned_at
+                rc, out = await _tmux(
+                    "new-session", "-d",
+                    "-s", self.tmux_session,
+                    "-x", str(TERM_WIDTH), "-y", str(TERM_HEIGHT),
+                    "-c", str(self.cwd),
+                    cmd,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"tmux new-session failed: {out.strip()}")
+                self._agy_pid = await self._pane_pid()  # known even if cancelled below
+                try:
+                    await self._wait_ready()
+                    return
+                except StartupTimeout as exc:
+                    await self._dump_startup_diagnostic(attempt, attempts, spawned_at, str(exc))
+                    if attempt >= attempts:
+                        raise StartupTimeout(f"{exc} (after {attempts} attempts)") from None
+                    logger.warning(
+                        "Session '%s': %s — killing the stuck process and respawning "
+                        "(attempt %d of %d)", self.name, exc, attempt + 1, attempts,
+                    )
+        except BaseException:
+            # Still under the startup lock: the failed process must be GONE
+            # before the next queued spawn may start, not merely SIGHUPed.
+            # BaseException: a cancelled request must not leave agy running.
+            await self._kill_process()
+            raise
 
     async def _wait_ready(self) -> None:
         """Poll the rendered screen until agy shows its idle input prompt."""
@@ -569,7 +691,109 @@ class AgySession:
                 )
                 return
             await asyncio.sleep(RESPONSE_POLL_INTERVAL)
-        raise RuntimeError(f"agy startup timed out after {STARTUP_TIMEOUT:.0f}s")
+        raise StartupTimeout(f"agy startup timed out after {STARTUP_TIMEOUT:.0f}s")
+
+    def _agy_log_tail(self, spawned_at: float) -> str:
+        """Tail of the newest agy process log started at/after *spawned_at*.
+
+        agy writes one log per process under AGY_STATE_DIR/log, named by its
+        start second (cli-YYYYMMDD_HHMMSS.log, local time). file_watcher
+        chatter (one line per watched path event) is dropped so the tail
+        shows the startup sequence: auth, loadCodeAssist, model resolution —
+        or where it stopped. Pure best-effort; any failure is reported inline.
+        """
+        log_dir = AGY_STATE_DIR / "log"
+        try:
+            newest: tuple[float, FsPath] | None = None
+            for path in log_dir.glob("cli-*.log"):
+                try:
+                    started = time.mktime(
+                        time.strptime(path.stem[len("cli-"):], "%Y%m%d_%H%M%S")
+                    )
+                except ValueError:
+                    try:
+                        started = path.stat().st_mtime
+                    except OSError:
+                        continue
+                # 2s slack: the file name is truncated to the second and the
+                # spawn instant is taken before tmux forks the process.
+                if started >= spawned_at - 2 and (newest is None or started > newest[0]):
+                    newest = (started, path)
+            if newest is None:
+                return f"(no agy log under {log_dir} started at/after the spawn)"
+            path = newest[1]
+            lines = [
+                ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if "file_watcher" not in ln
+            ]
+            tail = lines[-STARTUP_DUMP_LOG_LINES:]
+            head = f"=== {path} (last {len(tail)} of {len(lines)} non-file_watcher lines) ==="
+            return "\n".join([head, *tail])
+        except OSError as exc:
+            return f"(agy log unreadable: {exc})"
+
+    async def _dump_startup_diagnostic(
+        self, attempt: int, attempts: int, spawned_at: float, reason: str
+    ) -> None:
+        """Write what a startup stall looked like: the rendered screen and the
+        tail of agy's own process log, BEFORE the stuck process is killed.
+        Best-effort — diagnostics must never turn into a second failure."""
+        path = TIMEOUT_LOG_DIR / (
+            f"{worktree.safe_name(self.name)}-startup-g{self._generation}-attempt{attempt}.log"
+        )
+        header = [
+            f"session={self.name} reason=startup_timeout attempt={attempt}/{attempts}",
+            f"tmux_session={self.tmux_session} cwd={self.cwd}",
+            f"spawned_at={datetime.fromtimestamp(spawned_at).isoformat(timespec='milliseconds')} "
+            f"startup_timeout={STARTUP_TIMEOUT:.0f}s detail={reason}",
+        ]
+        if await self._dump_process_diagnostic(path, header, spawned_at):
+            logger.warning(
+                "Session '%s': startup timed out (attempt %d/%d) — diagnostic saved to %s",
+                self.name, attempt, attempts, path,
+            )
+
+    async def _dump_detect_diagnostic(self, elapsed: float, detail: str) -> FsPath | None:
+        """Snapshot a conversation-detection give-up — the same screen + agy
+        process log evidence a startup stall gets — so the 502 is explainable
+        after the fact. Returns the dump path, None if it could not be written."""
+        path = TIMEOUT_LOG_DIR / (
+            f"{worktree.safe_name(self.name)}-detect-g{self._generation}-turn{self._turn_count}.log"
+        )
+        header = [
+            f"session={self.name} reason=conversation_detect_timeout turn={self._turn_count}",
+            f"tmux_session={self.tmux_session} cwd={self.cwd}",
+            f"elapsed={elapsed:.1f}s window={CONVERSATION_DETECT_TIMEOUT:.0f}s "
+            f"max={CONVERSATION_DETECT_MAX:.0f}s detail={detail}",
+        ]
+        return await self._dump_process_diagnostic(path, header, self._spawned_at)
+
+    async def _dump_process_diagnostic(
+        self, path: FsPath, header: list[str], spawned_at: float
+    ) -> FsPath | None:
+        """Write *header*, the rendered screen and the tail of agy's own process
+        log to *path*. Best-effort — diagnostics must never turn into a second
+        failure — so any error is logged and None returned instead."""
+        try:
+            screen = await self._capture()
+        except Exception as exc:
+            screen = f"(screen capture failed: {exc})"
+        try:
+            TIMEOUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            lines = [
+                *header,
+                "\n=== rendered screen when we gave up ===",
+                screen,
+                "\n=== agy process log ===",
+                self._agy_log_tail(spawned_at),
+            ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return path
+        except OSError as exc:
+            logger.warning(
+                "Session '%s': could not write diagnostic %s: %s", self.name, path.name, exc
+            )
+            return None
 
     async def _detect_new_conversation(
         self,
@@ -577,6 +801,8 @@ class AgySession:
         timeout: float | None = None,
         *,
         watch_verify: bool = False,
+        extend: bool = True,
+        max_wait: float | None = None,
     ) -> str | None:
         """Wait for the new brain dir agy populates with this turn's transcript.
 
@@ -591,10 +817,34 @@ class AgySession:
         With *watch_verify* on, returns None as soon as the account-verification
         gate has visibly eaten the prompt (see _submit_first) instead of waiting
         out the whole window, so the caller can re-submit.
+
+        The window (*timeout*, default CONVERSATION_DETECT_TIMEOUT) is the
+        EXPECTED time, not a deadline: with *extend* on, running out of it only
+        ends the wait when agy is not visibly working. While the process is
+        alive and the screen shows a busy or auth/backend spinner we keep
+        polling — the screen re-read about once a second — up to
+        CONVERSATION_DETECT_MAX in total. agy 1.1.27 can sit 20s+ on a
+        post-login loadCodeAssist call between taking the prompt and writing
+        the transcript, and giving up then 502s a turn it goes on to run. An
+        idle screen (the prompt was dropped), a dead process or the hard bound
+        give up as before, now leaving a dump (screen + agy's own log tail)
+        under LOG_DIR/timeouts. *extend*=False keeps the plain window: for a
+        probe whose point is to learn QUICKLY whether a re-paste landed.
+        *max_wait* (what is left of the /chat call's budget) lowers the hard
+        bound — never below the window — so a lock wait or a re-submit that
+        already spent budget cannot push the extension past the request cap.
         """
         start = time.monotonic()
         window = CONVERSATION_DETECT_TIMEOUT if timeout is None else timeout
-        while time.monotonic() - start < window:
+        limit = CONVERSATION_DETECT_MAX
+        if max_wait is not None:
+            limit = min(limit, max_wait)
+        limit = max(window, limit) if extend else window
+        extended = False
+        next_look = 0.0
+        detail = f"nothing within the {window:.0f}s window"  # refined by the checks below
+        while True:
+            elapsed = time.monotonic() - start
             candidates: dict[str, float] = {}
             for cid in _brain_dirs():
                 if cid in before:
@@ -604,19 +854,63 @@ class AgySession:
                 except OSError:
                     continue  # dir exists but no transcript yet — keep waiting
             if candidates:
+                if extended:
+                    logger.info(
+                        "Session '%s': transcript appeared after %.1fs (%.1fs past "
+                        "the %.0fs window — agy was busy the whole time)",
+                        self.name, elapsed, elapsed - window, window,
+                    )
                 return max(candidates, key=candidates.get)  # newest transcript wins
             # The notice STAYS on screen once printed, so on its own it proves
             # nothing: only an idle screen with no candidate transcript means
             # the prompt was dropped rather than running. The settle grace keeps
             # a just-submitted prompt agy has not started rendering yet from
             # reading as a fresh drop — a re-paste then would duplicate a turn.
-            if watch_verify and time.monotonic() - start >= VERIFY_RESUBMIT_DELAY:
+            screen: str | None = None
+            if watch_verify and elapsed >= VERIFY_RESUBMIT_DELAY:
                 screen = await self._capture()
                 if VERIFY_REJECT_MARKER in screen and not self._is_busy(screen):
                     return None
+            if elapsed >= window:
+                if elapsed >= limit:
+                    if extended:
+                        detail = (
+                            f"agy still busy {elapsed:.0f}s after the prompt "
+                            f"(hard bound {limit:.0f}s)"
+                        )
+                    break
+                # Past the expected window: keep going only while agy is
+                # demonstrably at work. One tmux capture per ~1s, not per poll.
+                if elapsed >= next_look:
+                    next_look = elapsed + 1.0
+                    try:
+                        if not await self.is_alive():
+                            detail = f"agy process exited {elapsed:.0f}s after the prompt"
+                            break
+                        if screen is None:  # not already read for the gate check
+                            screen = await self._capture()
+                        if not self._shows_work(screen):
+                            detail = f"screen idle {elapsed:.0f}s after the prompt"
+                            break
+                    except Exception as exc:  # tmux gone mid-check: nothing to wait for
+                        detail = f"screen check failed {elapsed:.0f}s after the prompt: {exc}"
+                        break
+                    if not extended:
+                        extended = True
+                        logger.info(
+                            "Session '%s': agy still busy after %.0fs with no transcript "
+                            "— waiting up to %.0fs", self.name, window, limit,
+                        )
             await asyncio.sleep(0.5)
+        elapsed = time.monotonic() - start
+        dump = await self._dump_detect_diagnostic(elapsed, detail)
+        logger.warning(
+            "Session '%s': no new transcript after %.1fs (%s)%s",
+            self.name, elapsed, detail, f" — diagnostic saved to {dump}" if dump else "",
+        )
         raise RuntimeError(
-            "Could not determine agy conversation id (no new transcript appeared)"
+            f"Could not determine agy conversation id (no new transcript appeared; {detail})"
+            + (f" — diagnostic saved to {dump}" if dump else "")
         )
 
     async def stop(self) -> None:
@@ -624,9 +918,12 @@ class AgySession:
             await self._kill()
 
     async def _kill(self) -> None:
-        rc, _ = await _tmux("kill-session", "-t", self._target)
-        if rc == 0:
-            logger.info("Killed tmux session %s", self.tmux_session)
+        # Under the startup lock too: a shutdown overlapping another session's
+        # startup is the same shared-state collision in the other direction.
+        # (_launch_until_ready already holds the lock and calls _kill_process
+        # directly — asyncio.Lock is not re-entrant.)
+        async with _STARTUP_LOCK:
+            await self._kill_process()
         try:
             self.bell_file.unlink(missing_ok=True)  # a dead process's bells are stale
         except OSError:
@@ -636,6 +933,73 @@ class AgySession:
         self._last_baseline_step = -1
         self._last_bell_baseline = 0
         self._never_started_turn = -1  # turn numbering restarts with the process
+
+    async def _kill_process(self) -> bool:
+        """tmux kill-session, then wait until the agy PROCESS is actually gone.
+        Returns False only if the process outlived even the SIGKILL.
+
+        kill-session only SIGHUPs the pane and returns; agy then spends 0.1-5s
+        shutting down (it waits for its store migrations first). A spawn that
+        overlaps that window is exactly the 12:01:31 stall (see _STARTUP_LOCK),
+        so the pane pid is captured BEFORE the kill and polled on /proc for up
+        to AGY_EXIT_WAIT; past that its process group gets SIGKILL. A zombie
+        counts as gone. Never raises — a kill must not fail a stop/clear/reset.
+        """
+        pid = await self._pane_pid()
+        if pid is None:
+            pid = self._agy_pid  # pane already gone: the pid remembered earlier
+        self._agy_pid = pid
+        try:
+            rc, _ = await _tmux("kill-session", "-t", self._target)
+        except RuntimeError as exc:
+            logger.warning("Session '%s': tmux kill-session failed: %s", self.name, exc)
+            rc = 1
+        if rc == 0:
+            logger.info("Killed tmux session %s", self.tmux_session)
+        if pid is None or not _pid_alive(pid):
+            self._agy_pid = None
+            return True
+        deadline = time.monotonic() + AGY_EXIT_WAIT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            if not _pid_alive(pid):
+                logger.info(
+                    "Session '%s': agy pid %d exited %.1fs after kill-session",
+                    self.name, pid, AGY_EXIT_WAIT - (deadline - time.monotonic()),
+                )
+                self._agy_pid = None
+                return True
+        logger.warning(
+            "Session '%s': agy pid %d still alive %.0fs after kill-session — "
+            "sending SIGKILL to its process group", self.name, pid, AGY_EXIT_WAIT,
+        )
+        try:
+            os.killpg(pid, 9)  # the pane pid leads its own process group
+        except OSError:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        # A SIGKILLed process is gone as soon as the kernel reaps it; give it a
+        # short, bounded grace so the next spawn never starts on top of it.
+        for _ in range(20):
+            if not _pid_alive(pid):
+                self._agy_pid = None
+                return True
+            await asyncio.sleep(0.1)
+        logger.warning(
+            "Session '%s': agy pid %d did not exit after SIGKILL", self.name, pid
+        )
+        return False  # _agy_pid kept: the next kill re-checks this survivor
+
+    async def _pane_pid(self) -> int | None:
+        """The tmux pane's pid — agy itself, since the pane was created with
+        the command and no shell in between. None once the session is gone."""
+        try:
+            rc, out = await _tmux("display-message", "-p", "-t", self._target, "#{pane_pid}")
+            return int(out.strip()) if rc == 0 else None
+        except (ValueError, RuntimeError):
+            return None
 
     async def reset(self) -> None:
         """Kill and re-spawn the process (new conversation)."""
@@ -676,6 +1040,11 @@ class AgySession:
     @staticmethod
     def _is_busy(screen: str) -> bool:
         return any(m in screen for m in BUSY_MARKERS)
+
+    @classmethod
+    def _shows_work(cls, screen: str) -> bool:
+        """Is agy visibly doing something — a turn, or an auth/backend step?"""
+        return cls._is_busy(screen) or any(m in screen for m in STARTUP_BUSY_MARKERS)
 
     @staticmethod
     def _input_box_empty(screen: str) -> bool:
@@ -730,6 +1099,7 @@ class AgySession:
             if not await self.is_alive():
                 raise RuntimeError("agy process is not running")
 
+            t0 = time.monotonic()  # the /chat budget runs from here
             self._turn_count += 1
             self._last_attempt = 0  # new turn -> fresh recovery-poll count
             logger.info(
@@ -746,7 +1116,12 @@ class AgySession:
                     # Publish the bell baseline BEFORE submitting, for the same
                     # reason as _last_baseline_step: /last may race this turn.
                     self._last_bell_baseline = self._bell_count()
-                    self._conversation_id = await self._submit_first(prompt, before)
+                    # The busy extension may use only what the lock wait left
+                    # of the call's budget (base window always granted).
+                    self._conversation_id = await self._submit_first(
+                        prompt, before,
+                        max_wait=RESPONSE_HARD_TIMEOUT - (time.monotonic() - t0),
+                    )
                 logger.info(
                     "Session '%s': resolved conversation id %s",
                     self.name, self._conversation_id,
@@ -763,7 +1138,11 @@ class AgySession:
                 self._last_bell_baseline = self._bell_count()
                 await self._submit_confirmed(prompt, baseline)
 
-            response = await self._collect_response(baseline)
+            # Cap measured NOW: conversation detection (busy extension) and the
+            # submit confirmation have already spent part of the call's budget.
+            response = await self._collect_response(
+                baseline, hard_timeout=max(0.0, RESPONSE_HARD_TIMEOUT - (time.monotonic() - t0)),
+            )
             logger.info(
                 "Session '%s' turn %d — response collected (%d chars)",
                 self.name, self._turn_count, len(response),
@@ -786,7 +1165,9 @@ class AgySession:
         await asyncio.sleep(0.15)
         await _tmux("send-keys", "-t", self._target, "Enter")
 
-    async def _submit_first(self, prompt: str, before: set[str]) -> str:
+    async def _submit_first(
+        self, prompt: str, before: set[str], max_wait: float | None = None
+    ) -> str:
         """Submit a session's first prompt and resolve its conversation id.
 
         agy's per-launch account-verification gate CONSUMES a prompt submitted
@@ -802,9 +1183,10 @@ class AgySession:
         watch = VERIFY_RESUBMIT_MAX > 0  # 0 = kill switch: plain old behavior
         resubmits = 0
         timeout = None
+        extend = True
         while True:
             cid = await self._detect_new_conversation(
-                before, timeout, watch_verify=watch
+                before, timeout, watch_verify=watch, extend=extend, max_wait=max_wait,
             )
             if cid is not None:
                 return cid
@@ -825,7 +1207,11 @@ class AgySession:
             # Half window per retry: keeps the worst case (initial window +
             # VERIFY_RESUBMIT_MAX x (delay + this)) well inside the request's
             # latency budget. A re-paste that lands is detected in ~1-2s.
+            # No busy extension here: the probe exists to learn quickly whether
+            # the re-paste landed, and the initial window may already have
+            # spent the extension's budget.
             timeout = CONVERSATION_DETECT_TIMEOUT / 2
+            extend = False
 
     async def _submit_confirmed(self, prompt: str, baseline: int) -> None:
         """Submit *prompt* and make sure agy actually ingested it.
@@ -919,8 +1305,16 @@ class AgySession:
         except OSError:
             return 0.0
 
-    async def _collect_response(self, baseline: int) -> str:
+    async def _collect_response(
+        self, baseline: int, hard_timeout: float | None = None
+    ) -> str:
         """Poll until the turn is complete, then return the new model text.
+
+        *hard_timeout* caps THIS collection (default RESPONSE_HARD_TIMEOUT);
+        send() passes what is left of the /chat call's budget after submitting
+        (conversation detection may have waited on a busy agy, see
+        CONVERSATION_DETECT_MAX), so the whole request still never outlives
+        the hard timeout.
 
         A turn is complete when a new DONE model response exists in the
         transcript AND the rendered screen is idle (covers multi-step turns
@@ -942,6 +1336,7 @@ class AgySession:
         progress for RESPONSE_STALL_TIMEOUT, or RESPONSE_HARD_TIMEOUT absolute.
         """
         start = time.monotonic()
+        hard_cap = RESPONSE_HARD_TIMEOUT if hard_timeout is None else hard_timeout
         responses: list[str] = []
         confirm = 0
         exit_reason = "unknown"
@@ -954,12 +1349,12 @@ class AgySession:
         while True:
             now = time.monotonic()
             elapsed = now - start
-            if elapsed > RESPONSE_HARD_TIMEOUT:
+            if elapsed > hard_cap:
                 exit_reason = "hard_timeout"
                 logger.warning(
                     "Session '%s' ref=%s: hit hard timeout (%.0fs) — returning %d "
                     "partial response(s); turn keeps running, recover via /last",
-                    self.name, self._conversation_id or "-", RESPONSE_HARD_TIMEOUT,
+                    self.name, self._conversation_id or "-", hard_cap,
                     len(responses),
                 )
                 break

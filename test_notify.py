@@ -1,11 +1,12 @@
 """
 Unit tests for the codex bridge's notify fast path (push-based completion).
 
-codex's `notify` hook runs a program with the turn's summary JSON as argv[1]
-the moment a turn completes; the bridge's hook appends that payload to
-NOTIFY_LOG, and _collect_response uses the file as a "check the rollout NOW"
-signal instead of waiting out a full poll interval. The properties correctness
-rides on:
+codex runs the bridge's hook the moment a turn completes — as a `Stop`
+lifecycle hook with the event JSON on STDIN (the legacy `notify` program got it
+as argv[1], which Linux refuses past 128 KiB: E2BIG on every big answer); the
+hook appends a compact ids-only line to NOTIFY_LOG, and _collect_response uses
+the file as a "check the rollout NOW" signal instead of waiting out a full poll
+interval. The properties correctness rides on:
 
   * the push NEVER completes a turn by itself — a new task_complete must be
     durable in the rollout, which stays the single source of truth for the
@@ -17,6 +18,8 @@ rides on:
     grows for the whole server run, so a glance reads only newly appended bytes
   * a hook path unsafe for the TOML notify override is never wired in: both the
     install and the -c flag decline, degrading to pure polling
+  * the hook script itself can never hurt a turn: any payload size, exit 0,
+    nothing on stdout (a Stop hook's stdout is parsed as a decision)
   * with CODEX_NOTIFY off — or the signal never arriving — behavior is exactly
     the legacy polling path (rollout_done, same cadence, same timeouts)
 
@@ -25,9 +28,12 @@ mocked or tmp files. Run:  ./.venv/bin/python -m pytest test_notify.py -v
 """
 
 import asyncio
+import errno
 import json
 import os
 import shlex
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -381,18 +387,64 @@ class TestNotifyCountIncremental:
 # _build_command: the -c notify=[...] override, and its shell quoting
 # ===========================================================================
 
+@pytest.fixture(autouse=True)
+def _no_env_launch_flags(monkeypatch):
+    """The per-launch pins (effort, tier) come from the shell env; blank them so
+    these argv assertions don't depend on what the developer has exported."""
+    monkeypatch.setattr(codex_server, "CODEX_EFFORT", "")
+    monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "")
+
+
+def _stop_hook_override(hook):
+    """The exact TOML `-c` value the bridge registers — verified against codex
+    0.153.4 (`codex app-server` → hooks/list: source "sessionFlags", async,
+    timeoutSec 10, trustStatus "untrusted" — hence the bypass flag)."""
+    return (f'hooks.Stop=[{{hooks=[{{type="command",command="{hook}",'
+            f'async=true,timeout={codex_server.NOTIFY_HOOK_TIMEOUT}}}]}}]')
+
+
 class TestBuildCommand:
-    def test_includes_quoted_notify_override_when_enabled(self, monkeypatch, tmp_path):
-        hook = tmp_path / "notify-hook.sh"
+    def test_includes_quoted_stop_hook_override_when_enabled(self, monkeypatch, tmp_path):
+        hook = tmp_path / "notify-hook.py"
         monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY_LEGACY", False)
         monkeypatch.setattr(codex_server, "NOTIFY_HOOK", hook)
         monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
         cmd = codex_server.CodexSession(name="unit")._build_command()
         # the TOML inline array survives the shell as ONE argv part...
         parts = shlex.split(cmd)
-        assert parts[parts.index("-c") + 1] == f'notify=["{hook}"]'
+        assert parts[parts.index("-c") + 1] == _stop_hook_override(hook)
         # ...because shlex.join single-quoted it (the eyeball check, pinned)
-        assert f"""-c 'notify=["{hook}"]'""" in cmd
+        assert f"-c '{_stop_hook_override(hook)}'" in cmd
+        # a session-flags hook has no persisted trust hash: without the bypass
+        # codex lists it "untrusted" and never runs it
+        assert "--dangerously-bypass-hook-trust" in parts
+        # the argv-based program is gone: that is the E2BIG path
+        assert "notify=" not in cmd
+
+    def test_legacy_env_restores_the_argv_notify_program(self, monkeypatch, tmp_path):
+        hook = tmp_path / "notify-hook.py"
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY_LEGACY", True)
+        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", hook)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        cmd = codex_server.CodexSession(name="unit")._build_command()
+        parts = shlex.split(cmd)
+        assert parts[parts.index("-c") + 1] == f'notify=["{hook}"]'
+        assert "hooks.Stop" not in cmd
+        assert "--dangerously-bypass-hook-trust" not in parts
+
+    def test_resume_carries_the_stop_hook_too(self, monkeypatch, tmp_path):
+        # the re-pin relaunch (codex resume <thread>) must keep the fast path
+        hook = tmp_path / "notify-hook.py"
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY_LEGACY", False)
+        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", hook)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        parts = shlex.split(codex_server.CodexSession(name="unit")._build_command(resume_id="thr"))
+        assert parts[1:3] == ["resume", "thr"]
+        assert _stop_hook_override(hook) in parts
+        assert "--dangerously-bypass-hook-trust" in parts
 
     def test_omitted_when_disabled(self, monkeypatch):
         monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
@@ -401,6 +453,39 @@ class TestBuildCommand:
         parts = shlex.split(cmd)
         assert "-c" not in parts
         assert "notify=" not in cmd
+        assert "hooks.Stop" not in cmd
+        assert "--dangerously-bypass-hook-trust" not in parts
+
+    def _c_values(self, cmd):
+        parts = shlex.split(cmd)
+        return [parts[k + 1] for k, p in enumerate(parts) if p == "-c"]
+
+    def test_service_tier_pinned_per_launch(self, monkeypatch):
+        # Like model/effort: the flag must beat the (drifting) config.toml.
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "default")
+        cmd = codex_server.CodexSession(name="unit")._build_command()
+        assert self._c_values(cmd) == ['service_tier="default"']
+
+    def test_service_tier_omitted_when_empty(self, monkeypatch):
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        assert "service_tier" not in codex_server.CodexSession(name="unit")._build_command()
+
+    def test_effort_tier_and_notify_overrides_coexist(self, monkeypatch, tmp_path):
+        hook = tmp_path / "notify-hook.py"
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY_LEGACY", False)
+        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", hook)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        monkeypatch.setattr(codex_server, "CODEX_EFFORT", "xhigh")
+        monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "priority")
+        cmd = codex_server.CodexSession(name="unit")._build_command()
+        assert set(self._c_values(cmd)) >= {
+            'model_reasoning_effort="xhigh"', 'service_tier="priority"',
+            _stop_hook_override(hook),
+        }
 
 
 # ===========================================================================
@@ -409,21 +494,26 @@ class TestBuildCommand:
 # ===========================================================================
 
 class TestHookPathSafety:
-    UNSAFE = Path('/tmp/codex "quoted"/notify-hook.sh')
+    UNSAFE = Path('/tmp/codex "quoted"/notify-hook.py')
 
-    def test_unsafe_path_omits_the_notify_flag(self, monkeypatch):
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_unsafe_path_omits_the_notify_flag(self, monkeypatch, legacy):
         monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY_LEGACY", legacy)
         monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
         monkeypatch.setattr(codex_server, "NOTIFY_HOOK", self.UNSAFE)
         cmd = codex_server.CodexSession(name="unit")._build_command()
-        assert "-c" not in shlex.split(cmd)
+        parts = shlex.split(cmd)
+        assert "-c" not in parts
         assert "notify=" not in cmd
+        assert "hooks.Stop" not in cmd
+        assert "--dangerously-bypass-hook-trust" not in parts
 
     def test_unsafe_path_declines_the_hook_install(self, monkeypatch, tmp_path):
         bad = tmp_path / 'evil"dir'
         monkeypatch.setattr(codex_server, "NOTIFY_DIR", bad)
         monkeypatch.setattr(codex_server, "NOTIFY_LOG", bad / "events.jsonl")
-        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", bad / "notify-hook.sh")
+        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", bad / "notify-hook.py")
         codex_server._install_notify_hook()
         assert not bad.exists(), "nothing may be created for an unwireable hook"
 
@@ -431,11 +521,103 @@ class TestHookPathSafety:
         d = tmp_path / "notify"
         monkeypatch.setattr(codex_server, "NOTIFY_DIR", d)
         monkeypatch.setattr(codex_server, "NOTIFY_LOG", d / "events.jsonl")
-        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", d / "notify-hook.sh")
+        monkeypatch.setattr(codex_server, "NOTIFY_HOOK", d / "notify-hook.py")
         codex_server._install_notify_hook()
-        hook = d / "notify-hook.sh"
+        hook = d / "notify-hook.py"
         assert hook.is_file() and os.access(hook, os.X_OK)
         assert str(d / "events.jsonl") in hook.read_text()
+
+
+# ===========================================================================
+# The hook script: run for real (subprocess), as codex would. It must survive
+# ANY payload size via stdin — the legacy argv delivery is refused by Linux
+# past 128 KiB (MAX_ARG_STRLEN), which is the E2BIG failure this replaces —
+# and must never fail, block, or write to stdout.
+# ===========================================================================
+
+def _stop_payload(**over):
+    """A codex `Stop` hook stdin payload (snake_case fields per the generated
+    schema hooks/schema/generated/*.command.input.schema.json)."""
+    ev = {"session_id": "thread-1", "turn_id": "turn-7", "cwd": "/x",
+          "hook_event_name": "Stop", "model": "gpt-6-astra",
+          "permission_mode": "bypassPermissions", "stop_hook_active": False,
+          "transcript_path": None, "last_assistant_message": "the answer"}
+    ev.update(over)
+    return ev
+
+
+@pytest.fixture()
+def installed_hook(tmp_path, monkeypatch):
+    d = tmp_path / "notify"
+    monkeypatch.setattr(codex_server, "NOTIFY_DIR", d)
+    monkeypatch.setattr(codex_server, "NOTIFY_LOG", d / "events.jsonl")
+    monkeypatch.setattr(codex_server, "NOTIFY_HOOK", d / "notify-hook.py")
+    codex_server._install_notify_hook()
+    return d / "notify-hook.py"
+
+
+def _run_hook(hook, *argv, stdin=b""):
+    return subprocess.run([str(hook), *argv], input=stdin, capture_output=True, timeout=30)
+
+
+class TestHookScript:
+    BIG = 300_000  # well past MAX_ARG_STRLEN (131072)
+
+    def test_big_stdin_payload_becomes_one_compact_ids_only_line(self, installed_hook):
+        payload = json.dumps(_stop_payload(last_assistant_message="A" * self.BIG)).encode()
+        assert len(payload) > 131072
+        r = _run_hook(installed_hook, stdin=payload)
+        assert (r.returncode, r.stdout, r.stderr) == (0, b"", b"")
+        lines = codex_server.NOTIFY_LOG.read_bytes().splitlines()
+        assert len(lines) == 1 and len(lines[0]) < 512, "ids only, never the answer"
+        ev = json.loads(lines[0])
+        assert ev["type"] == "agent-turn-complete"
+        assert (ev["thread-id"], ev["turn-id"], ev["cwd"]) == ("thread-1", "turn-7", "/x")
+        assert "A" * 100 not in lines[0].decode()
+
+    def test_line_is_counted_by_thread_id_and_by_cwd(self, installed_hook):
+        sess = codex_server.CodexSession(name="unit")
+        _run_hook(installed_hook, stdin=json.dumps(_stop_payload(cwd=str(sess.cwd))).encode())
+        assert sess._notify_count() == 1  # cwd match, session id unbound
+        sess2 = codex_server.CodexSession(name="unit2")
+        assert sess2.cwd != sess.cwd  # the line's cwd is foreign to sess2...
+        sess2._session_id = "thread-1"
+        assert sess2._notify_count() == 1  # ...so this is the thread-id match
+
+    def test_legacy_argv_payload_still_appends_the_same_shape(self, installed_hook):
+        legacy = json.dumps(_notify_event(cwd="/x", thread_id="thread-L"))
+        r = _run_hook(installed_hook, legacy)
+        assert (r.returncode, r.stdout) == (0, b"")
+        ev = json.loads(codex_server.NOTIFY_LOG.read_text())
+        assert (ev["type"], ev["thread-id"], ev["cwd"]) == ("agent-turn-complete", "thread-L", "/x")
+
+    def test_non_stop_event_is_recorded_but_never_counted(self, installed_hook):
+        sess = codex_server.CodexSession(name="unit")
+        payload = _stop_payload(cwd=str(sess.cwd), hook_event_name="SessionStart")
+        assert _run_hook(installed_hook, stdin=json.dumps(payload).encode()).returncode == 0
+        assert json.loads(codex_server.NOTIFY_LOG.read_text())["type"] == "SessionStart"
+        assert sess._notify_count() == 0
+
+    def test_event_name_case_is_not_load_bearing(self, installed_hook):
+        sess = codex_server.CodexSession(name="unit")
+        payload = _stop_payload(cwd=str(sess.cwd), hook_event_name="stop")
+        assert _run_hook(installed_hook, stdin=json.dumps(payload).encode()).returncode == 0
+        assert sess._notify_count() == 1
+
+    @pytest.mark.parametrize("stdin", [b"", b"not json", b"[1, 2]", b"\xff\xfe"])
+    def test_garbage_stdin_exits_zero_silently_and_writes_nothing(self, installed_hook, stdin):
+        r = _run_hook(installed_hook, stdin=stdin)
+        assert (r.returncode, r.stdout, r.stderr) == (0, b"", b"")
+        assert not codex_server.NOTIFY_LOG.exists()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="MAX_ARG_STRLEN is a Linux limit")
+    def test_argv_delivery_is_refused_by_linux_past_128k(self, installed_hook):
+        # The bug itself, pinned: what codex's legacy `notify` did to the hook
+        # on a big answer — the spawn fails, the script never runs.
+        with pytest.raises(OSError) as exc:
+            _run_hook(installed_hook, json.dumps(_notify_event(last="A" * self.BIG)))
+        assert exc.value.errno == errno.E2BIG
+        assert not codex_server.NOTIFY_LOG.exists()
 
 
 # ===========================================================================

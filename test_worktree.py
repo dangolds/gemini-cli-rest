@@ -13,6 +13,8 @@ tip) without ever shelling out.
 Run standalone:  .venv/bin/python -m pytest test_worktree.py -q
 """
 
+import asyncio
+import logging
 import re
 from unittest.mock import AsyncMock
 
@@ -23,9 +25,16 @@ import worktree
 
 def _run(coro):
     """Drive an async function from a sync test without pytest-asyncio."""
-    import asyncio
-
     return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fetch_state(monkeypatch):
+    """The fetch coalescer is module state (last-attempt clock + lock); start
+    every test with 'never fetched' so ordering can't make a fetch get skipped."""
+    monkeypatch.setattr(worktree, "_last_fetch", 0.0)
+    monkeypatch.setattr(worktree, "_fetch_lock", None)
+    monkeypatch.setattr(worktree, "FETCH_MIN_INTERVAL", 60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +199,240 @@ def test_resolve_base_raises_when_repo_absent(monkeypatch):
         _run(worktree.resolve_base("dev"))
     # It bailed at repo_ok and never fetched.
     assert all(c.args[:1] != ("fetch",) for c in mock.await_args_list)
+
+
+def test_resolve_base_fetch_timeout_warns_and_continues(monkeypatch, caplog):
+    """A fetch that hit the git timeout (rc 124 from _git) must NOT raise out
+    of resolve_base: it logs a WARNING carrying the reason and the base still
+    resolves against the origin/* refs already in the clone."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev"})
+    real = mock.side_effect
+
+    async def fake_git(*args, check=True):
+        if args[0] == "fetch":
+            return (124, "timed out after 60s")
+        return await real(*args, check=check)
+
+    mock.side_effect = fake_git
+    with caplog.at_level(logging.WARNING, logger="worktree"):
+        assert _run(worktree.resolve_base("dev")) == "origin/dev"
+    warn = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warn) == 1
+    assert "timed out after 60s" in warn[0].getMessage()
+    assert "rc=124" in warn[0].getMessage()
+
+
+def test_resolve_base_fetch_failure_warns_with_first_line(monkeypatch, caplog):
+    """Non-zero fetch exit (offline, auth, dead remote) -> WARNING with the
+    first line of git's output and the elapsed time, then carry on."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev"})
+    real = mock.side_effect
+
+    async def fake_git(*args, check=True):
+        if args[0] == "fetch":
+            return (128, "ssh: connect to host github.com port 22: Connection timed out\n"
+                         "fatal: Could not read from remote repository.\n")
+        return await real(*args, check=check)
+
+    mock.side_effect = fake_git
+    with caplog.at_level(logging.WARNING, logger="worktree"):
+        assert _run(worktree.resolve_base("dev")) == "origin/dev"
+    msg = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "ssh: connect to host github.com port 22: Connection timed out" in msg
+    assert "fatal:" not in msg  # only the first line
+    assert re.search(r"after \d+\.\ds", msg)
+
+
+def test_resolve_base_fetch_success_logs_info(monkeypatch, caplog):
+    """One INFO line per ACTUAL fetch, naming the repo and the elapsed time."""
+    _patch_git(monkeypatch, resolvable={"origin/dev"})
+    with caplog.at_level(logging.INFO, logger="worktree"):
+        _run(worktree.resolve_base("dev"))
+    infos = [r.getMessage() for r in caplog.records
+             if r.levelno == logging.INFO and "fetch" in r.getMessage()]
+    assert len(infos) == 1
+    assert str(worktree.WORKTREE_REPO) in infos[0]
+    assert re.search(r"in \d+\.\ds", infos[0])
+
+
+# ---------------------------------------------------------------------------
+# fetch coalescing — one fetch per interval, shared by concurrent spawns
+# ---------------------------------------------------------------------------
+
+def _fetch_calls(mock):
+    return [c.args for c in mock.await_args_list if c.args[:1] == ("fetch",)]
+
+
+def _fake_clock(monkeypatch, clock):
+    """Replace only worktree's view of time.monotonic. Patching the global
+    time module would freeze asyncio's loop clock too and hang every sleep."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(worktree, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+
+def test_concurrent_resolves_share_one_fetch(monkeypatch):
+    """Two spawns arriving together (both bridges do this) -> ONE fetch; the
+    second waits on the lock and reuses the result instead of racing git."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev", "origin/main"})
+    real = mock.side_effect
+
+    async def slow_git(*args, check=True):
+        if args[0] == "fetch":
+            await asyncio.sleep(0.05)  # long enough for the 2nd caller to queue
+        return await real(*args, check=check)
+
+    mock.side_effect = slow_git
+
+    async def both():
+        return await asyncio.gather(
+            worktree.resolve_base("dev"), worktree.resolve_base("main")
+        )
+
+    assert _run(both()) == ["origin/dev", "origin/main"]
+    assert len(_fetch_calls(mock)) == 1
+
+
+def test_fetch_skipped_within_interval_then_repeats_after(monkeypatch, caplog):
+    """A call inside WORKTREE_FETCH_MIN_INTERVAL skips the fetch (DEBUG line);
+    once the interval has elapsed the next call fetches again."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev"})
+    clock = [1000.0]
+    _fake_clock(monkeypatch, clock)
+    monkeypatch.setattr(worktree, "FETCH_MIN_INTERVAL", 60.0)
+
+    with caplog.at_level(logging.DEBUG, logger="worktree"):
+        _run(worktree.resolve_base("dev"))          # t=1000: fetches
+        clock[0] += 30
+        _run(worktree.resolve_base("dev"))          # t=1030: inside interval, skipped
+        assert len(_fetch_calls(mock)) == 1
+        assert any("fetch skipped" in r.getMessage() and r.levelno == logging.DEBUG
+                   for r in caplog.records)
+        clock[0] += 31
+        _run(worktree.resolve_base("dev"))          # t=1061: interval over, fetch again
+    assert len(_fetch_calls(mock)) == 2
+
+
+def test_waiters_reuse_a_timed_out_fetch(monkeypatch):
+    """The interval is stamped when the fetch ENDS: a caller that queued on the
+    lock during a fetch that ran the full timeout must reuse it, not fire a
+    second 60s fetch of its own (timeout == interval by default)."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev"})
+    real = mock.side_effect
+    clock = [1000.0]
+    _fake_clock(monkeypatch, clock)
+    monkeypatch.setattr(worktree, "FETCH_MIN_INTERVAL", 60.0)
+
+    async def slow_timeout_git(*args, check=True):
+        if args[0] == "fetch":
+            await asyncio.sleep(0.05)
+            clock[0] += 60  # the fetch burned the whole 60s timeout
+            return (124, "timed out after 60s")
+        return await real(*args, check=check)
+
+    mock.side_effect = slow_timeout_git
+
+    async def both():
+        return await asyncio.gather(
+            worktree.resolve_base("dev"), worktree.resolve_base("dev")
+        )
+
+    _run(both())
+    assert len(_fetch_calls(mock)) == 1
+
+
+def test_failed_fetch_still_counts_toward_interval(monkeypatch):
+    """A failed/timed-out fetch marks the interval too, so a dead remote costs
+    one timeout per interval rather than one per spawn."""
+    mock = _patch_git(monkeypatch, resolvable={"origin/dev"})
+    real = mock.side_effect
+
+    async def failing_git(*args, check=True):
+        if args[0] == "fetch":
+            return (124, "timed out after 60s")
+        return await real(*args, check=check)
+
+    mock.side_effect = failing_git
+    _run(worktree.resolve_base("dev"))
+    _run(worktree.resolve_base("dev"))
+    assert len(_fetch_calls(mock)) == 1
+
+
+# ---------------------------------------------------------------------------
+# _git timeout — the only test that spawns a real (non-git) subprocess
+# ---------------------------------------------------------------------------
+
+def _patch_subprocess_as_sleep(monkeypatch, seen):
+    """Make worktree._git spawn `sleep 30` instead of git, keeping the same
+    kwargs, and stash the Process so the test can check it was killed."""
+    real_exec = asyncio.create_subprocess_exec
+
+    async def fake_exec(*argv, **kw):
+        proc = await real_exec("sleep", "30", **kw)
+        seen.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+
+def test_git_timeout_kills_process_and_returns_rc_124(monkeypatch, caplog):
+    seen = []
+    _patch_subprocess_as_sleep(monkeypatch, seen)
+    monkeypatch.setattr(worktree, "GIT_TIMEOUT", 0.2)
+
+    with caplog.at_level(logging.WARNING, logger="worktree"):
+        rc, out = _run(worktree._git("fetch", "--all", check=False))
+    assert rc == 124
+    assert "timed out after 0s" in out
+    assert seen[0].returncode == -9  # SIGKILLed, and reaped (returncode set)
+    assert any("timed out" in r.getMessage() for r in caplog.records)
+
+
+def test_git_caller_cancelled_kills_process(monkeypatch):
+    """If whoever awaits _git is cancelled (request torn down), the child must
+    not be left running detached: kill + reap, then the cancellation propagates."""
+    seen = []
+    _patch_subprocess_as_sleep(monkeypatch, seen)
+    monkeypatch.setattr(worktree, "GIT_TIMEOUT", 60)
+
+    async def scenario():
+        task = asyncio.create_task(worktree._git("fetch", check=False))
+        await asyncio.sleep(0.1)  # let it spawn
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    _run(scenario())
+    assert seen[0].returncode == -9
+
+
+def test_git_timeout_raises_when_check(monkeypatch):
+    """check=True callers (add) get the normal RuntimeError, message says why."""
+    _patch_subprocess_as_sleep(monkeypatch, [])
+    monkeypatch.setattr(worktree, "GIT_TIMEOUT", 0.2)
+    with pytest.raises(RuntimeError, match="timed out"):
+        _run(worktree._git("worktree", "add", "x"))
+
+
+# ---------------------------------------------------------------------------
+# env knobs
+# ---------------------------------------------------------------------------
+
+def test_env_seconds_parses_and_falls_back(monkeypatch, caplog):
+    monkeypatch.setenv("WORKTREE_GIT_TIMEOUT", "15")
+    assert worktree._env_seconds("WORKTREE_GIT_TIMEOUT", 60) == 15.0
+    monkeypatch.setenv("WORKTREE_FETCH_MIN_INTERVAL", "0.5")
+    assert worktree._env_seconds("WORKTREE_FETCH_MIN_INTERVAL", 60) == 0.5
+    monkeypatch.delenv("WORKTREE_GIT_TIMEOUT")
+    assert worktree._env_seconds("WORKTREE_GIT_TIMEOUT", 60) == 60
+    monkeypatch.setenv("WORKTREE_GIT_TIMEOUT", "soon")
+    with caplog.at_level(logging.WARNING, logger="worktree"):
+        assert worktree._env_seconds("WORKTREE_GIT_TIMEOUT", 60) == 60
+    assert any("not a number" in r.getMessage() for r in caplog.records)
+
+
+def test_env_knob_defaults_are_60s():
+    assert worktree.GIT_TIMEOUT == 60
+    assert worktree.FETCH_MIN_INTERVAL == 60
 
 
 # ---------------------------------------------------------------------------

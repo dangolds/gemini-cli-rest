@@ -9,6 +9,16 @@ services:
     ports:
       - "8000:8000"   # agy / Gemini
       - "8001:8001"   # codex / GPT
+    # Both bridges must answer /health (no auth on that path) or the container
+    # is marked unhealthy. start_period covers the boot-time agy/codex update
+    # checks + uvicorn start; curl ships in the image.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -m 5 http://127.0.0.1:8000/health >/dev/null && curl -fsS -m 5 http://127.0.0.1:8001/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 180s    # boot-time agy/codex update downloads can be slow
+      start_interval: 5s    # probe quickly during start_period so "healthy" shows early
     volumes:
       - agy-config:/root/.gemini    # agy auth + settings persist
       # codex gets its OWN independent login in this volume — run `codex login`
@@ -40,7 +50,11 @@ services:
       - CODEX_STARTUP_TIMEOUT=60           # codex: max wait for the TUI to reach its idle prompt
       - LOG_DIR=/app/logs                  # bridges write logs + timeout dumps here
       - LOG_LEVEL=INFO
-      - GIT_SSH_COMMAND=ssh -F /dev/null
+      # BatchMode: never sit on a password/host-key prompt; ConnectTimeout: a
+      # dead link fails in 15s. Host keys still come from the mounted ~/.ssh/known_hosts.
+      - GIT_SSH_COMMAND=ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=15
+      - WORKTREE_GIT_TIMEOUT=60            # kill any git call (the spawn-time fetch above all) after this
+      - WORKTREE_FETCH_MIN_INTERVAL=60     # at most one `git fetch` per bridge process per this many seconds
       # Repo each session cuts its per-session DETACHED worktree from. Matches the
       # clone mounted above; a session named e.g. q@dev reads a worktree pinned to
       # origin/dev. Defaults to this path in code too; set explicit for clarity.
@@ -60,6 +74,12 @@ services:
       # single-agent ceiling (max/ultra burn more).
       - CODEX_MODEL=gpt-6-astra
       - CODEX_EFFORT=xhigh
+      # Same story for the service tier: the volume's config.toml had drifted to
+      # "fast" (priority processing = faster turns, but it eats the ChatGPT usage
+      # budget quicker, and usage-limit errors are already the top codex failure).
+      # "default" = standard speed; set "priority" ("fast" is its legacy alias)
+      # here to opt back in deliberately.
+      - CODEX_SERVICE_TIER=default
 
 volumes:
   agy-config:

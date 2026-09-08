@@ -55,8 +55,10 @@ def server(request):
     running this file without Docker still exercises the mocked unit tests rather
     than erroring the whole file out.
     """
-    if request.cls is TestWorktreeBranching:
-        yield  # mocked unit tests — no live bridge needed, no teardown
+    # @pytest.mark.hermetic classes: mocked unit tests — no live bridge needed
+    # and NO /stop teardown (it would kill every live session on the bridge).
+    if request.node.get_closest_marker("hermetic"):
+        yield
         return
     print(f"\n[{_ts()}] Checking for server at {BASE}...", flush=True)
     if not _server_already_running():
@@ -578,6 +580,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.mark.hermetic
 class TestWorktreeBranching:
     """The detached-worktree session backing: branchless gate, spawn wiring,
     safe-name derivation, teardown on reset/delete, and the conversational

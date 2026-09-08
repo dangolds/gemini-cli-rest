@@ -55,9 +55,12 @@ def live_server(request):
     early with NO gate. Otherwise, a missing bridge SKIPS (not fails) so the host
     suite stays green whether or not `docker compose up -d` is running.
     """
-    # Hermetic unit classes never touch the network — run them unconditionally.
-    if request.cls in (TestSpawnWorktree, TestChatBranchGating,
-                       TestWorktreeTeardown, TestNameRegex):
+    # Hermetic unit classes never touch the network — run them unconditionally
+    # and, above all, WITHOUT the /stop teardown: that call kills every live
+    # session on the bridge, including the owner's. Classes opt in with
+    # @pytest.mark.hermetic (a name list here went stale when a new class was
+    # added and its tests then stopped the live bridge 13 times per run).
+    if request.node.get_closest_marker("hermetic"):
         yield
         return
 
@@ -611,6 +614,7 @@ def _stub_tmux_spawn(monkeypatch, session: "server.AgySession") -> None:
 
 # --- (b) spawn cuts a worktree pinned to the resolved base ------------------
 
+@pytest.mark.hermetic
 class TestSpawnWorktree:
     def test_spawn_resolves_base_then_adds_worktree(self, mock_worktree, monkeypatch):
         """POST-equivalent first spawn of 'svc@dev' resolves 'dev' then adds the
@@ -655,6 +659,7 @@ class TestSpawnWorktree:
 # --- (a) branchless POST /chat -> 200, message, NOTHING spawned ------------
 # --- (d) invalid branch -> conversational message --------------------------
 
+@pytest.mark.hermetic
 class TestChatBranchGating:
     def test_branchless_chat_returns_needs_branch_and_spawns_nothing(
         self, mock_worktree, monkeypatch
@@ -744,6 +749,7 @@ class TestChatBranchGating:
 
 # --- (c) reset and DELETE both tear down the worktree ----------------------
 
+@pytest.mark.hermetic
 class TestWorktreeTeardown:
     def test_reset_removes_then_respawns(self, mock_worktree, monkeypatch):
         """reset() drops the current generation's worktree (between _kill and
@@ -796,6 +802,7 @@ class TestWorktreeTeardown:
 
 # --- (e) _NAME regex accepts plain and '@base' keys, rejects junk ----------
 
+@pytest.mark.hermetic
 class TestNameRegex:
     @staticmethod
     def _matches(name: str) -> bool:
@@ -833,3 +840,328 @@ class TestNameRegex:
         # 200 (conversational), NOT 422 — the '@base' key passed path validation.
         assert r.status_code == 200, r.text
 
+
+
+# --- (f) startup resilience: one startup at a time, kills that wait for the
+# process, one respawn on a startup stall, and a dump of the evidence ---------
+#
+# Background (live suite, 2026-09-06): agy stalled after "OAuth: authenticated
+# successfully" when it started 90ms after two instances were killed and were
+# still shutting down, and two instances spawned 35ms apart shared one
+# per-second process log (one never reached the prompt). The bridge used to
+# spawn without any of that protection and gave up after 60s with no evidence.
+
+def _fake_tmux_factory(calls: list, *, pane_pid: int | None = None):
+    """tmux stub: no session exists yet (has-session fails), display-message
+    answers with *pane_pid* (or fails when None), everything else succeeds."""
+    async def fake(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "has-session":
+            return (1, "no session")
+        if args[0] == "display-message":
+            return (0, f"{pane_pid}\n") if pane_pid is not None else (1, "no session")
+        return (0, "")
+    return fake
+
+
+@pytest.fixture()
+def fresh_startup_lock(monkeypatch):
+    """asyncio.Lock binds to the loop that first contends it; every test here
+    runs its own asyncio.run(), so give each one a fresh module lock."""
+    lock = asyncio.Lock()
+    monkeypatch.setattr(server, "_STARTUP_LOCK", lock)
+    return lock
+
+
+@pytest.mark.hermetic
+class TestStartupResilience:
+    def test_concurrent_starts_never_overlap_their_startup_phase(
+        self, mock_worktree, monkeypatch, fresh_startup_lock
+    ):
+        """Two sessions started at once: the second's tmux new-session ->
+        ready-marker window begins only after the first's has ended."""
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls))
+        monkeypatch.setattr(server, "_pid_alive", lambda pid: False)
+        order: list[tuple[str, str]] = []
+
+        def ready_for(sess):
+            async def _ready():
+                order.append(("enter", sess.name))
+                await asyncio.sleep(0.05)  # a real startup takes a while
+                order.append(("exit", sess.name))
+            return _ready
+
+        a = server.AgySession(name="a@dev")
+        b = server.AgySession(name="b@dev")
+        monkeypatch.setattr(a, "_wait_ready", ready_for(a))
+        monkeypatch.setattr(b, "_wait_ready", ready_for(b))
+
+        async def both():
+            await asyncio.gather(a.start(), b.start())
+
+        _run(both())
+
+        assert len(order) == 4
+        # Each startup phase is contiguous: an enter is followed by ITS exit.
+        assert order[0][0] == "enter" and order[1] == ("exit", order[0][1])
+        assert order[2][0] == "enter" and order[3] == ("exit", order[2][1])
+        assert {order[0][1], order[2][1]} == {"a@dev", "b@dev"}
+        # And the lock is released afterwards (the next spawn is not queued forever).
+        assert not fresh_startup_lock.locked()
+
+    def test_kill_waits_for_the_process_then_sigkills_its_group(self, monkeypatch):
+        """_kill reads the pane pid BEFORE kill-session, polls it until gone,
+        and past AGY_EXIT_WAIT SIGKILLs the process group as a last resort."""
+        monkeypatch.setattr(server, "AGY_EXIT_WAIT", 0.05)
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls, pane_pid=4242))
+        sent: list = []
+        polls = {"n": 0}
+
+        def fake_alive(pid):
+            assert pid == 4242
+            polls["n"] += 1
+            return not sent  # dies once SIGKILLed
+
+        monkeypatch.setattr(server, "_pid_alive", fake_alive)
+        monkeypatch.setattr(server.os, "killpg", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setattr(server.os, "kill", lambda pid, sig: sent.append(("kill", pid, sig)))
+
+        sess = server.AgySession(name="svc@dev")
+        _run(sess._kill())
+
+        assert sent == [(4242, 9)]
+        assert polls["n"] >= 2  # waited (polled) before escalating
+        names = [c[0] for c in calls]
+        assert names.index("display-message") < names.index("kill-session")
+
+    def test_kill_returns_as_soon_as_the_process_is_gone(self, monkeypatch):
+        """A process that exits on its own is never signalled, and the wait
+        ends at once instead of running out AGY_EXIT_WAIT."""
+        monkeypatch.setattr(server, "AGY_EXIT_WAIT", 30.0)
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls, pane_pid=4242))
+        state = {"polls": 0}
+
+        def fake_alive(pid):
+            state["polls"] += 1
+            return state["polls"] < 3  # alive for two polls, then gone
+
+        def never(*a):
+            raise AssertionError("must not signal a process that exited by itself")
+
+        monkeypatch.setattr(server, "_pid_alive", fake_alive)
+        monkeypatch.setattr(server.os, "killpg", never)
+        monkeypatch.setattr(server.os, "kill", never)
+
+        sess = server.AgySession(name="svc@dev")
+        t0 = time.monotonic()
+        _run(sess._kill())
+        assert time.monotonic() - t0 < 5
+        assert state["polls"] == 3
+
+    def test_stop_is_serialized_with_a_startup(self, mock_worktree, monkeypatch, fresh_startup_lock):
+        """A stop of session B waits while session A is in its startup phase
+        (the collision works in both directions), then proceeds."""
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls))
+        monkeypatch.setattr(server, "_pid_alive", lambda pid: False)
+        order: list[str] = []
+        a = server.AgySession(name="a@dev")
+        b = server.AgySession(name="b@dev")
+
+        async def slow_ready():
+            order.append("a-start-enter")
+            await asyncio.sleep(0.05)
+            order.append("a-start-exit")
+
+        monkeypatch.setattr(a, "_wait_ready", slow_ready)
+
+        async def both():
+            t = asyncio.create_task(a.start())
+            await asyncio.sleep(0.01)  # a is inside its startup phase
+            await b.stop()
+            order.append("b-stopped")
+            await t
+
+        _run(both())
+        assert order == ["a-start-enter", "a-start-exit", "b-stopped"]
+        assert not fresh_startup_lock.locked()
+
+    def test_spawn_refuses_to_start_on_top_of_an_unkillable_process(
+        self, mock_worktree, monkeypatch, tmp_path, fresh_startup_lock
+    ):
+        monkeypatch.setattr(server, "AGY_EXIT_WAIT", 0.02)
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls, pane_pid=4242))
+        monkeypatch.setattr(server, "_pid_alive", lambda pid: True)  # survives SIGKILL
+        monkeypatch.setattr(server.os, "killpg", lambda pid, sig: None)
+        monkeypatch.setattr(server.asyncio, "sleep", AsyncMock())
+        sess = server.AgySession(name="svc@dev")
+        with pytest.raises(RuntimeError, match="refuses to exit"):
+            _run(sess._spawn())
+        assert not any(c[0] == "new-session" for c in calls)
+        mock_worktree.remove.assert_awaited_once_with(sess.cwd)
+
+    def test_survivor_pid_is_remembered_across_kills(self, monkeypatch):
+        """Once kill-session destroyed the pane tmux can no longer name the
+        pid; a survivor (or a kill interrupted mid-wait) is still re-checked
+        by the next kill instead of being assumed gone."""
+        monkeypatch.setattr(server, "AGY_EXIT_WAIT", 0.02)
+        monkeypatch.setattr(server.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(server.os, "killpg", lambda pid, sig: None)
+        alive = {"v": True}
+        monkeypatch.setattr(server, "_pid_alive", lambda pid: alive["v"] if pid == 4242 else False)
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls, pane_pid=4242))
+        sess = server.AgySession(name="svc@dev")
+        assert _run(sess._kill_process()) is False  # survived SIGKILL
+        assert sess._agy_pid == 4242
+        # The pane is gone now: tmux cannot answer, but the survivor is re-checked.
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls, pane_pid=None))
+        assert _run(sess._kill_process()) is False
+        alive["v"] = False  # it finally died
+        assert _run(sess._kill_process()) is True
+        assert sess._agy_pid is None
+
+    def test_kill_never_raises_over_the_wait(self, monkeypatch):
+        """tmux failing outright (RuntimeError from _exec) does not turn a
+        stop/clear/reset into a second failure."""
+        async def broken(*args, **kwargs):
+            raise RuntimeError("Command timed out: tmux ...")
+
+        monkeypatch.setattr(server, "_tmux", broken)
+        _run(server.AgySession(name="svc@dev")._kill())
+
+    def _spawn_env(self, monkeypatch, tmp_path, outcomes):
+        """A session whose _wait_ready pops *outcomes* (None = ready, an
+        exception = raised), with tmux/liveness stubbed and dumps in tmp_path."""
+        calls: list = []
+        monkeypatch.setattr(server, "_tmux", _fake_tmux_factory(calls))
+        monkeypatch.setattr(server, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(server, "TIMEOUT_LOG_DIR", tmp_path / "timeouts")
+        monkeypatch.setattr(server, "AGY_STATE_DIR", tmp_path / "state")
+        sess = server.AgySession(name="svc@dev")
+
+        async def wait_ready():
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        async def capture():
+            return "╭─ Antigravity ─╮\n(no prompt yet)"
+
+        monkeypatch.setattr(sess, "_wait_ready", wait_ready)
+        monkeypatch.setattr(sess, "_capture", capture)
+        return sess, calls
+
+    def test_startup_timeout_respawns_once_then_succeeds(
+        self, mock_worktree, monkeypatch, tmp_path, fresh_startup_lock
+    ):
+        outcomes = [server.StartupTimeout("agy startup timed out after 60s"), None]
+        sess, calls = self._spawn_env(monkeypatch, tmp_path, outcomes)
+
+        _run(sess._spawn())
+
+        spawns = [c for c in calls if c[0] == "new-session"]
+        assert len(spawns) == 2 and outcomes == []
+        assert spawns[0] == spawns[1]  # same tmux session name, same worktree cwd
+        # The stuck process was killed BETWEEN the two spawns.
+        names = [c[0] for c in calls]
+        first, second = [i for i, n in enumerate(names) if n == "new-session"]
+        assert "kill-session" in names[first:second]
+        # The worktree was cut once and is still there (the session is up).
+        mock_worktree.add.assert_awaited_once()
+        mock_worktree.remove.assert_not_awaited()
+        # The first attempt left its evidence behind.
+        assert len(list((tmp_path / "timeouts").glob("*startup*attempt1.log"))) == 1
+
+    def test_double_startup_timeout_raises_after_two_attempts(
+        self, mock_worktree, monkeypatch, tmp_path, fresh_startup_lock
+    ):
+        outcomes = [server.StartupTimeout("agy startup timed out after 60s")] * 2
+        sess, calls = self._spawn_env(monkeypatch, tmp_path, outcomes)
+
+        with pytest.raises(server.StartupTimeout,
+                           match=r"agy startup timed out after 60s \(after 2 attempts\)"):
+            _run(sess._spawn())
+
+        assert len([c for c in calls if c[0] == "new-session"]) == 2
+        assert calls[-1][0] == "kill-session"  # the last stuck process is gone too
+        mock_worktree.remove.assert_awaited_once_with(sess.cwd)
+        assert len(list((tmp_path / "timeouts").glob("*startup*.log"))) == 2
+        assert not fresh_startup_lock.locked()
+
+    def test_retries_are_configurable(
+        self, mock_worktree, monkeypatch, tmp_path, fresh_startup_lock
+    ):
+        monkeypatch.setattr(server, "AGY_STARTUP_RETRIES", 0)
+        outcomes = [server.StartupTimeout("agy startup timed out after 60s")]
+        sess, calls = self._spawn_env(monkeypatch, tmp_path, outcomes)
+        with pytest.raises(server.StartupTimeout, match=r"\(after 1 attempts\)"):
+            _run(sess._spawn())
+        assert len([c for c in calls if c[0] == "new-session"]) == 1
+
+    def test_process_death_during_startup_is_not_retried(
+        self, mock_worktree, monkeypatch, tmp_path, fresh_startup_lock
+    ):
+        """Only the stall is retried; a process that EXITS (not installed, not
+        authenticated) fails at once, as before."""
+        outcomes = [RuntimeError("agy exited during startup. Check that it is installed")]
+        sess, calls = self._spawn_env(monkeypatch, tmp_path, outcomes)
+        with pytest.raises(RuntimeError, match="exited during startup"):
+            _run(sess._spawn())
+        assert len([c for c in calls if c[0] == "new-session"]) == 1
+        mock_worktree.remove.assert_awaited_once_with(sess.cwd)
+        assert not (tmp_path / "timeouts").exists()
+
+    def test_startup_dump_has_the_screen_and_agy_log_tail(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(server, "TIMEOUT_LOG_DIR", tmp_path / "timeouts")
+        monkeypatch.setattr(server, "AGY_STATE_DIR", tmp_path / "state")
+        log_dir = tmp_path / "state" / "log"
+        log_dir.mkdir(parents=True)
+        spawned_at = time.time()
+        # This process's log (named by its start second) ...
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(spawned_at))
+        (log_dir / f"cli-{stamp}.log").write_text(
+            "I0906 auth.go:1] keyringAuth: ok\n"
+            "I0906 file_watcher.go:9] watching /tmp/x\n"
+            "I0906 auth.go:2] OAuth: authenticated successfully\n",
+            encoding="utf-8",
+        )
+        # ... and an older process's log that must NOT be quoted.
+        old = time.strftime("%Y%m%d_%H%M%S", time.localtime(spawned_at - 3600))
+        (log_dir / f"cli-{old}.log").write_text("OLD PROCESS\n", encoding="utf-8")
+
+        sess = server.AgySession(name="svc@origin/dev")
+
+        async def capture():
+            return "╭─ Antigravity ─╮\n(no prompt yet)"
+
+        monkeypatch.setattr(sess, "_capture", capture)
+        _run(sess._dump_startup_diagnostic(1, 2, spawned_at, "agy startup timed out after 60s"))
+
+        dumps = list((tmp_path / "timeouts").glob("*startup*attempt1.log"))
+        assert len(dumps) == 1
+        text = dumps[0].read_text(encoding="utf-8")
+        assert "reason=startup_timeout attempt=1/2" in text
+        assert "(no prompt yet)" in text                         # the rendered screen
+        assert "OAuth: authenticated successfully" in text       # agy's own log
+        assert "watching /tmp/x" not in text                     # file_watcher noise filtered
+        assert "OLD PROCESS" not in text                         # only this process's log
+
+    def test_startup_dump_never_fails_the_spawn(self, monkeypatch, tmp_path):
+        """No agy log at all and a dead pane: the dump still lands, and nothing
+        raises out of it."""
+        monkeypatch.setattr(server, "TIMEOUT_LOG_DIR", tmp_path / "timeouts")
+        monkeypatch.setattr(server, "AGY_STATE_DIR", tmp_path / "missing")
+        sess = server.AgySession(name="svc@dev")
+
+        async def capture():
+            raise RuntimeError("agy process died (tmux capture-pane failed)")
+
+        monkeypatch.setattr(sess, "_capture", capture)
+        _run(sess._dump_startup_diagnostic(2, 2, time.time(), "timed out"))
+        text = next((tmp_path / "timeouts").glob("*startup*attempt2.log")).read_text()
+        assert "screen capture failed" in text and "no agy log" in text

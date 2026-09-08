@@ -231,7 +231,7 @@ class TestSendCapturesBellBaseline:
         async def is_alive():
             return True
 
-        async def collect(baseline):
+        async def collect(baseline, **kw):
             return "canned"
 
         monkeypatch.setattr(sess, "is_alive", is_alive)
@@ -248,7 +248,7 @@ class TestSendCapturesBellBaseline:
             # the baseline must already be published when the prompt goes in
             seen["baseline_at_submit"] = sess._last_bell_baseline
 
-        async def detect(before, timeout=None, *, watch_verify=False):
+        async def detect(before, timeout=None, *, watch_verify=False, **kw):
             return "conv"
 
         monkeypatch.setattr(sess, "_submit", submit)

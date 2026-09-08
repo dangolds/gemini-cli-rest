@@ -86,7 +86,7 @@ While the turn is still running — poll again:
 { "done": false, "response": null, "turn": 2, "session": "research", "elapsed_ms": 30001, "status": "pending" }
 ```
 
-`status` tells the two not-done cases apart: `"pending"` = still working, keep polling; `"never_started"` = the CLI dropped the prompt and no answer is coming — re-send it.
+`status` tells the two not-done cases apart: `"pending"` = still working, keep polling; `"never_started"` = the CLI dropped the prompt and no answer is coming — re-send it. (The codex bridge adds `"usage_limit"` / `"model_drift"` / `"error"`: done, but with an empty `response` and an `error` message — see [CODEX.md](CODEX.md).)
 
 `wait` is capped at `LAST_MAX_WAIT` (default 180s) so `/last` never blocks longer than a `/chat` would. Recovery works while the **server is up** (the warm process holds the session); it does not survive a full server restart.
 
@@ -124,10 +124,13 @@ curl -s -X POST http://localhost:8000/stop
 
 ### `GET /health` — Health check
 
-Lists all active sessions and their status.
+Lists all active sessions and their status. `docker-compose.yml` also uses it as
+the container `healthcheck` (both bridges must answer, so `docker ps` shows
+`healthy`/`unhealthy` for the pair).
 
 ```bash
-curl -s http://localhost:8000/health
+curl -s http://localhost:8000/health   # agy
+curl -s http://localhost:8001/health   # codex
 ```
 
 ```json
@@ -266,12 +269,18 @@ All config via environment variables (set in `docker-compose.yml` or shell):
 | `RESPONSE_HARD_TIMEOUT` | `180` | Absolute hard cap on a turn (3 min), regardless of progress |
 | `RESPONSE_SLOW_DUMP_SECS` | `90` | Write a diagnostic dump for any turn slower than this (even successful ones) |
 | `STARTUP_TIMEOUT` | `60` | Max seconds to wait for CLI startup |
+| `AGY_STARTUP_RETRIES` | `1` | Respawns after a startup that never shows the idle prompt (screen + agy's own process log are dumped to `LOG_DIR/timeouts/<session>-startup-*.log` first, the stuck process is killed and confirmed gone, then the same worktree/tmux session is relaunched). Only after every attempt fails does `/chat` get the 503 "agy startup timed out … (after N attempts)". Startups are serialized bridge-wide: agy shares a per-second process log, sqlite stores and presence locks under `AGY_STATE_DIR`, and two instances initializing at once (or one starting while another is still shutting down) is what stalled it |
+| `AGY_EXIT_WAIT` | `10` | Seconds a stop/clear/reset waits for the agy process to actually exit after `tmux kill-session` (its shutdown takes 0.1–5s: it waits for store migrations first) before SIGKILLing its process group. A spawn never overlaps a shutting-down instance |
 | `VERIFY_RESUBMIT_MAX` | `3` | How many times a session's first prompt is re-pasted when agy's per-launch account-verification gate eats it (`⚠ Verifying your account...`); set to `0` to disable the recovery |
 | `VERIFY_RESUBMIT_DELAY` | `3.0` | Seconds to let the screen settle before a re-paste — and the grace a fresh submit gets before the (permanently displayed) notice may count as another drop |
+| `CONVERSATION_DETECT_TIMEOUT` | `20` | Expected time for a session's first prompt to produce its conversation transcript (how the bridge learns the conversation id). An idle screen with no transcript at the end of it means the prompt was dropped → `/chat` 502 |
+| `CONVERSATION_DETECT_MAX` | `RESPONSE_STALL_TIMEOUT` (`90`) | Hard bound on that wait when agy is visibly still working past the window — process alive and the screen showing `Generating...` or the auth/backend `Signing in...` spinner (agy 1.1.27 can sit 20s+ on a post-login `loadCodeAssist` call before forwarding the prompt). Checked ~1/s; a give-up writes `LOG_DIR/timeouts/<session>-detect-*.log` (screen + tail of agy's own log). Response collection then gets only what is left of `RESPONSE_HARD_TIMEOUT` |
 | `SUBMIT_REPASTE_MAX` | `2` | How many times a submit may be re-pasted when agy consumed the paste itself (input box empty, transcript frozen — Enter re-press can't help). Re-checked against the transcript at the last instant so an accepted turn can never duplicate; `0` disables |
 | `SUBMIT_REPASTE_DELAY` | `3.0` | Seconds to let the screen settle before each re-paste |
 | `LOG_DIR` | `/app/logs` | Rolling logs + per-incident dumps written here (mounted to `./logs`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `WORKTREE_GIT_TIMEOUT` | `60` | Seconds before any git call made for a session worktree (above all the spawn-time `git fetch`) is killed. A timed-out or failed fetch is logged as a warning and the spawn continues on the `origin/*` refs already in the clone; `0` disables the cap. Pair with a `GIT_SSH_COMMAND` carrying `-o ConnectTimeout` / `-o BatchMode=yes` (compose does) so ssh itself cannot prompt or hang |
+| `WORKTREE_FETCH_MIN_INTERVAL` | `60` | At most one `git fetch` per this many seconds per bridge process; concurrent spawns share the in-flight fetch, later ones inside the window skip it (agy and codex are separate processes, so the pair may fetch twice per window) |
 
 The codex bridge (port 8001) shares this tmux architecture and has matching, `CODEX_`-prefixed knobs — `CODEX_RESPONSE_HARD_TIMEOUT` (`180`), `CODEX_RESPONSE_STALL_TIMEOUT` (`90`), `CODEX_STARTUP_TIMEOUT` (`60`), `CODEX_SLOW_DUMP_SECS` (`90`), `CODEX_TMUX_SOCKET` (`codex-rest`) — and shares `LOG_DIR` / `LOG_LEVEL`. Its completion-push equivalent is codex's `notify` hook rather than a bell: `CODEX_NOTIFY` (`1`, set `0` to revert to pure polling), `CODEX_NOTIFY_DIR` (`/tmp/codex-rest-notify`), `CODEX_RESPONSE_FAST_POLL` (`0.3`), `CODEX_RESPONSE_FULL_CHECK_EVERY` (`10`). See [CODEX.md](CODEX.md) and [Logs & diagnostics](#logs--diagnostics).
 
