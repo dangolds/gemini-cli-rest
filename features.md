@@ -183,6 +183,6 @@ evidence, and the intended fix. Tick the box when shipped.
   503s and the conversation-id 502s did not recur; none of the new recovery
   paths (startup retry, detect extension, overload retry, quota) had to fire.
 
-## 16. A base with a dot (e.g. `release/1.2`) breaks the tmux session  — [x] fixed 2026-09-09 (worktree.tmux_safe_name; needs a container rebuild to deploy); found 2026-09-08 during the TestPRD Stage 0 review
+## 16. A base with a dot (e.g. `release/1.2`) breaks the tmux session  — [x] fixed 2026-09-09 (worktree.tmux_safe_name), deployed 2026-09-09; found 2026-09-08 during the TestPRD Stage 0 review
 - Both servers derive the tmux session name from `worktree.safe_name(key)`, which keeps dots. tmux 3.5a stores a session name with `.`/`:` replaced by `_` (`agy-x.y` is listed as `agy-x_y`) and then cannot resolve the dotted name as a target: `has-session -t agy-x.y` fails with "can't find pane: y". So every tmux call after `new-session` misses for such a session.
 - Verified on a throwaway tmux socket in the container, not on a bridge socket. Fix: normalise `.`/`:` in the tmux name (server side) or exclude them in `safe_name`. The test suite's teardown and fake CLI already mirror tmux's real behaviour.
