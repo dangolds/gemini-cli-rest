@@ -123,25 +123,34 @@ class _AsyncioProxy:
         task = asyncio.ensure_future(aw)
         deadline = clock.now + float(timeout)
         idle = 0
-        while True:
-            if task.done():
-                return task.result()
-            if clock.now >= deadline:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                raise asyncio.TimeoutError()
-            before = clock.now
-            await clock._real_sleep(0)
-            if task.done():
-                continue
-            idle = idle + 1 if clock.now == before else 0
-            if idle >= self.IDLE_YIELDS:
-                clock.advance(deadline - clock.now)
+        try:
+            while True:
+                if task.done():
+                    return task.result()
+                if clock.now >= deadline:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    raise asyncio.TimeoutError()
+                before = clock.now
                 await clock._real_sleep(0)
-                idle = 0
+                if task.done():
+                    continue
+                idle = idle + 1 if clock.now == before else 0
+                if idle >= self.IDLE_YIELDS:
+                    clock.advance(deadline - clock.now)
+                    await clock._real_sleep(0)
+                    idle = 0
+        except asyncio.CancelledError:
+            # the caller was cancelled: cancel and await the child, as asyncio does
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise
 
     def __getattr__(self, name: str):
         return getattr(asyncio, name)

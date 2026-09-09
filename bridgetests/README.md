@@ -41,7 +41,8 @@ Live (skipped, not failed, when `GET /health` on that port is not 200):
   `.status` (None on a client timeout/connection error, then `.error`), `.body`
   (parsed JSON or None), `.text`, `.elapsed`; `rep["turn"]`, `"via" in rep`
   and `rep.get("via")` read the body.
-  Disk/container: `bridge.docker_exec(*cmd)`, `bridge.worktree_dirs(key)`,
+  Disk/container: `bridge.docker_exec(*cmd)`, `bridge.worktree_dirs(key)` (the
+  key's generations on disk; `None` when the container could not be asked),
   `bridge.list_panes()`, `bridge.tmux_session_name(key)`, `bridge.sessions_root`.
 - `own_session` — per-story ownership: `k = own_session("chain")` (alias
   `own_session.key("chain")`) builds `names.key("chain")` and registers it;
@@ -62,22 +63,32 @@ failed delete can leave a live pane that later answers 404): after the delete,
 or once it has passed the deadline, teardown lists the container's tmux panes;
 a surviving pane whose tmux session name equals
 `<agent>-<worktree.tmux_safe_name(key)>` for a key this run owns is killed
-(verified gone), the delete repeated and the panes listed again. A worktree
-generation still on disk after a delete (the servers only prune at startup)
-is swept: `git worktree remove --force` (`rm -rf` as the fallback) per dir
-under this bridge's sessions root, then `git worktree prune`. Outcomes are
-`deleted`, `absent`, `killed+deleted`, `deleted+swept`, `killed+deleted+swept`
-(resolved, `live.Bridge.CONFIRMED`), `deleted?`/`absent?` (an earlier request
-to the key ended in an ordinary timeout or connection loss and might still
+(verified gone), the delete repeated and the panes listed again. After every
+confirmed outcome (also `absent`) the disk is checked; a worktree generation
+still there (the servers only prune at startup) is swept: `git worktree
+remove --force` (`rm -rf` as the fallback) per dir, then `git worktree
+prune`. The sweep refuses a key this run does not own (`ValueError`) and
+touches only dirs shaped exactly as that key's own generations,
+`<sessions_root>/<run-id>/<worktree.safe_name(key)>/c<generation>` (run-id
+not `.`/`..`, generation `c` plus digits only - `.../cache` is refused); one
+dir shaped otherwise and nothing is removed, and an empty list runs nothing.
+Outcomes are `deleted`, `absent`,
+`killed+deleted`, each also with `+swept` (resolved, `live.Bridge.CONFIRMED`),
+`deleted?`/`absent?` (an earlier request to the key ended in an ordinary
+timeout or connection loss - also one that failed AFTER its caller had
+already given up at the deadline: the worker records it - and might still
 land; reported once, a second teardown of the key says the plain word) or
 `failed:<why>` (including `request-still-pending` when an abandoned request
-is still in flight and `worktree-left(...)` when the sweep could not clear
-the disk). Every outcome not in CONFIRMED is unresolved and listed at session
+is still in flight, `cannot-list-worktrees` when the disk could not be
+inspected and `worktree-left(...)` when the sweep could not clear it).
+Every outcome not in CONFIRMED is unresolved and listed at session
 finish (`live.UNRESOLVED`). Note that httpx timeouts are per phase
 (connect/read/write), not an absolute deadline, so every request also runs
 under an absolute deadline of `timeout + 5` s in a worker thread (the worker
-is abandoned on expiry, `Reply.error` says "deadline ... exceeded"), and
-teardown treats `Reply.elapsed >= DELETE_DEADLINE` as a timeout. Each Bridge
+is abandoned on expiry, `Reply.error` says "deadline ... exceeded"). A request
+to a key is registered as pending before its worker starts, so
+`pending_requests`/`wait_pending` see it while it is in flight, not only once
+abandoned; the worker unregisters itself when it ends. Teardown treats `Reply.elapsed >= DELETE_DEADLINE` as a timeout. Each Bridge
 keeps one `httpx.Client`; `live.close_all()` at session finish closes them,
 which ends any abandoned worker still inside. Health of both ports is
 printed before the first live story and after the run, never asserted.
@@ -126,7 +137,9 @@ BRIDGE_RUN_STAMP=r1 .venv/bin/pytest stories -q    # pinned stamp (e.g. to find 
 Nothing under `stories/` or in this package ever calls `POST /stop`. The
 retained suites' live stop tests (`test_server.py`, `test_codex_server.py`)
 are skipped unless `BRIDGE_LIVE_STOP=1` is set — only when the bridge is known
-to be yours alone.
+to be yours alone. Their `cleanup` fixture forgets a key only on a CONFIRMED
+outcome; a raised or unresolved teardown leaves it for the module teardown to
+retry and report.
 
 ## Baseline file
 
@@ -137,15 +150,20 @@ nothing. The reference every run is compared to (by story nodeid: changed
 outcomes, missing and new stories, printed at session finish) is
 `baseline/reference.json`, tracked in git (`BRIDGE_BASELINE_REFERENCE` to
 move it); `BRIDGE_BASELINE_APPROVE=1` makes a fully green live run the new
-reference, a run with any failure is refused. Schema:
+reference; a run with any failure, any `teardown_error`, any unresolved
+teardown (`unresolved_teardowns` non-empty) or a non-zero pytest exit status
+is refused. Schema:
 
 - top level: `date`, `time`, `run_stamp`, `repo_prefix`, `container`,
-  `image_id`, `wall_time_s`, `totals`, `stories`
+  `image_id`, `wall_time_s`, `totals`, `unresolved_teardowns` (`[agent, key,
+  outcome]` per session teardown left unresolved, from `live.UNRESOLVED` at
+  write time), `stories`
 - per story: `nodeid`, `agent` (`agy`/`codex`/null), `port`, `group`, `units`
   (declared), `ran` (the call phase executed), `units_spent` (the declared
   units, counted only when the call phase ran, whatever its outcome; zero when
   setup failed or skipped), `hermetic`, `outcome` (`passed`/`failed`/`skipped`/
-  `error`), `duration`, `teardown_error` (only when present)
+  `error`), `duration`, `teardown_error` (only when present; a failed teardown
+  makes a passed or skipped story `error`, a failed one stays `failed`)
 - `totals`: `stories`, `stories_per_group`, `live_stories_ran`,
   `live_units_per_agent` (sum of `units_spent` of the live stories, keyed by
   agent name), `outcomes`

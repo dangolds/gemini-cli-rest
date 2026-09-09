@@ -1,6 +1,6 @@
 # Review Summary — TestPRD Stage 0 (test-suite foundation) vs main
 
-Stage 0 of `TestPRD-tasks.md` (2026-09-08), working tree against `main`: `bridgetests/` (names, live client, baseline, fakes), `stories/` (conftest, helper tests, hermetic smoke, live smoke), minimal edits to `test_server.py`, `test_codex_server.py`, `pytest.ini`. Reviewed in 7 rounds by Codex (gpt-6-astra, xhigh, gate) and Gemini (agy, advisor, Ready on round 4), main session (fable) as final authority. 31 findings raised across the rounds, all fixed on the branch; Codex never issued a formal Ready, the last three low points were fixed without a further round by the operator's rule. Hermetic 72 marked stories plus 301 existing green; live smoke and retained live suites green on both ports. Round 8 (2026-09-09) fixed every item below; each heading carries its fix. Gemini: Ready (two low notes, both fixed). Codex: no verdict, the ChatGPT usage limit (429) blocked it; rerun after the reset. Hermetic 301 + 43 + 38 green; live stories 6/6 on both ports (incl. the two new teardown stories); retained live suite agy 49/49, codex blocked by the same 429. Item #1 is fixed in the server code but the container still runs the old code until the operator rebuilds.
+Stage 0 of `TestPRD-tasks.md` (2026-09-08), working tree against `main`: `bridgetests/` (names, live client, baseline, fakes), `stories/` (conftest, helper tests, hermetic smoke, live smoke), minimal edits to `test_server.py`, `test_codex_server.py`, `pytest.ini`. Reviewed in 7 rounds by Codex (gpt-6-astra, xhigh, gate) and Gemini (agy, advisor, Ready on round 4), main session (fable) as final authority. 31 findings raised across the rounds, all fixed on the branch; Codex never issued a formal Ready, the last three low points were fixed without a further round by the operator's rule. Hermetic 72 marked stories plus 301 existing green; live smoke and retained live suites green on both ports. Round 8 (2026-09-09) fixed every item below; each heading carries its fix. Gemini: Ready (two low notes, both fixed). Codex came back in rounds 9-11 with 13 follow-ups on the round-8 fixes (see the last section); all fixed except one process point the operator declined; round 11: Codex Ready, Gemini Ready. Hermetic 301 + 43 + 38 green; live stories 6/6 on both ports (incl. the two new teardown stories); retained live suite agy 49/49, codex blocked by the same 429. Item #1 is fixed in the server code but the container still runs the old code until the operator rebuilds.
 
 ## High
 
@@ -115,3 +115,22 @@ Stage 0 of `TestPRD-tasks.md` (2026-09-08), working tree against `main`: `bridge
 **Where:** `bridgetests/live.py` (`Bridge.assert_not_live`: one health and one pane list per adoption; `Bridge._finish`: one pane list and one worktree list per teardown), `TestPRD.md` FR-7
 **Why:** The 32-unit budget counts spawns and turns; each session now also costs three or four `docker exec` round trips (about a second each). Over 32 units per port that is a minute or two inside the thirty.
 **Suggestion:** Count it in Stage 1's inventory (T1.x live-unit column) as a fixed per-session cost, or batch the pane and worktree listings into one exec.
+
+## Rounds 9-11 (codex follow-ups on the round-8 fixes, 2026-09-09)
+
+All fixed unless noted; hermetic 44 stories + 43 retained + 190 other green after each round.
+
+- R9-1 [medium] `sweep_worktrees` swept any path under the sessions root → requires `is_ours(key)` and the shape `<root>/<run-id>/<safe_name>/c<int>` (R10 tightened: no `.` run-id, `c\d+`, empty list is a no-op).
+- R9-2 [medium] `_finish` skipped the disk check on `absent`, and a failed listing looked empty → `worktree_dirs` returns None (marker line) → `failed:cannot-list-worktrees`; every confirmed outcome checks the disk (`absent+swept` added).
+- R9-3 [medium] a request abandoned at the deadline that later failed was never marked uncertain → the worker records `_uncertain` itself.
+- R9-4 [medium] retained `cleanup` dropped a key even when its teardown failed → only CONFIRMED outcomes leave `_created`.
+- R9-5 [medium] a skipped story with a failed teardown was approvable → recorded as `error`; `approve` refuses any `teardown_error`.
+- R9-6 [low] fake `wait_for` left its child running when the caller was cancelled → cancels and awaits it.
+- R10-1 [high per codex, medium per main] the worker was registered in `_pending` only after the deadline → registered before start, under `_pending_lock`.
+- R10-2 [medium] retained `test_delete_nonexistent_returns_404` deleted a fixed unstamped name → stamped key + `assert_not_live` + `Bridge.delete`.
+- R10-3 [medium] sweep shape, see R9-1.
+- R10-4 [medium] `SessionRegistry.teardown` failures never reached the baseline → run file carries `unresolved_teardowns`, `approve` refuses when non-empty.
+- R10-5 [medium] `approve` ignored pytest's exit status → `approve(run_path, exit_ok=)`, refused unless exitstatus 0.
+- R10-6 [scope] split the server tmux-name fix into its own commit before Stage 0 → DECLINED: already committed and pushed on main (a853385) at the operator's order.
+- R11-1 [medium] retained module teardown failures were not in `live.UNRESOLVED` → every non-CONFIRMED final outcome (incl. exceptions) is appended.
+- R11-2 [medium] `pytest_sessionfinish` ran before pytest's own fixture finalizers → `@pytest.hookimpl(trylast=True)`.

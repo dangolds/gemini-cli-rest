@@ -174,10 +174,12 @@ class Bridge:
     port: int
     host: str = HOST
     container: str = CONTAINER
-    # Abandoned (deadline-expired) requests still in flight, per session key:
-    # their POST may create or mutate the session later, so teardown waits
-    # for them before it deletes (see _request / teardown_session).
+    # Requests still in flight, per session key (registered before the worker
+    # starts, so an abandoned, deadline-expired one stays visible): their POST
+    # may create or mutate the session later, so teardown waits for them
+    # before it deletes (see _request / teardown_session).
     _pending: dict[str, list[threading.Event]] = field(default_factory=dict, repr=False)
+    _pending_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Keys whose request ended with status None for an ordinary httpx timeout
     # or connection loss (not the deadline path): the server may still have
     # executed it, so teardown re-checks and marks its outcome with "?".
@@ -291,13 +293,20 @@ class Bridge:
         want = tmux_display_name(self.tmux_session_name(key))
         return [pid for (sess, pid) in panes if sess == want]
 
-    def worktree_dirs(self, key: str) -> list[str]:
-        """Container paths of *key*'s worktree generations that exist on disk."""
+    def worktree_dirs(self, key: str) -> list[str] | None:
+        """Container paths of *key*'s worktree generations that exist on disk;
+        None when the disk could not be inspected (the listing did not end
+        with its marker line)."""
         safe = worktree.safe_name(key)
+        marker = "__wt_listed__"
         rc, out = self.docker_exec(
-            "sh", "-c", f"ls -d {self.sessions_root}/*/{safe}/c* 2>/dev/null",
+            "sh", "-c",
+            f'for d in {self.sessions_root}/*/{safe}/c*; do [ -e "$d" ] && echo "$d"; done; echo {marker}',
         )
-        return [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if rc != 0 or marker not in lines:
+            return None
+        return [ln for ln in lines if ln != marker]
 
     def image_id(self) -> str:
         try:
@@ -333,27 +342,28 @@ class Bridge:
         client = self.client()
         box: list = []  # [("ok", response)] or [("err", exception)]
         done = threading.Event()
+        if session is not None:  # visible to pending_requests/wait_pending from the start
+            with self._pending_lock:
+                self._pending.setdefault(session, []).append(done)
 
         def run() -> None:
             try:
                 box.append(("ok", client.request(method, url, timeout=httpx.Timeout(timeout), **kw)))
             except BaseException as exc:  # noqa: BLE001 - relayed to the caller
                 box.append(("err", exc))
+                if session is not None and isinstance(exc, httpx.HTTPError):
+                    self._uncertain.add(session)  # the server may still have run it
             finally:
-                done.set()
-                if session is not None:  # an abandoned worker unregisters itself
+                if session is not None:  # the worker unregisters itself (also when abandoned)
                     self._forget_pending(session, done)
+                done.set()
 
         threading.Thread(target=run, name="bridge-http", daemon=True).start()
         if not done.wait(timeout + self.DEADLINE_SLACK):
-            if session is not None and not done.is_set():
-                self._pending.setdefault(session, []).append(done)
             return Reply(None, None, "", time.monotonic() - t0,
                          f"deadline of {timeout + self.DEADLINE_SLACK:.0f}s exceeded ({method} {path})")
         kind, val = box[0]
         if kind == "err":
-            if isinstance(val, httpx.HTTPError) and session is not None:
-                self._uncertain.add(session)  # the server may still have run it
             if isinstance(val, httpx.TimeoutException):
                 return Reply(None, None, "", time.monotonic() - t0, f"timeout after {timeout:.0f}s: {val!r}")
             if isinstance(val, httpx.HTTPError):
@@ -382,21 +392,26 @@ class Bridge:
             c.close()
 
     def _forget_pending(self, session: str, ev: threading.Event) -> None:
-        lst = self._pending.get(session)
-        if lst and ev in lst:
-            lst.remove(ev)
-        if lst is not None and not lst:
-            self._pending.pop(session, None)
+        with self._pending_lock:
+            lst = self._pending.get(session)
+            if lst and ev in lst:
+                lst.remove(ev)
+            if lst is not None and not lst:
+                self._pending.pop(session, None)
 
     def pending_requests(self, session: str) -> list[threading.Event]:
-        """Abandoned requests to *session* whose worker has not finished."""
-        return [ev for ev in self._pending.get(session, []) if not ev.is_set()]
+        """Requests to *session* (in flight or abandoned) whose worker has not finished."""
+        with self._pending_lock:
+            evs = list(self._pending.get(session, []))
+        return [ev for ev in evs if not ev.is_set()]
 
     def wait_pending(self, session: str, timeout: float) -> bool:
         """Wait up to *timeout* for every abandoned request to *session* to
         finish; True when none is left in flight."""
         deadline = time.monotonic() + timeout
-        for ev in list(self._pending.get(session, [])):
+        with self._pending_lock:
+            evs = list(self._pending.get(session, []))
+        for ev in evs:
             if not ev.wait(max(0.0, deadline - time.monotonic())):
                 return False
         return not self.pending_requests(session)
@@ -532,12 +547,13 @@ class Bridge:
                 return None
             time.sleep(0.25)
 
-    CONFIRMED = ("deleted", "absent", "killed+deleted", "deleted+swept", "killed+deleted+swept")
+    CONFIRMED = ("deleted", "absent", "killed+deleted",
+                 "deleted+swept", "absent+swept", "killed+deleted+swept")
 
     def teardown_session(self, key: str) -> str:
         """Delete *key* and VERIFY it is gone. Outcome words:
         deleted | absent | killed+deleted | deleted? | absent? | failed:<why>,
-        the deleted forms also with "+swept"; CONFIRMED lists the resolved ones.
+        each confirmed form also with "+swept"; CONFIRMED lists the resolved ones.
 
         The HTTP status is not trusted on its own: the servers pop the manager
         entry before stopping the session, so a failed/timed-out DELETE can
@@ -549,14 +565,13 @@ class Bridge:
         DELETE_DEADLINE: its late POST could still spawn the session after an
         "absent"; if it is still in flight the key stays unresolved. Before
         every successful return the pending list is re-checked (the teardown's
-        own DELETE may have been abandoned) and, after a delete, the key's
-        worktree generations must be gone from disk. A key whose earlier
+        own DELETE may have been abandoned) and the key's worktree generations
+        must be gone from disk (a disk that cannot be listed is a failure). A key whose earlier
         request ended in an ordinary timeout/connection loss (`_uncertain`) is
         re-checked once more after the pass; if something reappeared it is
         deleted again (confirmed), otherwise the outcome carries a "?" and the
         key is no longer uncertain (reported once). A worktree generation left
-        on disk after a delete is swept (see sweep_worktrees) and the outcome
-        gets "+swept"."""
+        on disk is swept (see sweep_worktrees) and the outcome gets "+swept"."""
         if not names.is_ours(key):
             raise ValueError(f"refusing to tear down a session this run did not create: {key!r}")
         if self.pending_requests(key):
@@ -592,16 +607,29 @@ class Bridge:
             return outcome
         return outcome + "?"  # nothing visible now, but a late request could still arrive
 
-    def sweep_worktrees(self, key: str, dirs: list[str]) -> list[str]:
+    def sweep_worktrees(self, key: str, dirs: list[str]) -> list[str] | None:
         """Remove *key*'s leftover worktree generations *dirs* from the
         container (`git worktree remove --force`, `rm -rf` as the fallback,
-        then `git worktree prune`) and return what is still on disk. Only
-        paths under this bridge's sessions root are touched; anything else
-        is refused and reported as left."""
+        then `git worktree prune`) and return what is still on disk (None
+        when the disk could not be re-listed). Only paths shaped as this
+        key's own generations under this bridge's sessions root
+        (<root>/<run-id>/<safe-name>/c<generation>) are touched; anything
+        else is refused and reported as left."""
+        if not names.is_ours(key):
+            raise ValueError(f"refusing to sweep worktrees of a session this run did not create: {key!r}")
+        if not dirs:
+            return []  # nothing to do (and the joined script below would start with "; ")
         root = self.sessions_root + "/"
-        safe = [d for d in dirs if d.startswith(root) and ".." not in d.split("/")]
+        want = worktree.safe_name(key)
+
+        def ours(d: str) -> bool:
+            parts = d[len(root):].split("/") if d.startswith(root) else []
+            return (len(parts) == 3 and all(parts) and parts[0] not in (".", "..")
+                    and parts[1] == want and re.fullmatch(r"c\d+", parts[2]) is not None)
+
+        safe = [d for d in dirs if ours(d)]
         if len(safe) != len(dirs):
-            _say(f"refusing to sweep outside {root}: {[d for d in dirs if d not in safe]}")
+            _say(f"refusing to sweep outside {root}*/{want}/c*: {[d for d in dirs if d not in safe]}")
             return dirs
         git = f"git -C {REPO_IN_CONTAINER}"
         script = "; ".join(
@@ -615,14 +643,17 @@ class Bridge:
         """The gate before every successful return of a teardown pass."""
         if self.pending_requests(key):
             return "failed:request-still-pending"
-        if outcome in ("deleted", "killed+deleted"):
-            left = self.worktree_dirs(key)
+        left = self.worktree_dirs(key)
+        if left is None:
+            return "failed:cannot-list-worktrees"
+        if left:
+            _say(f"worktree(s) of {key} left on disk after delete: {left}; sweeping")
+            left = self.sweep_worktrees(key, left)
+            if left is None:
+                return "failed:cannot-list-worktrees"
             if left:
-                _say(f"worktree(s) of {key} left on disk after delete: {left}; sweeping")
-                left = self.sweep_worktrees(key, left)
-                if left:
-                    return f"failed:worktree-left({left})"
-                return outcome + "+swept"
+                return f"failed:worktree-left({left})"
+            return outcome + "+swept"
         return outcome
 
     def _teardown_once(self, key: str) -> str:

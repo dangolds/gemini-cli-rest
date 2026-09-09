@@ -1,13 +1,13 @@
 # TestPRD — Stories and Tasks
 
-> Breakdown of `TestPRD.md` into stages and tasks. Date: 2026-09-08. Status: Stage 0 DONE 2026-09-09 (8 rounds; debt of `TestPRD-stage0-review.md` fixed in round 8, codex verdict pending on the usage-limit reset); waiting for the operator's go on Stage 1.
+> Breakdown of `TestPRD.md` into stages and tasks. Date: 2026-09-08. Status: Stage 0 DONE 2026-09-09 (11 rounds; debt of `TestPRD-stage0-review.md` fixed in round 8, codex's follow-ups in rounds 9-11, codex AND gemini Ready on round 11); waiting for the operator's go on Stage 1.
 
 ## Progress
 
 - [x] Go for Stage 0 (2026-09-08)
 - [x] Stage 0 written (2026-09-08): hermetic 11 + 41 green, smoke green on both ports, baseline file written, retained live suites green on both ports (47/49 agy, 28/30 codex: one stop test skipped behind the flag each, one name-shadowing bug found by the run and fixed)
 - [x] Stage 0 reviewed (2026-09-08): 7 codex rounds (10+7+6+2+1+2+3 points, all fixed; the last 3 low ones without a further round), agy Ready on round 4; bridge bug found → features.md #16; tech debt listed in `TestPRD-stage0-review.md`
-- [x] Stage 0 debt fixed (2026-09-09): all 12 items of `TestPRD-stage0-review.md` (round 8); gemini Ready; codex blocked by the ChatGPT usage limit, rerun pending; server fix (features.md #16) waits for a rebuild
+- [x] Stage 0 debt fixed (2026-09-09): all 12 items of `TestPRD-stage0-review.md` (round 8) plus 13 codex follow-ups (rounds 9-11, listed at the end of that file); round 11: codex Ready, gemini Ready; server fix (features.md #16) waits for a rebuild; verification run after round 11: agy retained 49/49, stories agy-side all green, codex side blocked by the ChatGPT usage limit (429, reset 07:57 UTC), rerun pending
 - [ ] Stage 1 (waits for the operator's go)
 - [ ] Stage 2
 - [ ] Stage 3

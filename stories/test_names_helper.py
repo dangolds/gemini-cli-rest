@@ -295,6 +295,7 @@ def test_teardown_does_not_take_a_dead_health_for_absence(monkeypatch):
     monkeypatch.setattr(live.Bridge, "delete",
                         lambda self, k, timeout=0: live.Reply(500, None, "boom", 0.1))
     monkeypatch.setattr(live.Bridge, "pane_pids", lambda self, k: [])
+    monkeypatch.setattr(live.Bridge, "worktree_dirs", lambda self, k: [])
     monkeypatch.setattr(live.Bridge, "health",
                         lambda self, timeout=10.0: live.Reply(None, None, "", 0.1, "ConnectError"))
     assert b.teardown_session(key) == "failed:health-unavailable"
@@ -399,6 +400,7 @@ def test_teardown_waits_for_an_abandoned_request(monkeypatch):
     monkeypatch.setattr(live.Bridge, "delete",
                         lambda self, k, timeout=0: (deletes.append(k), live.Reply(404, None, "", 0.0))[1])
     monkeypatch.setattr(live.Bridge, "pane_pids", lambda self, k: [])
+    monkeypatch.setattr(live.Bridge, "worktree_dirs", lambda self, k: [])
     b = live.Bridge.for_agent("agy")
     key = names.key("late")
     rep = b.chat(key, "hi", timeout=0.1)
@@ -411,6 +413,34 @@ def test_teardown_waits_for_an_abandoned_request(monkeypatch):
     threading.Timer(0.2, release.set).start()
     assert b.teardown_session(key) == "absent"
     assert deletes == [key] and b.pending_requests(key) == [] and key not in b._pending
+
+
+def test_request_is_pending_while_its_worker_runs(monkeypatch):
+    """A request is registered as pending BEFORE its worker starts, so
+    pending_requests/wait_pending see it while it is in flight, not only once
+    its caller gave up at the deadline."""
+    import threading
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(self, method, url, **kw):
+        started.set()
+        release.wait(30)
+        return httpx.Response(200, json={"session": "x", "turn": 1, "response": "ok"})
+
+    monkeypatch.setattr(httpx.Client, "request", blocked)
+    b = live.Bridge.for_agent("agy")
+    key = names.key("inflight")
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(b._request("POST", "/chat/x", timeout=5.0, session=key)))
+    t.start()
+    assert started.wait(5)
+    assert len(b.pending_requests(key)) == 1
+    assert not b.wait_pending(key, 0.05)
+    release.set()
+    t.join(5)
+    assert out and out[0].status == 200
+    assert b.wait_pending(key, 2.0)
+    assert b.pending_requests(key) == [] and key not in b._pending
 
 
 def _health_with(*keys):
@@ -483,15 +513,18 @@ def test_worktree_left_on_disk_is_swept_or_unresolved(monkeypatch):
     key = names.key("wt")
     safe = live.worktree.safe_name(key)
     root = b.sessions_root
-    disk = {"dirs": [f"{root}/abc123/{safe}/c1", f"{root}/abc123/{safe}/c2"], "sweep_clears": True}
+    disk = {"dirs": [f"{root}/abc123/{safe}/c1", f"{root}/abc123/{safe}/c2"], "sweep_clears": True,
+            "listable": True}
     sweeps: list[str] = []
 
     def fake_exec(self, *cmd, timeout=30.0):
         if cmd[:2] == ("sh", "-c") and "list-panes" in cmd[2]:
             return 1, "no current target\n__tmux_rc=1\n"
-        if cmd[:2] == ("sh", "-c") and cmd[2].startswith("ls -d"):
-            assert f"{root}/*/{safe}/c*" in cmd[2]
-            return (0, "".join(d + "\n" for d in disk["dirs"])) if disk["dirs"] else (2, "")
+        if cmd[:2] == ("sh", "-c") and cmd[2].startswith("for d in"):
+            assert f"{root}/*/{safe}/c*" in cmd[2] and cmd[2].endswith("echo __wt_listed__")
+            if not disk["listable"]:
+                return 127, "docker: no such container\n"
+            return 0, "".join(d + "\n" for d in disk["dirs"]) + "__wt_listed__\n"
         if cmd[:2] == ("sh", "-c") and "worktree remove --force" in cmd[2]:
             sweeps.append(cmd[2])
             if disk["sweep_clears"]:
@@ -517,12 +550,80 @@ def test_worktree_left_on_disk_is_swept_or_unresolved(monkeypatch):
     disk["dirs"] = ["/app/slitled-platform"]
     out = b.teardown_session(key)
     assert out.startswith("failed:worktree-left(") and sweeps == []
-    # "absent" does not consult the disk (nothing was deleted); gone dirs -> deleted
+    # "absent" consults the disk too (a generation can outlive the manager entry)
+    disk["dirs"], disk["sweep_clears"] = [f"{root}/abc123/{safe}/c2"], True
     monkeypatch.setattr(live.Bridge, "delete", lambda self, k, timeout=0: live.Reply(404, None, "", 0.0))
-    assert b.teardown_session(key) == "absent"
+    assert b.teardown_session(key) == "absent+swept" and "absent+swept" in live.Bridge.CONFIRMED
+    assert b.worktree_dirs(key) == [] and b.teardown_session(key) == "absent"
     disk["dirs"] = []
     monkeypatch.setattr(live.Bridge, "delete", lambda self, k, timeout=0: live.Reply(200, None, "", 0.0))
     assert b.teardown_session(key) == "deleted"
+    # a disk that cannot be inspected is not "nothing on disk"
+    disk["listable"] = False
+    assert b.worktree_dirs(key) is None
+    assert b.teardown_session(key) == "failed:cannot-list-worktrees"
+    # ... also when it is the re-listing after a sweep
+    disk["dirs"], disk["listable"], sweeps[:] = [f"{root}/abc123/{safe}/c1"], True, []
+    monkeypatch.setattr(live.Bridge, "docker_exec",
+                        lambda self, *cmd, timeout=30.0: (disk.update(listable=False), fake_exec(self, *cmd))[1]
+                        if "worktree remove --force" in cmd[-1] else fake_exec(self, *cmd))
+    assert b.teardown_session(key) == "failed:cannot-list-worktrees" and len(sweeps) == 1
+
+
+def test_sweep_refuses_foreign_keys_and_paths_not_shaped_as_the_keys_generation(monkeypatch):
+    _no_network(monkeypatch)
+    execs: list = []
+    monkeypatch.setattr(live.Bridge, "docker_exec",
+                        lambda self, *cmd, timeout=30.0: (execs.append(cmd), (0, ""))[1])
+    b = live.Bridge.for_agent("codex")
+    key = names.key("wt")
+    safe = live.worktree.safe_name(key)
+    root = b.sessions_root
+    with pytest.raises(ValueError):
+        b.sweep_worktrees(names.raw("wt-other@main"), [f"{root}/abc123/{safe}/c1"])
+    other = live.worktree.safe_name(names.key("other"))
+    for bad in ([f"{root}/abc123/{other}/c1"],            # another key's generation
+                [f"{root}/abc123/{safe}"],                # the slug dir, not a generation
+                [f"{root}/abc123/{safe}/c1/deeper"],      # below a generation
+                [f"{root}/abc123/{safe}/x1"],             # not a c<generation>
+                [f"{root}/abc123/{safe}/cache"],          # starts with c, not c<int>
+                [f"{root}/../abc123/{safe}/c1"],          # traversal
+                [f"{root}/./{safe}/c1"],                  # `.` run-id segment
+                [f"{root}//{safe}/c1"],                   # empty run-id segment
+                [f"{safe}/c1"],                           # outside the root
+                [f"{root}/abc123/{safe}/c1", f"{root}/abc123/{safe}"]):   # one bad dir spoils the set
+        assert b.sweep_worktrees(key, bad) == bad
+    assert b.sweep_worktrees(key, []) == []          # nothing to sweep, no script run
+    assert execs == []
+
+
+def test_abandoned_worker_failure_marks_the_key_uncertain(monkeypatch):
+    """An abandoned request (deadline passed, caller already answered) that
+    later fails inside httpx may still have been run by the server: the
+    WORKER records the uncertainty, not the caller that is no longer there."""
+    import threading
+    release = threading.Event()
+
+    def late_timeout(self, method, url, **kw):
+        release.wait(30)
+        raise httpx.ReadTimeout("late")
+
+    monkeypatch.setattr(httpx.Client, "request", late_timeout)
+    monkeypatch.setattr(live.Bridge, "DEADLINE_SLACK", 0.1)
+    b = live.Bridge.for_agent("agy")
+    key = names.key("late-err")
+    rep = b.chat(key, "hi", timeout=0.1)
+    assert rep.status is None and "deadline" in rep.error and key not in b._uncertain
+    assert len(b.pending_requests(key)) == 1
+    release.set()
+    assert b.wait_pending(key, 2.0)
+    assert key in b._uncertain and key not in b._pending
+    # a non-httpx failure of an abandoned worker is not an uncertainty
+    monkeypatch.setattr(httpx.Client, "request", lambda self, m, u, **kw: (_ for _ in ()).throw(RuntimeError("x")))
+    other = names.key("plain-err")
+    with pytest.raises(RuntimeError):
+        b.chat(other, "hi", timeout=0.1)
+    assert other not in b._uncertain
 
 
 def test_group_session_default_name_comes_from_module_and_class(monkeypatch):
@@ -634,3 +735,70 @@ def test_baseline_compare_and_approve(tmp_path, monkeypatch):
     herm = tmp_path / "herm.json"
     herm.write_text(json.dumps({"stories": [story("h", "passed", hermetic=True)]}))
     assert baseline.approve(herm) is None
+    # a failed teardown refuses the run even when every story passed
+    torn = tmp_path / "torn.json"
+    torn.write_text(json.dumps({"stories": [dict(story("a", "passed"), teardown_error=True)]}))
+    assert baseline.approve(torn) is None
+    # an unresolved teardown refuses the run even when every story passed
+    unres = tmp_path / "unres.json"
+    unres.write_text(json.dumps({"stories": [story("a", "passed")],
+                                 "unresolved_teardowns": [["agy", "k-x@main", "deleted?"]]}))
+    assert baseline.approve(unres) is None
+    # so does a pytest run that did not finish cleanly
+    assert baseline.approve(green, exit_ok=False) is None
+    assert json.loads(baseline.reference_path().read_text()) == json.loads(green.read_text())
+
+
+def test_baseline_reads_unresolved_teardowns_at_build_time(monkeypatch):
+    from bridgetests import baseline
+    monkeypatch.setattr(live, "UNRESOLVED", [])
+    rec = baseline.BaselineRecorder({"agy": 8000}, "c")
+    assert rec.build()["unresolved_teardowns"] == []
+    live.UNRESOLVED.append(("agy", "k@main", "deleted?"))
+    assert rec.build()["unresolved_teardowns"] == [["agy", "k@main", "deleted?"]]
+
+
+def test_baseline_teardown_failure_marks_the_story_error():
+    import types
+    from bridgetests import baseline
+    item = types.SimpleNamespace(get_closest_marker=lambda n: None, module=types.SimpleNamespace(GROUP="A"))
+    report = lambda nodeid, when, outcome: types.SimpleNamespace(
+        nodeid=nodeid, when=when, outcome=outcome, duration=0.1)
+    rec = baseline.BaselineRecorder({"agy": 8000}, "c")
+    for nodeid, call in (("skipped", "skipped"), ("passed", "passed"), ("failed", "failed")):
+        rec.record(item, report(nodeid, "setup", "passed"))
+        rec.record(item, report(nodeid, "call", call))
+        rec.record(item, report(nodeid, "teardown", "failed"))
+    rec.record(item, report("setup-skipped", "setup", "skipped"))
+    rec.record(item, report("setup-skipped", "teardown", "failed"))
+    rec.record(item, report("clean", "setup", "passed"))
+    rec.record(item, report("clean", "call", "passed"))
+    rec.record(item, report("clean", "teardown", "passed"))
+    got = {n: (r["outcome"], r.get("teardown_error")) for n, r in rec.records.items()}
+    assert got == {"skipped": ("error", True), "passed": ("error", True), "failed": ("failed", True),
+                   "setup-skipped": ("error", True), "clean": ("passed", None)}
+
+
+def test_fake_clock_wait_for_cancels_the_child_when_the_caller_is_cancelled():
+    import asyncio
+    from bridgetests import fakes
+    clock = fakes.FakeClock()
+    proxy = fakes._AsyncioProxy(clock)
+    state = {"child": "running"}
+
+    async def child():
+        try:
+            await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError:
+            state["child"] = "cancelled"
+            raise
+
+    async def scenario():
+        waiter = asyncio.ensure_future(proxy.wait_for(child(), 30))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert state["child"] == "cancelled"   # not left running behind the cancelled caller
+    asyncio.run(scenario())
+    assert clock.elapsed == 0                  # no timeout was reached

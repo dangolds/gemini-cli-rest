@@ -13,8 +13,8 @@ stories/conftest.py wires the pytest hooks to `BaselineRecorder`.
 The REFERENCE (baseline/reference.json, tracked in git; BRIDGE_BASELINE_REFERENCE
 to move it) is the run every later run is compared to by story nodeid
 (`compare`: changed outcomes, missing and new stories). BRIDGE_BASELINE_APPROVE=1
-makes a fully green run the new reference (`approve`); a run with any failure
-is refused.
+makes a fully green run the new reference (`approve`); a run with any failure,
+an unresolved teardown or an unclean pytest exit is refused.
 
 Conventions the recorder reads from a story:
   @pytest.mark.units(n)     live spawn-and-turn units the story spends (0 if absent)
@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from bridgetests import names
+from bridgetests import live, names
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIR = REPO_ROOT / "logs" / "baseline"
@@ -67,14 +67,29 @@ def compare(run: dict[str, Any], reference: dict[str, Any]) -> dict[str, list]:
     return {"changed": changed, "missing": missing, "new": new}
 
 
-def approve(run_path: Path) -> Path | None:
+def approve(run_path: Path, *, exit_ok: bool = True) -> Path | None:
     """Copy the run file to the reference path, only when every story that ran
-    passed (skipped stories are fine); None, with the reason printed, otherwise."""
+    passed (skipped stories are fine), no teardown failed or stayed unresolved
+    and pytest finished cleanly (*exit_ok*); None, with the reason printed,
+    otherwise."""
+    if not exit_ok:
+        print("[baseline] not approved: pytest did not finish cleanly", flush=True)
+        return None
     data = json.loads(Path(run_path).read_text(encoding="utf-8"))
     bad = [(s["nodeid"], s.get("outcome")) for s in data.get("stories", [])
            if s.get("outcome") not in ("passed", "skipped")]
     if bad:
         print(f"[baseline] not approved: {len(bad)} story(ies) did not pass, e.g. {bad[0]}",
+              flush=True)
+        return None
+    torn = [s["nodeid"] for s in data.get("stories", []) if s.get("teardown_error")]
+    if torn:
+        print(f"[baseline] not approved: {len(torn)} story(ies) failed at teardown, e.g. {torn[0]}",
+              flush=True)
+        return None
+    unresolved = data.get("unresolved_teardowns") or []
+    if unresolved:
+        print(f"[baseline] not approved: {len(unresolved)} teardown(s) unresolved, e.g. {unresolved[0]}",
               flush=True)
         return None
     if not any(s.get("ran") and not s.get("hermetic") for s in data.get("stories", [])):
@@ -156,7 +171,7 @@ class BaselineRecorder:
             rec["units_spent"] = rec["units"]
         elif report.when == "teardown" and report.outcome == "failed":
             rec["teardown_error"] = True
-            if rec["outcome"] == "passed":
+            if rec["outcome"] in (None, "passed", "skipped"):
                 rec["outcome"] = "error"
 
     # --- output -------------------------------------------------------------------
@@ -191,6 +206,8 @@ class BaselineRecorder:
                 "live_units_per_agent": dict(sorted(units_per_agent.items())),
                 "outcomes": dict(sorted(outcomes.items())),
             },
+            # read at write time: every fixture teardown has run by then
+            "unresolved_teardowns": [list(t) for t in live.UNRESOLVED],
             "stories": [
                 {k: v for k, v in r.items() if k != "phases"} | {"duration": round(r["duration"], 2)}
                 for r in stories

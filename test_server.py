@@ -75,9 +75,13 @@ def live_server(request):
     print(f"\n[{_ts()}] Tearing down — deleting this run's sessions...", flush=True)
     for name in sorted(_created):  # keys no `cleanup` fixture covered
         try:
-            print(f"  [{_ts()}] {name}: {_bridge().teardown_session(name)}", flush=True)
+            outcome = _bridge().teardown_session(name)
+            print(f"  [{_ts()}] {name}: {outcome}", flush=True)
         except Exception as e:
+            outcome = f"failed:{type(e).__name__}: {e}"
             print(f"  [{_ts()}] WARNING: teardown of '{name}' failed: {e}", flush=True)
+        if outcome not in live.Bridge.CONFIRMED:  # reported at session finish (stories/conftest)
+            live.UNRESOLVED.append((_bridge().agent, name, outcome))
     _created.clear()
     _bridge().close()
     print(f"[{_ts()}] Done", flush=True)
@@ -154,11 +158,14 @@ def cleanup():
             print(f"  [{_ts()}] Cleaning up session '{name}': not adopted, skipped", flush=True)
             continue
         print(f"  [{_ts()}] Cleaning up session '{name}'...", flush=True)
+        outcome = None
         try:
-            print(f"  [{_ts()}] cleanup '{name}': {_bridge().teardown_session(name)}", flush=True)
+            outcome = _bridge().teardown_session(name)
+            print(f"  [{_ts()}] cleanup '{name}': {outcome}", flush=True)
         except Exception as e:
             print(f"  [{_ts()}] WARNING: cleanup of '{name}' failed: {e}", flush=True)
-        _created.discard(name)  # torn down here; the module teardown skips it
+        if outcome in live.Bridge.CONFIRMED:
+            _created.discard(name)  # confirmed here; anything else the module teardown retries
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +423,10 @@ class TestDelete:
 
     def test_delete_nonexistent_returns_404(self):
         print(f"\n[{_ts()}] TEST: Delete nonexistent session → expect 404", flush=True)
-        r = httpx.delete(f"{BASE}/chat/nonexistent-session-xyz", timeout=10)
-        assert r.status_code == 404
+        k = names.key("nonexistent")
+        _bridge().assert_not_live(k)
+        r = _bridge().delete(k, timeout=10)
+        assert r.status == 404
         print(f"  [{_ts()}] PASS: Got 404 as expected", flush=True)
 
 

@@ -72,13 +72,14 @@ def pytest_runtest_makereport(item, call):
     _get_recorder().record(item, outcome.get_result())
 
 
+@pytest.hookimpl(trylast=True)  # after pytest's own fixture finalizers
 def pytest_sessionfinish(session, exitstatus):
     if _recorder is None:
         return
     path = _recorder.write()
     if path is not None:
         print(f"\n[baseline] run stamp {names.STAMP}: wrote {path}", flush=True)
-        _report_against_reference(path)
+        _report_against_reference(path, exit_ok=(exitstatus == 0))
     else:
         print(f"\n[baseline] run stamp {names.STAMP}: no live story ran, no baseline written",
               flush=True)
@@ -90,7 +91,7 @@ def pytest_sessionfinish(session, exitstatus):
     live.close_all()
 
 
-def _report_against_reference(run_path) -> None:
+def _report_against_reference(run_path, *, exit_ok: bool = True) -> None:
     ref = baseline.reference_path()
     if ref.exists():
         try:
@@ -107,7 +108,7 @@ def _report_against_reference(run_path) -> None:
         print(f"[baseline] no reference at {ref} (BRIDGE_BASELINE_APPROVE=1 on a green run creates it)",
               flush=True)
     if baseline.approve_requested():
-        dest = baseline.approve(run_path)
+        dest = baseline.approve(run_path, exit_ok=exit_ok)
         if dest is not None:
             print(f"[baseline] approved: {run_path} is now the reference {dest}", flush=True)
 
