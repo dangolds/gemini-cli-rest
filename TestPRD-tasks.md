@@ -7,7 +7,7 @@
 - [x] Go for Stage 0 (2026-09-08)
 - [x] Stage 0 written (2026-09-08): hermetic 11 + 41 green, smoke green on both ports, baseline file written, retained live suites green on both ports (47/49 agy, 28/30 codex: one stop test skipped behind the flag each, one name-shadowing bug found by the run and fixed)
 - [x] Stage 0 reviewed (2026-09-08): 7 codex rounds (10+7+6+2+1+2+3 points, all fixed; the last 3 low ones without a further round), agy Ready on round 4; bridge bug found → features.md #16; tech debt listed in `TestPRD-stage0-review.md`
-- [x] Stage 0 debt fixed (2026-09-09): all 12 items of `TestPRD-stage0-review.md` (round 8) plus 13 codex follow-ups (rounds 9-11, listed at the end of that file); round 11: codex Ready, gemini Ready; server fix (features.md #16) waits for a rebuild; verification run after round 11: agy retained 49/49, stories agy-side all green, codex side blocked by the ChatGPT usage limit (429, reset 07:57 UTC), rerun pending
+- [x] Stage 0 debt fixed (2026-09-09): all 12 items of `TestPRD-stage0-review.md` (round 8) plus 13 codex follow-ups (rounds 9-11, listed at the end of that file); round 11: codex Ready, gemini Ready; server fix (features.md #16) waits for a rebuild; verification run after round 11: agy retained 49/49, stories agy-side all green, codex side rerun after the quota reset: stories 6/6, retained 30 passed / 1 skipped; all green
 - [ ] Stage 1 (waits for the operator's go)
 - [ ] Stage 2
 - [ ] Stage 3
