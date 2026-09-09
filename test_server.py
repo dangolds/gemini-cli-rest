@@ -9,12 +9,15 @@ Usage:
     pytest test_server.py -v
 """
 
+import os
 import time
 import uuid
 from datetime import datetime
 
 import httpx
 import pytest
+
+from bridgetests import live, names
 
 
 def _ts() -> str:
@@ -69,12 +72,42 @@ def live_server(request):
         pytest.skip(f"No bridge at {BASE}; run docker compose up -d")
     print(f"[{_ts()}] Server is up and healthy", flush=True)
     yield
-    print(f"\n[{_ts()}] Tearing down — stopping all sessions...", flush=True)
-    try:
-        httpx.post(f"{BASE}/stop", timeout=10)
-    except Exception:
-        pass
+    print(f"\n[{_ts()}] Tearing down — deleting this run's sessions...", flush=True)
+    for name in sorted(_created):  # keys no `cleanup` fixture covered
+        try:
+            print(f"  [{_ts()}] {name}: {_bridge().teardown_session(name)}", flush=True)
+        except Exception as e:
+            print(f"  [{_ts()}] WARNING: teardown of '{name}' failed: {e}", flush=True)
+    _created.clear()
+    _bridge().close()
     print(f"[{_ts()}] Done", flush=True)
+
+
+# Every key chat() addressed this run; the `cleanup` fixture or, failing
+# that, the autouse fixture above deletes them.
+_created: set[str] = set()
+_BRIDGE: live.Bridge | None = None
+
+
+def _bridge() -> live.Bridge:
+    """The one client for BASE (bridgetests.live.Bridge): ownership gate,
+    absolute deadline and verified teardown live there, not here."""
+    global _BRIDGE
+    if _BRIDGE is None:
+        _BRIDGE = live.Bridge.for_url('agy', BASE)
+    return _BRIDGE
+
+
+def _adopt(session: str) -> None:
+    """Own *session* for teardown; a key already live on the bridge (another
+    run pinned to this stamp, or a leftover) is never adopted."""
+    if session in _created:
+        return
+    try:
+        _bridge().assert_not_live(session)
+    except ValueError as e:
+        pytest.fail(str(e))
+    _created.add(session)
 
 
 def chat(session: str, prompt: str) -> dict:
@@ -84,18 +117,12 @@ def chat(session: str, prompt: str) -> dict:
     # name to "@main" so E2E sessions actually start.
     if "@" not in session:
         session = f"{session}@main"
-    print(f"  [{_ts()}] >>> {session}: {prompt}", flush=True)
-    t0 = time.monotonic()
-    r = httpx.post(
-        f"{BASE}/chat/{session}",
-        json={"prompt": prompt},
-        timeout=TIMEOUT,
-    )
-    r.raise_for_status()
-    data = r.json()
-    elapsed = time.monotonic() - t0
-    print(f"  [{_ts()}] <<< {session} (turn {data['turn']}, {elapsed:.1f}s): {data['response']}", flush=True)
-    return data
+    live._own(session)  # raises before HTTP: foreign stamp, or a route trick like "main/../../stop"
+    _adopt(session)
+    rep = _bridge().chat(session, prompt, timeout=TIMEOUT)
+    if rep.status != 200:
+        raise AssertionError(f"POST /chat/{session} -> {rep.status}: {rep.error or rep.text[:300]}")
+    return rep.body
 
 
 def last(session: str, wait: float = 15.0) -> dict:
@@ -103,12 +130,10 @@ def last(session: str, wait: float = 15.0) -> dict:
     # Same default-basing as chat(): a bare name addresses the wrong key.
     if "@" not in session:
         session = f"{session}@main"
-    r = httpx.get(f"{BASE}/last/{session}", params={"wait": wait}, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    print(f"  [{_ts()}] /last {session}: done={data['done']} turn={data['turn']} "
-          f"resp={data['response']!r}", flush=True)
-    return data
+    rep = _bridge().last(session, wait=wait, timeout=TIMEOUT)
+    if rep.status != 200:
+        raise AssertionError(f"GET /last/{session} -> {rep.status}: {rep.error or rep.text[:300]}")
+    return rep.body
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +150,15 @@ def cleanup():
         # URL addresses the SAME key the session was actually created under.
         if "@" not in name:
             name = f"{name}@main"
+        if name not in _created:
+            print(f"  [{_ts()}] Cleaning up session '{name}': not adopted, skipped", flush=True)
+            continue
         print(f"  [{_ts()}] Cleaning up session '{name}'...", flush=True)
         try:
-            httpx.delete(f"{BASE}/chat/{name}", timeout=30)
+            print(f"  [{_ts()}] cleanup '{name}': {_bridge().teardown_session(name)}", flush=True)
         except Exception as e:
             print(f"  [{_ts()}] WARNING: cleanup of '{name}' failed: {e}", flush=True)
+        _created.discard(name)  # torn down here; the module teardown skips it
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +171,7 @@ class TestChatMemory:
     def test_remembers_fact(self, cleanup):
         print(f"\n[{_ts()}] TEST: Chat memory — does session remember a secret word?", flush=True)
         # Keyed: the response's "session" field echoes the full "<name>@<base>" key.
-        name = f"test-memory-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-memory-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
 
@@ -167,7 +196,7 @@ class TestLastReadback:
     def test_last_recovers_the_completed_answer(self, cleanup):
         print(f"\n[{_ts()}] TEST: /last — recover the answer a /chat just produced", flush=True)
         # Keyed: /last echoes the full "<name>@<base>" key in its "session" field.
-        name = f"test-last-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-last-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
 
@@ -185,7 +214,7 @@ class TestLastReadback:
     def test_last_returns_latest_turn_not_a_previous_one(self, cleanup):
         """The baseline guard, over real HTTP: after a 2nd turn, /last is turn 2 — never turn 1."""
         print(f"\n[{_ts()}] TEST: /last — returns the LATEST turn, not a stale previous one", flush=True)
-        name = f"test-last2-{uuid.uuid4().hex[:8]}"
+        name = names.bare(f"test-last2-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         tok1 = _unique("firstx")
         tok2 = _unique("secndx")
@@ -206,7 +235,7 @@ class TestLastReadback:
         print(f"\n[{_ts()}] TEST: /last after /clear → no stale pre-clear answer", flush=True)
         # Keyed: chat()/last() leave an already-@based name alone, and the direct
         # /clear URL below must hit the SAME key.
-        name = f"test-lastclr-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-lastclr-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
 
@@ -238,7 +267,7 @@ class TestClear:
     def test_clear_forgets_context(self, cleanup):
         print(f"\n[{_ts()}] TEST: Clear — does /clear wipe conversation context?", flush=True)
         # Keyed: the direct /clear URL below must address the same key chat() uses.
-        name = f"test-clear-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-clear-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
 
@@ -277,7 +306,7 @@ class TestReset:
     def test_reset_returns_200_and_resets_turn_count(self, cleanup):
         print(f"\n[{_ts()}] TEST: Reset — does /reset kill and restart with fresh turn count?", flush=True)
         # Keyed: the direct /reset URL below must address the same key chat() uses.
-        name = f"test-reset-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-reset-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
 
         # Build up some turns
@@ -314,8 +343,8 @@ class TestMultiSessionIsolation:
     def test_sessions_are_isolated(self, cleanup):
         print(f"\n[{_ts()}] TEST: Multi-session isolation — do sessions leak context?", flush=True)
         suffix = uuid.uuid4().hex[:8]
-        alpha = f"test-alpha-{suffix}"
-        beta = f"test-beta-{suffix}"
+        alpha = names.bare(f"test-alpha-{suffix}")
+        beta = names.bare(f"test-beta-{suffix}")
         cleanup.extend([alpha, beta])
         token_a = _unique("cola")
         token_b = _unique("anlb")
@@ -361,7 +390,7 @@ class TestDelete:
         print(f"\n[{_ts()}] TEST: Delete — does DELETE remove session from /health?", flush=True)
         # Key the name to its base: /health, the chat() URL and the DELETE URL
         # must all reference the SAME "<name>@<base>" key.
-        name = f"test-delete-{uuid.uuid4().hex[:8]}@main"
+        name = names.key(f"test-delete-{uuid.uuid4().hex[:8]}")
 
         # Create session
         print(f"  [{_ts()}] Step 1/3: Creating session...", flush=True)
@@ -369,8 +398,8 @@ class TestDelete:
 
         # Verify it shows in health
         health = httpx.get(f"{BASE}/health", timeout=10).json()
-        names = [s["name"] for s in health["sessions"]]
-        assert name in names
+        listed = [s["name"] for s in health["sessions"]]
+        assert name in listed
         print(f"  [{_ts()}] Session visible in /health ({health['active_sessions']} active)", flush=True)
 
         # Delete it
@@ -381,8 +410,8 @@ class TestDelete:
         # Verify gone from health
         print(f"  [{_ts()}] Step 3/3: Verifying session removed from /health...", flush=True)
         health = httpx.get(f"{BASE}/health", timeout=10).json()
-        names = [s["name"] for s in health["sessions"]]
-        assert name not in names
+        listed = [s["name"] for s in health["sessions"]]
+        assert name not in listed
         print(f"  [{_ts()}] PASS: Session deleted and gone from /health", flush=True)
 
     def test_delete_nonexistent_returns_404(self):
@@ -395,14 +424,16 @@ class TestDelete:
 class TestStop:
     """Verify that POST /stop kills all sessions."""
 
+    @pytest.mark.skipif(os.environ.get("BRIDGE_LIVE_STOP") != "1",
+                        reason="POST /stop ends every live session on the bridge, the operator's too; set BRIDGE_LIVE_STOP=1 to run it")
     def test_stop_clears_everything(self):
         print(f"\n[{_ts()}] TEST: Stop — does /stop kill all sessions?", flush=True)
 
         # Create two sessions
         suffix = uuid.uuid4().hex[:8]
         # Keyed to their base so they spawn under the worktree gate.
-        stop_a = f"test-stop-a-{suffix}@main"
-        stop_b = f"test-stop-b-{suffix}@main"
+        stop_a = names.key(f"test-stop-a-{suffix}")
+        stop_b = names.key(f"test-stop-b-{suffix}")
         print(f"  [{_ts()}] Step 1/3: Creating two sessions...", flush=True)
         chat(stop_a, "hello")
         chat(stop_b, "hello")
@@ -450,7 +481,7 @@ class TestSpecialCharacters:
 
     def test_special_chars_treated_as_text(self, cleanup):
         print(f"\n[{_ts()}] TEST: Special characters — do dangerous chars get treated as text?", flush=True)
-        name = f"test-specchar-{uuid.uuid4().hex[:8]}"
+        name = names.bare(f"test-specchar-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
 
         # Each tuple: (label, prompt_template with {token} placeholder)
@@ -510,7 +541,7 @@ class TestSpecialCharacters:
     def test_simple_prompt_baseline(self, cleanup):
         """Baseline: a trivial prompt returns a coherent response."""
         print(f"\n[{_ts()}] TEST: Simple prompt baseline", flush=True)
-        name = f"test-baseline-{uuid.uuid4().hex[:8]}"
+        name = names.bare(f"test-baseline-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
         resp = chat(name, f'Say "OK" and then repeat this token exactly: {token}')
@@ -522,7 +553,7 @@ class TestSpecialCharacters:
     def test_long_prompt(self, cleanup):
         """~3000-char prompt (60x repeated pangram) is handled correctly."""
         print(f"\n[{_ts()}] TEST: Long prompt (~3000 chars)", flush=True)
-        name = f"test-longprompt-{uuid.uuid4().hex[:8]}"
+        name = names.bare(f"test-longprompt-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
         pangram = "The quick brown fox jumps over the lazy dog. " * 60
@@ -537,7 +568,7 @@ class TestSpecialCharacters:
     def test_very_long_single_line(self, cleanup):
         """~5000-char single line is handled correctly."""
         print(f"\n[{_ts()}] TEST: Very long single line (~5000 chars)", flush=True)
-        name = f"test-longline-{uuid.uuid4().hex[:8]}"
+        name = names.bare(f"test-longline-{uuid.uuid4().hex[:8]}")
         cleanup.append(name)
         token = _unique()
         filler = "abcdefghijklmnopqrstuvwxyz0123456789" * 140
@@ -630,12 +661,22 @@ class TestSpawnWorktree:
         expected_cwd = sess.cwd
         mock_worktree.add.assert_awaited_once_with(expected_cwd, "origin/dev")
 
-        # The cwd path and tmux session are both derived via safe_name(self.name)
-        # — the raw '@' key would be unsafe in a path component / tmux name.
+        # The cwd path derives from safe_name(self.name), the tmux session from
+        # tmux_safe_name(self.name) — the raw '@' key would be unsafe in a path
+        # component / tmux name.
         safe = server.worktree.safe_name("svc@dev")
         assert safe in str(sess.cwd)
         assert "svc@dev" not in str(sess.cwd)  # raw key never leaks into the path
-        assert sess.tmux_session == f"agy-{safe}"
+        assert sess.tmux_session == f"agy-{server.worktree.tmux_safe_name('svc@dev')}"
+
+    def test_dotted_base_gets_a_dot_free_tmux_name(self, mock_worktree):
+        """tmux stores '.' in a session name as '_' and cannot resolve the dotted
+        target, so the tmux name of 'svc@release/1.2' carries no dot while the
+        cwd path keeps the safe_name() token."""
+        sess = server.AgySession(name="svc@release/1.2")
+        assert "." not in sess.tmux_session
+        assert sess.tmux_session == f"agy-{server.worktree.tmux_safe_name('svc@release/1.2')}"
+        assert server.worktree.safe_name("svc@release/1.2") in str(sess.cwd)
 
     def test_build_command_grants_the_worktree_dir(self, mock_worktree):
         """_build_command appends '--add-dir <cwd>' so the read-only agent may
@@ -1068,9 +1109,9 @@ class TestStartupResilience:
         assert len(spawns) == 2 and outcomes == []
         assert spawns[0] == spawns[1]  # same tmux session name, same worktree cwd
         # The stuck process was killed BETWEEN the two spawns.
-        names = [c[0] for c in calls]
-        first, second = [i for i, n in enumerate(names) if n == "new-session"]
-        assert "kill-session" in names[first:second]
+        calls_seq = [c[0] for c in calls]
+        first, second = [i for i, n in enumerate(calls_seq) if n == "new-session"]
+        assert "kill-session" in calls_seq[first:second]
         # The worktree was cut once and is still there (the session is up).
         mock_worktree.add.assert_awaited_once()
         mock_worktree.remove.assert_not_awaited()

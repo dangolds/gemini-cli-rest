@@ -933,10 +933,13 @@ class CodexSession:
 
     @property
     def tmux_session(self) -> str:
-        # self.name now carries '@' and '/' (from a base like origin/dev), which
-        # are unsafe in a tmux session name — derive the tmux name from the
-        # sanitized, collision-proof token instead. self.name stays the dict key.
-        return f"codex-{worktree.safe_name(self.name)}"
+        # self.name carries '@' and '/' (from a base like origin/dev), which are
+        # unsafe in a tmux session name, and tmux stores '.'/':' as '_' and then
+        # cannot resolve the dotted name as a target (a base like release/1.2
+        # would lose every tmux call after new-session) — derive the tmux name
+        # from the tmux-safe, collision-proof token. self.name stays the dict
+        # key; the cwd path keeps safe_name().
+        return f"codex-{worktree.tmux_safe_name(self.name)}"
 
     @property
     def _target(self) -> str:

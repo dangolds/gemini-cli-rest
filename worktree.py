@@ -103,6 +103,14 @@ def safe_name(name: str) -> str:
     return f"{slug}-{digest}"
 
 
+def tmux_safe_name(name: str) -> str:
+    """safe_name() for a TMUX session name: tmux (3.5a) stores '.' and ':' in a
+    session name as '_' and then cannot resolve the dotted name as a target
+    ("can't find session"), so a key with a dotted base (x@release/1.2) would
+    lose every tmux call after new-session. Paths keep safe_name() as is."""
+    return safe_name(name).replace(".", "_").replace(":", "_")
+
+
 async def _git(*args: str, check: bool = True) -> tuple[int, str]:
     """Run a git command against WORKTREE_REPO; return (rc, combined output)."""
     proc = await asyncio.create_subprocess_exec(

@@ -541,11 +541,13 @@ class AgySession:
 
     @property
     def tmux_session(self) -> str:
-        # safe_name(): the key now carries '@' and '/' (from bases like
-        # origin/dev), which are illegal in a tmux session name — so every
-        # tmux-name derivation goes through it. The raw self.name stays the
-        # manager key / identity; only the tmux/path encoding is sanitized.
-        return f"agy-{worktree.safe_name(self.name)}"
+        # tmux_safe_name(): the key carries '@' and '/' (from bases like
+        # origin/dev), which are illegal in a tmux session name, and tmux
+        # stores '.'/':' as '_' and cannot resolve the dotted name as a target
+        # (a base like release/1.2 would lose every tmux call after
+        # new-session). The raw self.name stays the manager key / identity;
+        # only the tmux encoding is sanitized (paths keep safe_name()).
+        return f"agy-{worktree.tmux_safe_name(self.name)}"
 
     @property
     def _target(self) -> str:
