@@ -6,9 +6,12 @@ services:
     build: .
     restart: unless-stopped
     init: true                       # tini as PID 1: reaps zombies (agy's tmux daemon reparents here)
+    # 127.0.0.1 prefix = loopback only. The bridges have NO auth and ~/.ssh is
+    # mounted below, so a bare "8000:8000" (= 0.0.0.0, which also bypasses ufw)
+    # lets anyone on the Wi-Fi/ZeroTier drive the CLIs. Never drop the prefix.
     ports:
-      - "8000:8000"   # agy / Gemini
-      - "8001:8001"   # codex / GPT
+      - "127.0.0.1:8000:8000"   # agy / Gemini
+      - "127.0.0.1:8001:8001"   # codex / GPT
     # Both bridges must answer /health (no auth on that path) or the container
     # is marked unhealthy. start_period covers the boot-time agy/codex update
     # checks + uvicorn start; curl ships in the image.
