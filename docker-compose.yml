@@ -6,9 +6,12 @@ services:
     build: .
     restart: unless-stopped
     init: true                       # tini as PID 1: reaps zombies (agy's tmux daemon reparents here)
+    # 127.0.0.1 prefix = loopback only. The bridges have NO auth and ~/.ssh is
+    # mounted below, so a bare "8002:8000" (= 0.0.0.0, which also bypasses ufw)
+    # lets anyone on the Wi-Fi/ZeroTier drive the CLIs. Never drop the prefix.
     ports:
-      - "8002:8000"   # agy / Gemini   — host 8002 (rental-dash bridge; internal port unchanged)
-      - "8003:8001"   # codex / gpt-5.5 — host 8003 (rental-dash bridge; internal port unchanged)
+      - "127.0.0.1:8002:8000"   # agy / Gemini   — host 8002 (rental-dash bridge; internal port unchanged)
+      - "127.0.0.1:8003:8001"   # codex / gpt-5.5 — host 8003 (rental-dash bridge; internal port unchanged)
     volumes:
       - agy-config:/root/.gemini    # agy auth + settings persist
       # codex gets its OWN independent login in this volume — run `codex login`
