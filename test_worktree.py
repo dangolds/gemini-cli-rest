@@ -16,6 +16,7 @@ Run standalone:  .venv/bin/python -m pytest test_worktree.py -q
 import asyncio
 import logging
 import re
+from pathlib import Path as FsPath
 from unittest.mock import AsyncMock
 
 import pytest
@@ -518,3 +519,20 @@ def test_prune_stale_skips_when_repo_absent(monkeypatch):
     # Only the repo_ok probe ran; no 'worktree prune' was attempted.
     calls = [c.args for c in mock.await_args_list]
     assert all(c != ("worktree", "prune") for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# docker-compose.yml: the session worktree is the ONLY dir the CLIs are given
+# ---------------------------------------------------------------------------
+
+
+def test_compose_does_not_grant_the_main_clone():
+    """agy and codex list every --add-dir to the model as a workspace root. With
+    the clone granted next to the session worktree, reviews read the dev
+    checkout instead of the branch, so the extra-args vars must never name it."""
+    compose = (FsPath(__file__).parent / "docker-compose.yml").read_text()
+    # List form, optionally quoted: - "AGY_EXTRA_ARGS=--add-dir /x"
+    m = re.search(r"^\s*-\s*[\"']?WORKTREE_REPO=([^\s\"']+)", compose, re.M)
+    repo = m.group(1) if m else str(worktree.WORKTREE_REPO)
+    grants = re.findall(r"^\s*-\s*[\"']?(?:AGY|CODEX)_EXTRA_ARGS=(.*)$", compose, re.M)
+    assert not [g for g in grants if repo.rstrip("/") in g or "WORKTREE_REPO" in g], grants

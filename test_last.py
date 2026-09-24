@@ -578,6 +578,18 @@ class TestLastEndpointStatus:
         r = _serve_last(codex_server, sess, monkeypatch)
         assert (r.done, r.response, r.turn, r.status) == (False, None, 2, "never_started")
 
+    def test_codex_running_first_turn_is_pending_not_never_started(self, codex_fastpoll,
+                                                                  monkeypatch):
+        # B2: send() publishes start baseline 0 on turn 1, so the turn's own
+        # task_started proves it is running, even with an idle-looking screen.
+        sess = _codex_session(monkeypatch, events=lambda: [_ev_meta(), _ev_start("t1")],
+                              baseline=0, turn=1)
+        sess._last_baseline_starts = 0
+        sess._never_started_turn = 1
+        monkeypatch.setattr(sess, "_capture", _idle_capture)
+        r = _serve_last(codex_server, sess, monkeypatch)
+        assert (r.done, r.response, r.turn, r.status) == (False, None, 1, "pending")
+
     def test_codex_done_turn_is_status_done(self, codex_fastpoll, monkeypatch):
         sess = _codex_session(
             monkeypatch,

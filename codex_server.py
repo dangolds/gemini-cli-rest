@@ -78,6 +78,11 @@ CODEX_MODEL = os.getenv("CODEX_MODEL", "")
 # usage budget faster) without anything pinning it. Empty = leave it to
 # config.toml.
 CODEX_SERVICE_TIER = os.getenv("CODEX_SERVICE_TIER", "")
+# Hide codex's "Approaching rate limits — switch to <cheaper model>?" popup
+# (shown at >=90% usage). In a headless pane the next pasted prompt lands in it
+# and its Enter picks "Switch": the turn ran on gpt-6-luna medium (bugs.md B5).
+# Kill switch: CODEX_HIDE_MODEL_NUDGE=0.
+CODEX_HIDE_MODEL_NUDGE = os.getenv("CODEX_HIDE_MODEL_NUDGE", "1").strip().lower() not in ("0", "false", "no", "")
 
 TMUX_BIN = os.getenv("TMUX_BIN", "tmux")
 # Dedicated tmux server socket, distinct from the agy bridge's ("agy-rest"), so
@@ -976,11 +981,14 @@ class CodexSession:
             parts.extend(["-c", f'model_reasoning_effort="{CODEX_EFFORT}"'])
         if CODEX_SERVICE_TIER:
             parts.extend(["-c", f'service_tier="{CODEX_SERVICE_TIER}"'])
+        if CODEX_HIDE_MODEL_NUDGE:
+            parts.extend(["-c", "notice.hide_rate_limit_model_nudge=true"])
         if CODEX_EXTRA_ARGS:
             parts.extend(shlex.split(CODEX_EXTRA_ARGS))
-        # Grant codex read access to THIS session's per-run worktree. The static
-        # CODEX_EXTRA_ARGS env grant (if any) points at the main clone, not the
-        # ephemeral /tmp checkout, so the worktree must be trusted dynamically.
+        # Declare THIS session's per-run worktree as codex's workspace (the /tmp
+        # checkout is ephemeral, so it is passed per launch). Keep it the only
+        # one: codex lists every --add-dir to the model as a workspace root, so a
+        # CODEX_EXTRA_ARGS grant of the main clone made it read dev.
         # codex's flag is --add-dir <DIR> ("Additional directories that should be
         # writable alongside the primary workspace") — same name as agy's.
         parts.extend(["--add-dir", str(self.cwd)])
@@ -1434,7 +1442,12 @@ class CodexSession:
                     self._rollout_before = before
                     self._bind_rollout(await self._submit_first(prompt, before))
                 baseline_completes = 0
-                baseline_starts = _count_task_starts(_read_rollout(self._rollout_path))
+                # 0, not a count: the rollout was written because of THIS turn,
+                # so nothing in it predates the prompt (same reason as completes,
+                # and what _submit_first's _repaste_safe(0) assumes). Counting
+                # the turn's own task_started made turn 1 look never-started and
+                # switched off its in-flight guard.
+                baseline_starts = 0
                 # Record where this turn began so a later /last can recover its
                 # answer and never mistake a previous turn's for it.
                 self._last_baseline_completes = baseline_completes

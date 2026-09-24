@@ -571,9 +571,10 @@ class AgySession:
             parts.extend(["--model", AGY_MODEL])
         if AGY_EXTRA_ARGS:
             parts.extend(AGY_EXTRA_ARGS.split())
-        # Grant the read-only agent access to THIS session's worktree. The
-        # static env grant points at the main clone, not the per-session /tmp
-        # worktree, so each generation's checkout must be trusted dynamically.
+        # Declare THIS session's worktree as the agent's workspace (each
+        # generation's checkout is a new /tmp path, so it is passed per launch).
+        # It must be the only one: agy lists every --add-dir to the model as a
+        # workspace root, so also adding the main clone made it read dev.
         parts.extend(["--add-dir", str(self.cwd)])
         return shlex.join(parts)
 

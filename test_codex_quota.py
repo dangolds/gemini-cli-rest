@@ -289,6 +289,7 @@ class TestResumeCommand:
         monkeypatch.setattr(codex_server, "CODEX_MODEL", PIN)
         monkeypatch.setattr(codex_server, "CODEX_EFFORT", "xhigh")
         monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "default")
+        monkeypatch.setattr(codex_server, "CODEX_HIDE_MODEL_NUDGE", True)
         monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "--add-dir /repos")
         monkeypatch.setattr(codex_server, "CODEX_NOTIFY", True)
         monkeypatch.setattr(codex_server, "NOTIFY_HOOK", tmp_path / "notify-hook.sh")
@@ -305,6 +306,7 @@ class TestResumeCommand:
         c_values = [resumed[k + 1] for k, p in enumerate(resumed) if p == "-c"]
         assert 'model_reasoning_effort="xhigh"' in c_values
         assert 'service_tier="default"' in c_values
+        assert "notice.hide_rate_limit_model_nudge=true" in c_values  # B5, re-pin too
         hook = str(tmp_path / "notify-hook.sh")
         assert any(v.startswith("hooks.Stop=") and f'command="{hook}"' in v for v in c_values)
         assert "--dangerously-bypass-hook-trust" in resumed

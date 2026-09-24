@@ -389,10 +389,12 @@ class TestNotifyCountIncremental:
 
 @pytest.fixture(autouse=True)
 def _no_env_launch_flags(monkeypatch):
-    """The per-launch pins (effort, tier) come from the shell env; blank them so
-    these argv assertions don't depend on what the developer has exported."""
+    """The per-launch pins (effort, tier, the hidden rate-limit popup) come from
+    the shell env; blank them so these argv assertions don't depend on what the
+    developer has exported."""
     monkeypatch.setattr(codex_server, "CODEX_EFFORT", "")
     monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "")
+    monkeypatch.setattr(codex_server, "CODEX_HIDE_MODEL_NUDGE", False)
 
 
 def _stop_hook_override(hook):
@@ -467,6 +469,22 @@ class TestBuildCommand:
         monkeypatch.setattr(codex_server, "CODEX_SERVICE_TIER", "default")
         cmd = codex_server.CodexSession(name="unit")._build_command()
         assert self._c_values(cmd) == ['service_tier="default"']
+
+    @pytest.mark.parametrize("resume_id", [None, "thr"])
+    def test_rate_limit_popup_hidden_per_launch(self, monkeypatch, resume_id):
+        # B5: at >=90% usage codex offers "switch to a cheaper model?"; a pasted
+        # prompt's Enter answered "Switch". One TOML bool, on fresh AND re-pin.
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        monkeypatch.setattr(codex_server, "CODEX_HIDE_MODEL_NUDGE", True)
+        cmd = codex_server.CodexSession(name="unit")._build_command(resume_id=resume_id)
+        assert self._c_values(cmd) == ["notice.hide_rate_limit_model_nudge=true"]
+
+    def test_rate_limit_popup_flag_omitted_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
+        monkeypatch.setattr(codex_server, "CODEX_EXTRA_ARGS", "")
+        assert "hide_rate_limit_model_nudge" not in \
+            codex_server.CodexSession(name="unit")._build_command()
 
     def test_service_tier_omitted_when_empty(self, monkeypatch):
         monkeypatch.setattr(codex_server, "CODEX_NOTIFY", False)
@@ -662,7 +680,8 @@ class TestSendBaselines:
         assert _run(sess.send("q")) == "ok"
         assert sess._last_notify_baseline == 3
         assert sess._session_id == "thread-1"
-        assert captured["baselines"] == (0, 1)
+        # Start baseline 0: the preseeded task_started is this turn's own (B2).
+        assert captured["baselines"] == (0, 0)
 
     def test_next_turn_send_baselines_previous_turns_events(self, notify_log, tmp_path,
                                                             monkeypatch):

@@ -538,6 +538,97 @@ def test_a_retried_first_turn_reuses_the_original_scan_set(sessions_dir, monkeyp
     assert sess._session_id == "ours"
 
 
+# ===========================================================================
+# B2: turn 1's own task_started is not a baseline. The rollout is written
+# because codex took the first prompt; counting its task_started made a running
+# turn 1 look never-started (/last said "re-send it") and switched off the
+# in-flight guard (a silent think was cut off as "stalled").
+# ===========================================================================
+
+IDLE = "  Context 0% used"  # no busy marker, as during long silent reasoning
+
+
+def _append(path, *events):
+    with open(path, "a") as f:
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+
+
+@pytest.fixture()
+def first_turn(sessions_dir, fastpoll, tmp_path, monkeypatch):
+    """A real send() of turn 1. The stubbed paste plays codex taking the prompt:
+    it writes the rollout (meta + *events*). No tmux, no host notify log."""
+    monkeypatch.setattr(codex_server, "RESPONSE_STALL_TIMEOUT", 0.3)
+    monkeypatch.setattr(codex_server, "RESPONSE_HARD_TIMEOUT", 1.5)
+    monkeypatch.setattr(codex_server, "TIMEOUT_LOG_DIR", tmp_path / "timeouts")
+    monkeypatch.setattr(codex_server, "NOTIFY_LOG", tmp_path / "notify" / "events.jsonl")
+    monkeypatch.setattr(codex_server, "_SPAWN_LOCK", asyncio.Lock())
+
+    def make(*events):
+        sess = codex_server.CodexSession(name="unit")
+
+        async def submit(prompt):
+            _append(_write_rollout(sessions_dir, "ours", cwd=str(sess.cwd)), *events)
+
+        async def alive():
+            return True
+
+        async def capture():
+            return IDLE
+
+        monkeypatch.setattr(sess, "_submit", submit)
+        monkeypatch.setattr(sess, "is_alive", alive)
+        monkeypatch.setattr(sess, "_capture", capture)
+        return sess
+
+    return make
+
+
+def test_first_turn_in_flight_is_not_reported_never_started(first_turn):
+    # The live shape (perf-view@dev, 2026-09-24): turn 1 started, then thought
+    # silently past the stall window with no busy marker on screen.
+    sess = first_turn(_start())
+    assert _run(sess.send(PROMPT)) == ""
+    assert sess._last_baseline_starts == 0
+    assert sess._last_exit_reason == "hard_timeout"  # in-flight outlived the 0.3s stall
+    assert sess._never_started_turn == -1
+    # /last's own guard in the exact shape of the false alarm: even flagged, a
+    # task_started past the baseline means the turn is running.
+    sess._never_started_turn = sess._turn_count
+    assert _run(sess.never_started()) is False
+
+
+def test_first_turn_that_never_started_is_still_reported(first_turn):
+    # The guard still fires on turn 1 when nothing started at all.
+    sess = first_turn()
+    assert _run(sess.send(PROMPT)) == ""
+    assert sess._last_exit_reason == "stalled"
+    assert sess._never_started_turn == 1
+    assert _run(sess.never_started()) is True
+
+
+@pytest.mark.parametrize("earlier, answer", [
+    ((_start(),), ""),                                         # still running
+    # already done: returning its answer is current behaviour, not a B2 requirement
+    ((_start(), _complete(last="earlier answer")), "earlier answer"),
+])
+def test_a_retried_first_turn_rebinds_the_accepted_attempt(
+        first_turn, sessions_dir, monkeypatch, earlier, answer):
+    # A first turn that failed to bind may still have been taken by codex. The
+    # retry rebinds that rollout; its task_started is the same logical turn's.
+    sess = first_turn()
+    _append(_write_rollout(sessions_dir, "ours", cwd=str(sess.cwd)), *earlier)
+    sess._rollout_before = set()  # what the failed attempt captured
+
+    async def submit(prompt):
+        pass
+
+    monkeypatch.setattr(sess, "_submit", submit)
+    assert _run(sess.send(PROMPT)) == answer
+    assert sess._last_baseline_starts == 0
+    assert sess._never_started_turn == -1
+
+
 def test_startup_grace_zero_is_off(monkeypatch):
     monkeypatch.setattr(codex_server, "SUBMIT_GRACE", 0.0)
     sess = codex_server.CodexSession(name="unit")

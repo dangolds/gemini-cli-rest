@@ -133,6 +133,9 @@ host on a matching codex version (`codex update`) to avoid version skew.
 
 To let codex read your repos, mount them under `/repos` in the `bridges` service
 and set `CODEX_EXTRA_ARGS=--add-dir /repos` (mirrors agy's `/repos` setup).
+Never add the `WORKTREE_REPO` clone this way: codex shows every granted dir to
+the model as a workspace root, and it would read that checkout instead of the
+session's branch.
 
 ## API
 
@@ -178,18 +181,21 @@ returning an empty 504:
   used: a human resets the usage (or waits for `resets_at`) and simply sends
   the next prompt to the same session.
 
-**Re-pin on resume.** After the quota error codex silently switches the thread
-to a fallback model (`gpt-5.6-luna` medium — visible as a
-`thread_settings_applied` event and the next `turn_context`), and no config
-flag prevents it. Before the next prompt the bridge therefore checks both its
-in-memory flag (set by the 429/409 turn) and the rollout (a
+**Re-pin on resume.** Near the usage limit the thread can end up on a cheaper
+model (`gpt-6-luna` medium — visible as a `thread_settings_applied` event and
+the next `turn_context`). Every such switch seen so far came from codex's
+"Approaching rate limits" popup (shown at >=90% usage): a pasted prompt landed
+in it and its Enter picked "Switch" (bugs.md B5). The bridge now hides that
+popup on every launch (`CODEX_HIDE_MODEL_NUDGE`), and the re-pin stays as the
+safety net for any other switch. Before the next prompt the bridge therefore
+checks both its in-memory flag (set by the 429/409 turn) and the rollout (a
 `thread_settings_applied` naming a model other than `CODEX_MODEL` since the
 last completed turn — so a bridge restart changes nothing), and when either
 says so it re-pins: kills the codex process (its exit is confirmed, since codex
 holds a per-thread lock), relaunches in the same tmux session with
 `codex resume <thread-id>` plus every usual launch flag (`-m CODEX_MODEL`,
-effort, tier, notify hook, `--add-dir`), waits for the TUI, then pastes the
-prompt as usual. `resume` appends to the same rollout, so the conversation and
+effort, tier, hidden rate-limit popup, notify hook, `--add-dir`), waits for
+the TUI, then pastes the prompt as usual. `resume` appends to the same rollout, so the conversation and
 the answer read-back continue unchanged. Logged as `re-pinning session X: model
 drifted to Y, resuming thread Z with -m <pin>`. With `CODEX_MODEL` empty
 (no pin) drift detection and the re-pin are off.
@@ -240,6 +246,7 @@ exhausted (or no budget is left) `/chat` answers **503** with
 | `CODEX_MODEL` | _(empty)_ | Model slug, passed as `-m …` on every launch; empty = codex's own default. `docker-compose.yml` sets `gpt-6-astra`. Set there rather than in `config.toml`, which drifts (see [Configuration](#configuration-auto-approve--xhigh-reasoning)) |
 | `CODEX_EFFORT` | _(empty)_ | Reasoning effort, passed as `-c model_reasoning_effort=…` on every launch; empty = whatever `config.toml` says. `docker-compose.yml` sets `xhigh`. Same drift reason |
 | `CODEX_SERVICE_TIER` | _(empty)_ | Service tier (`default`, `priority`, `flex`; `fast` is the legacy alias of `priority`), passed as `-c service_tier=…` on every launch; empty = whatever `config.toml` says. `docker-compose.yml` sets `default` (the file had drifted to `fast`, which burns the ChatGPT usage budget faster). Same drift reason |
+| `CODEX_HIDE_MODEL_NUDGE` | `1` | Pass `-c notice.hide_rate_limit_model_nudge=true` on every launch, hiding codex's ">=90% usage: switch to a cheaper model?" popup, which a pasted prompt would otherwise answer "Switch" (bugs.md B5); `0` disables |
 | `CODEX_TMUX_SOCKET` | `codex-rest` | Dedicated tmux socket (distinct from agy's `agy-rest`) |
 | `SESSIONS_ROOT` | `/tmp/codex-rest-sessions` | Per-session working dirs |
 | `CODEX_HOME` | `~/.codex` | Where codex stores auth + sessions (rollouts are read from here) |

@@ -62,14 +62,14 @@ services:
       # clone mounted above; a session named e.g. q@dev reads a worktree pinned to
       # origin/dev. Defaults to this path in code too; set explicit for clarity.
       - WORKTREE_REPO=/app/slitled-platform
-      # Grant both CLIs read/write access to the clone (agy already trusts /app
-      # via entrypoint.sh; codex needs the explicit --add-dir since sessions run
-      # in their own per-session cwd):
-      - AGY_EXTRA_ARGS=--add-dir /app/slitled-platform
+      # Never grant the clone itself via AGY_EXTRA_ARGS / CODEX_EXTRA_ARGS
+      # (`--add-dir /app/slitled-platform`). Each session gets only its own
+      # branch worktree (the bridges add `--add-dir <worktree>`). Both CLIs show
+      # every granted dir to the model as a workspace root, and with the clone
+      # listed the model reads the dev checkout instead of the branch under review.
       # agy encodes reasoning effort in the model name (`agy models`): High, not
       # the Low the persisted settings.json defaults to. Slower turns, better answers.
       - AGY_MODEL=Gemini 3.8 Flash (High)
-      - CODEX_EXTRA_ARGS=--add-dir /app/slitled-platform
       # Model + effort are set here, not in config.toml: that file is in the
       # persistent volume, the TUI rewrites it (it had drifted to "medium"), and
       # the entrypoint only seeds it when absent — so the flags are the only
